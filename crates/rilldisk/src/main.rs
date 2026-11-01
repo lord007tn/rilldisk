@@ -17,6 +17,7 @@ use std::{
 };
 
 mod mcp;
+mod update;
 
 #[derive(Parser)]
 #[command(
@@ -78,6 +79,25 @@ enum Command {
         #[arg(long, default_value_t = rilldisk_core::DEFAULT_MAX_ENTRIES)]
         max_entries: usize,
     },
+    /// Check GitHub Releases for a newer RillDisk and install it after you
+    /// confirm. Never runs on its own; RILLDISK_NO_UPDATE_CHECK=1 disables it.
+    #[command(
+        after_help = "Exit codes: 0 up to date or updated, 10 update available (--check), 11 updates unavailable here (disabled, package-managed or unsupported platform), 1 error."
+    )]
+    Update {
+        /// Only report the current and latest versions; change nothing.
+        #[arg(long)]
+        check: bool,
+        /// Install without asking for confirmation.
+        #[arg(long, short = 'y', conflicts_with = "check")]
+        yes: bool,
+        /// Release channel. Defaults to prerelease for pre-release builds,
+        /// stable otherwise, or RILLDISK_UPDATE_CHANNEL.
+        #[arg(long, value_enum)]
+        channel: Option<update::ChannelArg>,
+        #[arg(long, value_enum, default_value = "table")]
+        format: ReportFormat,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -96,6 +116,20 @@ enum ReportFormat {
 #[tokio::main(worker_threads = 2)]
 async fn main() -> Result<ExitCode> {
     match Cli::parse().command {
+        Command::Update {
+            check,
+            yes,
+            channel,
+            format,
+        } => {
+            update::run(update::Args {
+                check,
+                yes,
+                channel,
+                json: matches!(format, ReportFormat::Json),
+            })
+            .await
+        }
         Command::Mcp {
             root,
             threads,

@@ -10,6 +10,7 @@ authors.workspace = true
 
 [dependencies]
 rilldisk-core = { path = "../rilldisk-core", version = "0.2.0" }
+rilldisk-update = { path = "../rilldisk-update", version = "0.2.0" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
