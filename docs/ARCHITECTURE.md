@@ -6,7 +6,7 @@ November 1, 2026.
 ```text
                     ┌─ rilldisk (CLI): table / JSON / JSONL, reclaim, drives
 rilldisk-core ──────┼─ rilldisk mcp: stdio, background job, paginated queries
-  scan · reclaim    └─ rilldisk-desktop: egui on wgpu, treemap, tree, reclaim
+  scan · reclaim    └─ rilldisk-desktop: egui on wgpu, overview, treemap, rings, clean up
   stats · volumes
        │
        ├─ Windows: batched Win32 directory metadata
@@ -137,14 +137,30 @@ contents are read and nothing is modified.
 
 `rilldisk-desktop` is a separate crate on eframe/egui with the wgpu renderer, so
 CLI and MCP builds carry no GPU dependencies. Scans and analysis (reclaim, types,
-largest files) run on a worker thread; the UI thread only polls progress counters
-and swaps in a finished `Arc<Snapshot>`. The tree is virtualized (only visible
-rows are laid out). The treemap is a squarified layout computed once per (zoom
-root, size metric, canvas size) and cached as a single vertex mesh with four-
-corner cushion shading, capped at 120,000 tiles; hit testing walks the cached
-tiles. Single-child folder chains fold into one header. `--capture DIR` runs a
-scripted tour that injects real pointer events and saves PNG frames for
-documentation.
+largest files, agent grouping) run on a worker thread; the UI thread only polls
+progress counters and swaps in a finished `Arc<Snapshot>`.
+
+* **Design tokens** live in `style.rs`: three color identities (Tide, Moss,
+  Aurora), each with a light and dark theme, read through one `t()` accessor.
+  Surfaces are separated by tone, not outlines. Fonts are the platform's own
+  (Segoe UI Variable, SF, or a common Linux sans) with a variable-weight semibold.
+  The chosen palette and theme are remembered in a small `desktop.txt` beside the
+  update preferences.
+* **Treemap** (`treemap.rs`): squarified layout of up to four levels below the
+  shown folder, computed once per (root, metric, canvas, theme) and tessellated
+  with egui's feathering into one cached mesh of rounded tiles (capped at 40,000).
+  Hit testing walks the cached tiles; single-child folder chains fold into one
+  label. Tiles are colored by top-level folder (a gradient position shared with
+  the rings) or by file type.
+* **Rings** (`sunburst.rs`): a six-level sunburst built into one mesh of
+  anti-aliased annular sectors (each a 4 × n vertex grid whose outer rows fade over
+  one pixel) and hit-tested in polar coordinates.
+* **Views**: Overview, Explore (map or rings plus a virtualized folder list),
+  Clean up (virtualized, grouped by category, with a plan that is only ever copied
+  to the clipboard), Largest files, File types, Unread and Search.
+
+`--capture DIR` runs a scripted tour that injects real pointer events and saves PNG
+frames for documentation, with invented drives in place of the real ones.
 
 ## Updates and releases
 

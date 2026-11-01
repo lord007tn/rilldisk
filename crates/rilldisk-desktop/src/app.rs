@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 use crate::capture::Tour;
 use crate::icons::{self, Icon};
+use crate::settings;
 use crate::style::{self, FileClass, Identity, t};
 use crate::sunburst::{self, Hit, Rings};
 use crate::treemap::{self, ColorBy, Params};
+use crate::update;
 use crate::widgets::{self as w, Kind};
 use eframe::egui::{
     self, Align, Align2, Color32, Frame, Key, Layout, Margin, Mesh, Pos2, Rect, RichText, Sense,
@@ -13,9 +15,6 @@ use rilldisk_core::{
     Candidate, Category, EntryKind, ReclaimReport, Safety, ScanControl, ScanOptions, Snapshot,
     TypeStat, Volume, file_types, find_reclaimable, largest_files, scan, volumes,
 };
-mod canvas;
-mod triage;
-
 use std::{
     collections::{HashMap, HashSet},
     f32::consts::TAU,
@@ -33,35 +32,6 @@ pub enum Tab {
     Types,
     Issues,
     Search,
-}
-
-/// Overall window layout.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Shell {
-    /// Sidebar, tabs and an overview of cards.
-    Dashboard,
-    /// The chart fills the window; controls float over it.
-    Canvas,
-    /// A reclaim inbox: categories, suggestions and an inspector.
-    Triage,
-}
-
-impl Shell {
-    pub const ALL: [Shell; 3] = [Shell::Dashboard, Shell::Canvas, Shell::Triage];
-
-    pub fn name(self) -> &'static str {
-        match self {
-            Shell::Dashboard => "Dashboard",
-            Shell::Canvas => "Canvas",
-            Shell::Triage => "Triage",
-        }
-    }
-
-    pub fn parse(text: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|s| s.name().eq_ignore_ascii_case(text))
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -156,7 +126,9 @@ enum Action {
     Pick(usize),
     Theme(bool),
     Identity(Identity),
-    Shell(Shell),
+    /// The user agreed to install this update.
+    Install(update::Release),
+    CheckUpdates,
 }
 
 pub struct RillApp {
@@ -186,16 +158,17 @@ pub struct RillApp {
     pub safety_filter: Option<Safety>,
     pub category_filter: Option<Category>,
     pub picked: HashSet<usize>,
-    /// Candidate shown in the triage inspector.
-    pub inspect: Option<usize>,
     pub highlight: bool,
     toast: Option<(String, f64)>,
     pub dark: bool,
     pub identity: Identity,
     applied: Option<(Identity, bool)>,
-    pub shell: Shell,
-    /// Treemap of the inspected suggestion (triage).
-    inspect_map: treemap::Layout,
+    /// Background update check, its result and a running install.
+    update_check: Option<update::Pending<Result<Option<update::Release>, String>>>,
+    update_manual: bool,
+    pub available: Option<update::Release>,
+    installing: Option<update::Install>,
+    update_error: Option<String>,
     after_scan: Option<(Tab, Option<Category>)>,
     pub tour: Option<Tour>,
     pub injected: Vec<egui::Event>,
@@ -218,12 +191,15 @@ impl RillApp {
         cc: &eframe::CreationContext<'_>,
         path: Option<String>,
         dark: Option<bool>,
-        identity: Identity,
-        shell: Shell,
+        identity: Option<Identity>,
         tour: Option<Tour>,
     ) -> Self {
         style::install_fonts(&cc.egui_ctx);
-        let dark = dark.unwrap_or(cc.egui_ctx.system_theme() != Some(egui::Theme::Light));
+        let saved = settings::load();
+        let identity = identity.or(saved.identity).unwrap_or(Identity::Tide);
+        let dark = dark
+            .or(saved.dark)
+            .unwrap_or(cc.egui_ctx.system_theme() != Some(egui::Theme::Light));
         style::apply(&cc.egui_ctx, identity, dark);
         let home = home_dir();
         // The platform's standard folders. Linux reads the XDG user-dirs file, so
@@ -280,7 +256,12 @@ impl RillApp {
         };
         let mut app = Self {
             path: path.clone().unwrap_or_else(home_dir),
-            volumes: volumes(),
+            // Public captures show invented drives, never this machine's.
+            volumes: if tour.is_some() {
+                crate::capture::demo_volumes()
+            } else {
+                volumes()
+            },
             places,
             running: None,
             data: None,
@@ -305,20 +286,26 @@ impl RillApp {
             safety_filter: None,
             category_filter: None,
             picked: HashSet::new(),
-            inspect: None,
             highlight: false,
             toast: None,
             dark,
             identity,
             applied: Some((identity, dark)),
-            shell,
-            inspect_map: Default::default(),
+            update_check: None,
+            update_manual: false,
+            available: None,
+            installing: None,
+            update_error: None,
             after_scan: None,
             tour,
             injected: Vec::new(),
         };
         if path.is_some() {
             app.start_scan(&cc.egui_ctx);
+        }
+        // Scripted captures never touch the network.
+        if app.tour.is_none() {
+            app.update_check = Some(update::check(&cc.egui_ctx, update::Trigger::Automatic));
         }
         app
     }
@@ -375,6 +362,27 @@ impl RillApp {
                 }
             }
         }
+        if let Some(result) = self.update_check.as_ref().and_then(|c| c.poll()) {
+            self.update_check = None;
+            match result {
+                Ok(Some(release)) => self.available = Some(release),
+                Ok(None) if self.update_manual => {
+                    self.toast = Some(("RillDisk is up to date".into(), ctx.input(|i| i.time)));
+                }
+                Ok(None) => {}
+                Err(error) if self.update_manual => self.update_error = Some(error),
+                Err(_) => {}
+            }
+            self.update_manual = false;
+        }
+        if let Some(install) = &self.installing {
+            if let Some(Err(error)) = install.poll() {
+                self.update_error = Some(error);
+                self.installing = None;
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+        }
         if let Some(rx) = &self.search_rx
             && let Ok(result) = rx.try_recv()
         {
@@ -407,7 +415,6 @@ impl RillApp {
         self.generation += 1;
         self.search_results = None;
         self.picked.clear();
-        self.inspect = None;
         self.data = Some(Arc::new(data));
         match self.after_scan.take() {
             Some((tab, category)) => {
@@ -502,13 +509,22 @@ impl RillApp {
                         self.picked.insert(index);
                     }
                 }
-                Action::Theme(dark) => self.dark = dark,
-                Action::Identity(identity) => self.identity = identity,
-                Action::Shell(shell) => {
-                    self.shell = shell;
-                    if shell == Shell::Canvas && self.tab == Tab::Overview {
-                        self.tab = Tab::Explore;
-                    }
+                Action::Theme(dark) => {
+                    self.dark = dark;
+                    settings::save(self.identity, self.dark);
+                }
+                Action::Identity(identity) => {
+                    self.identity = identity;
+                    settings::save(self.identity, self.dark);
+                }
+                Action::Install(release) => {
+                    self.update_error = None;
+                    self.installing = Some(update::install_and_restart(ctx, release));
+                }
+                Action::CheckUpdates => {
+                    self.update_error = None;
+                    self.update_manual = true;
+                    self.update_check = Some(update::check(ctx, update::Trigger::Manual));
                 }
             }
         }
@@ -708,15 +724,48 @@ impl RillApp {
             actions.push(Action::Scan(folder.display().to_string()));
         }
         ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-            ui.label(
-                RichText::new(concat!(
-                    "v",
-                    env!("CARGO_PKG_VERSION"),
-                    " · AGPL-3.0 · open source"
-                ))
-                .font(style::regular(11.0))
-                .color(th.faint),
-            );
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.label(
+                    RichText::new(concat!("v", env!("CARGO_PKG_VERSION"), " · AGPL-3.0 ·"))
+                        .font(style::regular(11.0))
+                        .color(th.faint),
+                );
+                let busy = self.update_check.is_some();
+                let link = ui.add(
+                    egui::Label::new(
+                        RichText::new(if busy {
+                            "checking…"
+                        } else {
+                            "check for updates"
+                        })
+                        .font(style::regular(11.0))
+                        .color(th.dim),
+                    )
+                    .sense(Sense::click()),
+                );
+                if link.clicked() && !busy {
+                    actions.push(Action::CheckUpdates);
+                }
+                link.on_hover_text("Right-click for update settings")
+                    .context_menu(|ui| {
+                        let mut automatic = update::automatic_checks();
+                        if ui
+                            .checkbox(&mut automatic, "Check once a day on startup")
+                            .changed()
+                        {
+                            let _ = update::set_automatic_checks(automatic);
+                        }
+                        ui.label(
+                            RichText::new("Only asks GitHub for the latest version. Set RILLDISK_NO_UPDATE_CHECK=1 to turn checks off.")
+                                .font(style::regular(11.0))
+                                .color(th.faint),
+                        );
+                    });
+            });
+            if let Some(action) = self.update_card(ui) {
+                actions.push(action);
+            }
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 let (dot, _) = ui.allocate_exact_size(vec2(8.0, 14.0), Sense::hover());
@@ -728,10 +777,6 @@ impl RillApp {
                 );
             });
             ui.add_space(10.0);
-            if let Some(shell) = shell_picker(ui, self.shell) {
-                actions.push(Action::Shell(shell));
-            }
-            ui.add_space(8.0);
             if let Some(identity) = identity_picker(ui, self.identity) {
                 actions.push(Action::Identity(identity));
             }
@@ -2115,8 +2160,7 @@ impl RillApp {
                             );
                         }
                         Row::Item(i) => {
-                            actions
-                                .extend(self.candidate_card(ui, data, *i, rect, response, false));
+                            actions.extend(self.candidate_card(ui, data, *i, rect, response));
                         }
                     }
                 }
@@ -2125,8 +2169,7 @@ impl RillApp {
         actions
     }
 
-    /// One reclaim suggestion as a card. In triage mode a click inspects it and
-    /// only the checkbox adds it to the plan; otherwise a click toggles the plan.
+    /// One reclaim suggestion as a card; a click toggles it in the cleanup plan.
     fn candidate_card(
         &mut self,
         ui: &mut Ui,
@@ -2134,7 +2177,6 @@ impl RillApp {
         i: usize,
         rect: Rect,
         response: egui::Response,
-        triage: bool,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         let th = t();
@@ -2145,13 +2187,10 @@ impl RillApp {
         let c = &report.candidates[i];
         let card = rect.shrink2(vec2(0.0, 3.0));
         let picked = self.picked.contains(&i);
-        let inspected = triage && self.inspect == Some(i);
         p.rect_filled(
             card,
             12,
-            if inspected {
-                style::alpha(th.accent, if th.dark { 40 } else { 28 })
-            } else if response.hovered() {
+            if response.hovered() {
                 th.hover
             } else {
                 th.card
@@ -2226,7 +2265,7 @@ impl RillApp {
         );
         // Row actions appear on hover.
         let mut action_rect = None;
-        if !triage && (response.hovered() || response.contains_pointer()) {
+        if response.hovered() || response.contains_pointer() {
             let r = Rect::from_min_size(
                 pos2(card.right() - right_w - 108.0, card.center().y - 16.0),
                 vec2(104.0, 32.0),
@@ -2262,20 +2301,10 @@ impl RillApp {
                 clicked_action = true;
             }
         }
-        let response = if triage {
-            response
-        } else {
-            response.on_hover_text(format!("{}\n\nSuggested: {}", c.reason, c.suggested_action))
-        };
+        let response =
+            response.on_hover_text(format!("{}\n\nSuggested: {}", c.reason, c.suggested_action));
         if response.clicked() && !clicked_action {
-            let on_check = response
-                .interact_pointer_pos()
-                .is_some_and(|pos| check.expand(10.0).contains(pos));
-            if triage && !on_check {
-                self.inspect = Some(i);
-            } else {
-                actions.push(Action::Pick(i));
-            }
+            actions.push(Action::Pick(i));
         }
         response.context_menu(|ui| entry_menu(ui, snapshot, c.entry_id, &mut actions));
         actions
@@ -2729,7 +2758,7 @@ impl RillApp {
                     let cards: [(Icon, &str, &str, usize); 3] = [
                         (Icon::Folder, "A folder", "Pick any folder, or press Ctrl+O", 0),
                         (Icon::Home, "Your home folder", "Projects, downloads and app caches", 1),
-                        (Icon::Agent, "AI agent worktrees", "Stale Claude, Codex, T3 and Cursor checkouts", 2),
+                        (Icon::Agent, "AI agent worktrees", "Stale checkouts left by coding agents", 2),
                     ];
                     let gap = 12.0;
                     let cw = (width - gap * 2.0) / 3.0;
@@ -2784,6 +2813,9 @@ impl RillApp {
                             });
                         });
                     });
+                    if let Some(action) = self.update_card(ui) {
+                        actions.push(action);
+                    }
                     ui.add_space(24.0);
                     ui.vertical_centered(|ui| {
                         ui.label(
@@ -2801,6 +2833,85 @@ impl RillApp {
             });
         });
         actions
+    }
+
+    /// Offer for a newer release; nothing installs until the user clicks.
+    fn update_card(&self, ui: &mut Ui) -> Option<Action> {
+        let th = t();
+        let mut action = None;
+        if self.available.is_none() && self.update_error.is_none() {
+            return None;
+        }
+        ui.add_space(10.0);
+        Frame::new()
+            .fill(style::alpha(th.accent, if th.dark { 34 } else { 26 }))
+            .corner_radius(12)
+            .inner_margin(Margin::same(12))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                if let Some(error) = &self.update_error {
+                    ui.label(
+                        RichText::new("Update failed")
+                            .font(style::semibold(13.0))
+                            .color(th.danger),
+                    );
+                    ui.label(
+                        RichText::new(error)
+                            .font(style::regular(11.5))
+                            .color(th.dim),
+                    );
+                    return;
+                }
+                let Some(release) = &self.available else {
+                    return;
+                };
+                ui.label(
+                    RichText::new(format!("RillDisk {} is available", release.version))
+                        .font(style::semibold(13.0)),
+                );
+                if let Some(install) = &self.installing {
+                    let (bar, _) =
+                        ui.allocate_exact_size(vec2(ui.available_width(), 6.0), Sense::hover());
+                    w::progress(
+                        ui.painter(),
+                        bar,
+                        install.progress().unwrap_or(0.05),
+                        th.accent,
+                    );
+                    ui.label(
+                        RichText::new("Downloading and verifying…")
+                            .font(style::regular(11.5))
+                            .color(th.dim),
+                    );
+                    return;
+                }
+                if let Some(command) = &release.update_command {
+                    ui.label(
+                        RichText::new("Installed by a package manager. Update with:")
+                            .font(style::regular(11.5))
+                            .color(th.dim),
+                    );
+                    ui.label(RichText::new(command).font(style::mono(11.5)));
+                    return;
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    if w::button(ui, Kind::Primary, None, "Install and restart")
+                        .on_hover_text(
+                            "Downloads the release, checks its SHA-256 and replaces both programs",
+                        )
+                        .clicked()
+                    {
+                        action = Some(Action::Install(release.clone()));
+                    }
+                    if w::button(ui, Kind::Ghost, None, "What's new").clicked() {
+                        ui.ctx()
+                            .open_url(egui::OpenUrl::new_tab(&release.notes_url));
+                    }
+                });
+            });
+        action
     }
 
     fn paint_toast(&mut self, ctx: &egui::Context) {
@@ -2855,10 +2966,6 @@ impl eframe::App for RillApp {
                     None => self.home(ui),
                 });
             actions.extend(central.inner);
-        } else if self.shell == Shell::Canvas {
-            actions.extend(self.canvas(ui));
-        } else if self.shell == Shell::Triage {
-            actions.extend(self.triage(ui));
         } else {
             let side = egui::Panel::left("sidebar")
                 .exact_size(248.0)
@@ -2976,20 +3083,6 @@ fn agent_color(agent: &str) -> Color32 {
     }
 }
 
-fn safety_help(safety: Safety) -> &'static str {
-    match safety {
-        Safety::Regenerable => {
-            "Project tools rebuild or reinstall this from your source files (npm install, cargo build)."
-        }
-        Safety::Cache => {
-            "Downloaded or generated on demand; removing it costs time or bandwidth later."
-        }
-        Safety::Review => {
-            "May hold work that exists nowhere else, such as uncommitted changes. Look before removing."
-        }
-    }
-}
-
 fn category_title(category: Category) -> &'static str {
     match category {
         Category::GitWorktree => "Git worktrees",
@@ -3054,14 +3147,6 @@ fn logo(p: &egui::Painter, rect: Rect) {
     p.rect_filled(r(0.60, 0.18, 0.82, 0.46), radius, stops[2]);
     p.rect_filled(r(0.60, 0.51, 0.82, 0.66), radius, stops[3]);
     p.rect_filled(r(0.60, 0.71, 0.82, 0.82), radius, stops[5]);
-}
-
-/// Layout switcher; returns a newly chosen shell.
-fn shell_picker(ui: &mut Ui, current: Shell) -> Option<Shell> {
-    let mut shell = current;
-    let options: Vec<(Shell, Option<Icon>, &str)> =
-        Shell::ALL.iter().map(|&s| (s, None, s.name())).collect();
-    (w::segmented(ui, &mut shell, &options, "Layout") && shell != current).then_some(shell)
 }
 
 /// Three swatches; returns a newly chosen identity.

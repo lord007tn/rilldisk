@@ -5,11 +5,10 @@
 mod app;
 mod capture;
 mod icons;
+mod settings;
 mod style;
 mod sunburst;
 mod treemap;
-// Update API for the UI to call; not wired into the interface yet.
-#[allow(dead_code)]
 mod update;
 mod widgets;
 
@@ -20,23 +19,15 @@ fn main() -> eframe::Result {
     let mut path = None;
     let mut capture = None;
     let mut dark = None;
-    let mut identity = style::Identity::Tide;
-    let mut shell = app::Shell::Dashboard;
+    let mut identity = None;
     let mut size = [1480.0_f32, 920.0];
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--capture" => capture = args.next().map(PathBuf::from),
             "--theme" => dark = args.next().map(|theme| theme == "dark"),
-            "--layout" => {
-                if let Some(found) = args.next().as_deref().and_then(app::Shell::parse) {
-                    shell = found;
-                }
-            }
             "--palette" => {
-                if let Some(found) = args.next().as_deref().and_then(style::Identity::parse) {
-                    identity = found;
-                }
+                identity = args.next().as_deref().and_then(style::Identity::parse);
             }
             "--size" => {
                 if let Some((w, h)) = args.next().as_deref().and_then(|s| s.split_once('x')) {
@@ -54,7 +45,7 @@ fn main() -> eframe::Result {
                     );
                 }
                 println!(
-                    "rilldisk-desktop [PATH] [--theme light|dark] [--palette tide|moss|aurora] [--layout dashboard|canvas|triage] [--size WIDTHxHEIGHT] [--capture DIR]\n\nOpens the RillDisk desktop app. PATH starts a scan immediately.\n--capture runs a scripted tour and saves screenshots to DIR (development)."
+                    "rilldisk-desktop [PATH] [--theme light|dark] [--palette tide|moss|aurora] [--size WIDTHxHEIGHT] [--capture DIR]\n\nOpens the RillDisk desktop app. PATH starts a scan immediately.\n--capture runs a scripted tour and saves screenshots to DIR (development)."
                 );
                 return Ok(());
             }
@@ -75,10 +66,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "RillDisk",
         options,
-        Box::new(move |cc| {
-            Ok(Box::new(app::RillApp::new(
-                cc, path, dark, identity, shell, tour,
-            )))
-        }),
+        Box::new(move |cc| Ok(Box::new(app::RillApp::new(cc, path, dark, identity, tour)))),
     )
 }

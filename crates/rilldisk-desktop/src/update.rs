@@ -221,10 +221,3 @@ pub fn set_automatic_checks(enabled: bool) -> Result<(), String> {
     state.automatic_checks = enabled;
     state.save().map_err(|e| format!("{e:#}"))
 }
-
-/// `None` follows the running build (pre-release builds follow pre-releases).
-pub fn set_channel(channel: Option<Channel>) -> Result<(), String> {
-    let mut state = State::load();
-    state.channel = channel;
-    state.save().map_err(|e| format!("{e:#}"))
-}

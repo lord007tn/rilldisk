@@ -154,6 +154,25 @@ impl Tour {
     }
 }
 
+/// Synthetic drives for screenshots, so public media shows no real machine.
+pub fn demo_volumes() -> Vec<rilldisk_core::Volume> {
+    const GB: u64 = 1 << 30;
+    [
+        ("C:\\", "Local Disk", 954 * GB, 212 * GB),
+        ("D:\\", "Projects", 1863 * GB, 1210 * GB),
+    ]
+    .into_iter()
+    .map(|(root, label, total, free)| rilldisk_core::Volume {
+        root: PathBuf::from(root),
+        label: label.into(),
+        filesystem: "NTFS".into(),
+        total_bytes: total,
+        free_bytes: free,
+        removable: false,
+    })
+    .collect()
+}
+
 fn save(ctx: &egui::Context, pending: &Arc<AtomicUsize>, path: PathBuf) {
     pending.fetch_add(1, Ordering::SeqCst);
     let pending = pending.clone();

@@ -20,9 +20,9 @@ MCP server so your AI assistant sees exactly what you see.
 [Performance](#performance) ·
 [Roadmap](ROADMAP.md)
 
-<img src="docs/media/tour.gif" alt="RillDisk desktop: hovering the treemap, selecting build output, highlighting reclaimable folders, the Reclaim list and file types" width="100%">
+<img src="docs/media/tour.gif" alt="RillDisk desktop: overview, exploring the map, lighting up cleanable folders, the rings view and the cleanup plan" width="100%">
 
-<sub>Recorded by the app's own scripted tour on a synthetic demo disk (<code>scripts/make_demo_fixture.py</code>). No real user data.</sub>
+<sub>Recorded by the app's own scripted tour on a synthetic demo disk (<code>scripts/make_demo_fixture.py</code>) with invented drives. No real user data.</sub>
 
 </div>
 
@@ -30,59 +30,70 @@ MCP server so your AI assistant sees exactly what you see.
 
 |  |  |
 | --- | --- |
-| **Fast and lean** | Batched Win32 metadata enumeration on Windows, `readdir` plus one no-follow `stat` per entry on Linux and macOS, all on one barrier-free, work-stealing pipeline. A 3.1-million-file developer workspace scans in **5–9 s** using ~560 MB; a whole 30-million-entry system drive in about 3 minutes ([numbers](#performance)). |
-| **A map, not a list** | Squarified, cushion-shaded treemap rendered on the GPU (wgpu). Hover, click, zoom, breadcrumb back out. Folder chains like `SteamLibrary › … › common` fold into one header. |
-| **Reclaim, explained** | Finds Git worktrees (including forgotten **AI-agent worktrees**), `node_modules`, `target`, `.next`, `.venv`, Unity `Library`, package caches and temp folders — each with a safety level, reason, idle time, the exact command to run, and how much space it **really** frees once hard links are accounted for. |
+| **See it at a glance** | An overview that answers the real questions first: how full the drive is, how much you can safely get back, which AI agents left worktrees behind, and the biggest file, next to a live map of the scan. |
+| **Two ways to explore** | A rounded, nested treemap and a sunburst **Rings** view, both GPU-rendered (wgpu). Click to drill in, hover for details, color by folder or by file type, and light up everything that can be cleaned. |
+| **Reclaim, explained** | Finds Git worktrees (including forgotten **AI-agent worktrees**, labeled Claude Code, Codex, T3 Code, Cursor or Conductor), `node_modules`, `target`, `.next`, `.venv`, Unity `Library`, package caches and temp folders. Each comes with a safety level, the reason, idle time, the exact command, and how much space it **really** frees once hard links are counted. Tick folders to build a commented **cleanup plan** you review and run yourself. |
+| **Fast and lean** | Batched Win32 metadata enumeration on Windows and a no-follow `readdir` backend on Linux and macOS, on one barrier-free, work-stealing pipeline. A 3.1-million-file workspace scans in **5–9 s** using ~560 MB ([numbers](#performance)). |
 | **Built for agents too** | The same engine powers a CLI with JSON output and a local **MCP server**. Claude Code, Codex, Cursor or any MCP client can scan, query and explain your disk. |
+| **Yours to style** | Three color identities (**Tide**, **Moss**, **Aurora**), each in light and dark. RillDisk remembers your choice. |
 | **Read-only by design** | Metadata only. Never opens, uploads or deletes files. No telemetry, no network listener, no elevation. The only network request is an [opt-out-able update check](docs/proposals/updates.md) that sends nothing about you. |
-| **Open source** | AGPL-3.0-only, pure Rust: no Electron, no Tauri, no webview, no JavaScript. |
+| **Open source** | AGPL-3.0-only, pure Rust: no Electron, no Tauri, no webview, no JavaScript. Windows, Linux and macOS. |
 
 <table>
 <tr>
-<td width="50%"><img src="docs/media/reclaim.png" alt="Reclaim view listing build output, a virtual environment, a stale Git worktree and caches with safety levels"></td>
-<td width="50%"><img src="docs/media/zoom.png" alt="Treemap zoomed into a Projects folder with a tooltip on a Next.js build cache"></td>
+<td width="50%"><img src="docs/media/overview.png" alt="Overview: drive usage donut, a Clean up card with 23.1 GB, AI agent worktrees, the biggest file, a file-type breakdown, the largest folders and a treemap"></td>
+<td width="50%"><img src="docs/media/rings-dark.png" alt="Rings view in dark mode: a sunburst of the Projects folder with the contents of node_modules listed beside it"></td>
 </tr>
 <tr>
-<td><b>Reclaim</b> — what you can free, grouped by how safe it is to remove.</td>
-<td><b>Zoom</b> — double-click any block; hover for size, share, file count and age.</td>
+<td><b>Overview</b> — the drive, what you can get back and where the space went.</td>
+<td><b>Rings</b> — one ring per folder level; hover any slice to see what is inside.</td>
 </tr>
 <tr>
-<td><img src="docs/media/map.png" alt="Full treemap with reclaimable folders outlined by safety color"></td>
+<td><img src="docs/media/cleanup.png" alt="Clean up view: build output, dependencies, Git worktrees and caches with safety levels, three selected and a Copy cleanup plan bar"></td>
+<td><img src="docs/media/cleanable.png" alt="Treemap with every cleanable folder lit up in its safety color"></td>
+</tr>
+<tr>
+<td><b>Clean up</b> — tick folders, then copy a commented plan of the suggested commands.</td>
+<td><b>Light up cleanable</b> — every candidate shown in place on the map.</td>
+</tr>
+<tr>
+<td><img src="docs/media/explore-dark.png" alt="Treemap of a Projects folder in dark mode with a tooltip and the folder list"></td>
 <td><img src="docs/media/types.png" alt="File types view ranking extensions by total size"></td>
 </tr>
 <tr>
-<td><b>Highlight reclaimable</b> — outlines every candidate directly on the map.</td>
-<td><b>File types</b> — which extensions eat your space.</td>
+<td><b>Explore</b> — nested map with a live folder list beside it.</td>
+<td><b>File types</b> — which kinds of files eat your space.</td>
 </tr>
 </table>
 
 ## Get started
 
-Download the Windows x64 zip from [Releases](https://github.com/lord007tn/rilldisk/releases)
-and extract it anywhere. It contains two programs:
+Download the archive for your system from
+[Releases](https://github.com/lord007tn/rilldisk/releases): Windows x64, Linux x64,
+or macOS (Apple Silicon and Intel). Extract it anywhere. It contains two programs:
 
-* **`rilldisk-desktop.exe`** — the desktop app. Click a drive or press **Browse…**.
-* **`rilldisk.exe`** — the CLI and MCP server.
+* **`rilldisk-desktop`** — the desktop app. Pick a drive, a place or any folder.
+* **`rilldisk`** — the CLI and MCP server.
 
-No installer, no admin rights, no account. Protected system folders appear under
-**Issues** and the result is clearly marked partial.
+No installer, no admin rights, no account. Protected system folders are listed under
+**Unread** and the result is clearly marked partial. Builds are not code-signed
+yet, so Windows SmartScreen and macOS Gatekeeper may warn; every release ships
+`SHA256SUMS` and GitHub build attestations.
 
-On **Linux and macOS**, [build from source](#build-from-source) for now. The desktop,
-CLI and MCP server work the same way; drives are your mounted disks (`/`, `/home`,
-`/Volumes/...`) and the sidebar uses your standard folders.
-
-`rilldisk update --check` reports whether a newer release exists; `rilldisk update`
-downloads it, verifies its SHA-256 and replaces both programs after you confirm.
-Set `RILLDISK_NO_UPDATE_CHECK=1` to turn update checks off entirely
-([details](docs/proposals/updates.md)).
+**Updates.** The desktop checks GitHub once a day for a newer release and offers
+it; nothing is installed until you click **Install and restart**. From a terminal,
+`rilldisk update --check` reports whether a newer release exists and
+`rilldisk update` downloads it, verifies its SHA-256 and replaces both programs
+after you confirm. Set `RILLDISK_NO_UPDATE_CHECK=1` to turn update checks off
+entirely ([details](docs/proposals/updates.md)).
 
 | Shortcut | Action |
 | --- | --- |
+| `1`–`5` | Overview, Explore, Clean up, Largest files, File types |
 | `F5` / `Esc` | Rescan / stop and keep partial results |
-| `Enter` / `Backspace` | Zoom into selection / back out (mouse back button too) |
-| `↑ ↓ ← →` | Move through the tree, expand and collapse |
-| `Ctrl+F` / `Ctrl+C` | Find by name / copy the selected path |
-| `1`–`4` | Map, Reclaim, Largest files, File types |
+| `Ctrl+O` / `Ctrl+F` | Scan a folder / find files by name |
+| `↑ ↓` / `Enter` / `Backspace` | Move through the folder list / open / go up (mouse back too) |
+| `Ctrl+C` | Copy the selected path |
 
 **Size** shows logical file length; **On disk** shows allocated clusters with hard
 links counted once. Switch at the top right.
@@ -216,7 +227,7 @@ Method and earlier comparisons: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
   report what they really occupy, and every name of a hard-linked file is flagged.
 * **Partial is visible.** Unreadable folders, cancellation, unresponsive folders and
   the entry limit (30 million by default, `--max-entries`) mark the result partial
-  everywhere: status bar, CLI exit code, JSON and MCP.
+  everywhere: the status chip, CLI exit code, JSON and MCP.
 * **No surprises.** Junctions, symlinks and cloud placeholders are listed but not
   followed or hydrated. On Linux and macOS a scan stays on one filesystem: other
   mounts are listed, not entered, and counted as `skipped_mounts`

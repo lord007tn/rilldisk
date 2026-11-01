@@ -20,7 +20,9 @@ network server. Stdout contains only protocol messages.
    Bin. Filter with `category` (`git_worktree`, `build_output`, `dependencies`,
    `package_cache`, `app_cache`, `temporary`, `recycle_bin`) and `min_bytes`
    (default 1 MiB). Each candidate has `safety` (`regenerable`, `cache`,
-   `review`), `reason`, `idle_days`, `file_count`, `exclusive_bytes` (on-disk
+   `review`), `agent` (for worktrees an AI tool created: `Claude Code`, `Codex`,
+   `T3 Code`, `Cursor`, `Conductor`; absent otherwise), `reason`, `idle_days`,
+   `file_count`, `exclusive_bytes` (on-disk
    space removing it frees at least), `shared_bytes` (hard-linked elsewhere),
    `nested_in` and a
    `suggested_action` for the user to run. Totals count outermost candidates only.
