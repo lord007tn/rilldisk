@@ -185,6 +185,10 @@ fn resident_ntfs_data_has_no_separate_allocated_clusters() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "APFS and HFS+ reject filenames that are not valid UTF-8"
+)]
 fn exports_non_unicode_filenames_as_lossy_text_without_losing_the_inventory() {
     let root = tempfile::tempdir().unwrap();
     #[cfg(windows)]
