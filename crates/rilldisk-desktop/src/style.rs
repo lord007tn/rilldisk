@@ -275,28 +275,132 @@ pub fn mono(size: f32) -> FontId {
     FontId::monospace(size)
 }
 
-/// Prefers Segoe UI Variable (Windows 11), then Segoe UI, then egui's bundled font.
+/// The platform UI typeface as a regular and a semibold face. Windows uses Segoe UI
+/// Variable, macOS San Francisco and Linux the first of Inter, Cantarell, Ubuntu Sans,
+/// Noto Sans and DejaVu Sans that is installed. egui's bundled fonts stay as the fallback for
+/// missing glyphs and for systems without any of them; a file egui cannot parse is
+/// skipped with a warning by egui itself.
 fn fonts() -> FontDefinitions {
+    use std::path::{Path, PathBuf};
     let mut defs = FontDefinitions::default();
     let fallback = defs.families[&FontFamily::Proportional].clone();
-    let dir =
-        std::path::PathBuf::from(std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into()))
-            .join("Fonts");
-    let read = |name: &str| std::fs::read(dir.join(name)).ok();
-    let mut faces: Vec<(&str, FontData)> = Vec::new();
-    if let Some(bytes) = read("SegUIVar.ttf") {
+    // One variable font serves both weights through its `wght` axis.
+    let variable = |bytes: Vec<u8>, opsz: Option<f32>| {
         let blob: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new(bytes);
         let face = |weight: f32| {
+            let mut coords = VariationCoords::new([(*b"wght", weight)]);
+            if let Some(size) = opsz {
+                coords.push(*b"opsz", size);
+            }
             FontData::from_blob(blob.clone(), 0).tweak(FontTweak {
-                coords: VariationCoords::new([(*b"wght", weight), (*b"opsz", 10.5)]),
+                coords,
                 ..Default::default()
             })
         };
-        faces.push(("ui", face(400.0)));
-        faces.push(("ui-semibold", face(600.0)));
-    } else if let (Some(regular), Some(bold)) = (read("segoeui.ttf"), read("seguisb.ttf")) {
-        faces.push(("ui", FontData::from_owned(regular)));
-        faces.push(("ui-semibold", FontData::from_owned(bold)));
+        vec![("ui", face(400.0)), ("ui-semibold", face(600.0))]
+    };
+    let pair = |regular: Vec<u8>, semibold: Vec<u8>| {
+        vec![
+            ("ui", FontData::from_owned(regular)),
+            ("ui-semibold", FontData::from_owned(semibold)),
+        ]
+    };
+    let read = |path: &Path| std::fs::read(path).ok();
+    let mut faces: Vec<(&str, FontData)> = Vec::new();
+    if cfg!(windows) {
+        let dir = PathBuf::from(std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into()))
+            .join("Fonts");
+        if let Some(bytes) = read(&dir.join("SegUIVar.ttf")) {
+            faces = variable(bytes, Some(10.5));
+        } else if let (Some(regular), Some(bold)) = (
+            read(&dir.join("segoeui.ttf")),
+            read(&dir.join("seguisb.ttf")),
+        ) {
+            faces = pair(regular, bold);
+        }
+    } else if cfg!(target_os = "macos") {
+        // San Francisco ships as one variable TrueType font; text optical size.
+        if let Some(bytes) = read(Path::new("/System/Library/Fonts/SFNS.ttf")) {
+            faces = variable(bytes, Some(13.0));
+        }
+    } else {
+        // Index font files by lowercase name under the usual fontconfig directories.
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let data = std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|h| h.join(".local/share")));
+        let mut stack: Vec<(PathBuf, u8)> = ["/usr/share/fonts", "/usr/local/share/fonts"]
+            .into_iter()
+            .map(PathBuf::from)
+            .chain(data.map(|d| d.join("fonts")))
+            .chain(home.map(|h| h.join(".fonts")))
+            .map(|dir| (dir, 0))
+            .collect();
+        let mut files = std::collections::HashMap::new();
+        while let Some((dir, depth)) = stack.pop() {
+            for item in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                match item.file_type() {
+                    Ok(kind) if kind.is_dir() => {
+                        if depth < 4 {
+                            stack.push((item.path(), depth + 1));
+                        }
+                    }
+                    Ok(_) => {
+                        let name = item.file_name().to_string_lossy().to_lowercase();
+                        files.entry(name).or_insert_with(|| item.path());
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+        // (variable TrueType files, static regular files, static semibold/bold files),
+        // in order of preference. A variable file wins over a static pair of the same
+        // family. CFF2 variable fonts (`*-VF.otf`) are left out on purpose.
+        const FAMILIES: [(&[&str], &[&str], &[&str]); 5] = [
+            (
+                &[
+                    "intervariable.ttf",
+                    "inter[opsz,wght].ttf",
+                    "inter-variable.ttf",
+                ],
+                &["inter-regular.ttf", "inter-regular.otf"],
+                &["inter-semibold.ttf", "inter-semibold.otf"],
+            ),
+            (
+                &[],
+                &["cantarell-regular.otf", "cantarell-regular.ttf"],
+                &["cantarell-bold.otf", "cantarell-bold.ttf"],
+            ),
+            // Ubuntu's UI font since 24.04, then the classic Ubuntu font.
+            (
+                &["ubuntusans[wdth,wght].ttf", "ubuntu[wdth,wght].ttf"],
+                &["ubuntu-r.ttf"],
+                &["ubuntu-m.ttf"],
+            ),
+            (
+                &["notosans[wght].ttf", "notosans[wdth,wght].ttf"],
+                &["notosans-regular.ttf"],
+                &["notosans-semibold.ttf", "notosans-bold.ttf"],
+            ),
+            (&[], &["dejavusans.ttf"], &["dejavusans-bold.ttf"]),
+        ];
+        let load = |names: &[&str]| {
+            names
+                .iter()
+                .find_map(|name| files.get(*name).and_then(|path| read(path)))
+        };
+        for (variable_names, regular, semibold) in FAMILIES {
+            if let Some(bytes) = load(variable_names) {
+                faces = variable(bytes, None);
+                break;
+            }
+            if let Some(semibold) = load(semibold)
+                && let Some(regular) = load(regular)
+            {
+                faces = pair(regular, semibold);
+                break;
+            }
+        }
     }
     let mut semibold = fallback.clone();
     for (name, data) in faces {
