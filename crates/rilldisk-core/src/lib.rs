@@ -416,6 +416,15 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
         multiple_links: false,
         fully_listed: false,
     }];
+    if let Some(warning) = volume.warning() {
+        add_issue(
+            &mut summary,
+            ScanIssue {
+                path: root.clone(),
+                message: warning.to_string(),
+            },
+        );
+    }
     let mut first_link: HashMap<(u64, u64), usize, IdentityHasher> = HashMap::default();
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(options.threads)

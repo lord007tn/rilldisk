@@ -59,6 +59,9 @@ fn unavailable(args: &Args, reason: &str, command: Option<&str>) -> Result<ExitC
 }
 
 fn run_blocking(args: Args) -> Result<ExitCode> {
+    if args.json && !args.check {
+        anyhow::bail!("--format json is only available with --check");
+    }
     if disabled_by_env() {
         return unavailable(
             &args,
@@ -77,7 +80,9 @@ fn run_blocking(args: Args) -> Result<ExitCode> {
     let source = std::env::current_exe()
         .map(|exe| detect_install(&exe.canonicalize().unwrap_or(exe)))
         .unwrap_or(InstallSource::Standalone);
-    if let (Ok(plan), InstallSource::Standalone) = (&plan, &source) {
+    // `--check` changes nothing: leftovers of an interrupted swap may be the
+    // only copies of the old or new binaries.
+    if let (false, Ok(plan), InstallSource::Standalone) = (args.check, &plan, &source) {
         cleanup_previous_update(&plan.dir);
     }
     let current = rilldisk_update::current_version();
@@ -95,8 +100,12 @@ fn run_blocking(args: Args) -> Result<ExitCode> {
     };
 
     if args.check {
+        let managed_update = managed.is_some() && check.update.is_some();
         report(&check, managed, args.json)?;
-        return Ok(ExitCode::from(if check.update.is_some() {
+        // Same codes as `rilldisk update`: a managed copy cannot update itself.
+        return Ok(ExitCode::from(if managed_update {
+            UNAVAILABLE
+        } else if check.update.is_some() {
             UPDATE_AVAILABLE
         } else {
             UP_TO_DATE

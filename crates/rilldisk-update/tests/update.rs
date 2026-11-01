@@ -274,3 +274,22 @@ fn traversal_entries_are_matched_by_file_name_only() {
     );
     assert!(!dir.path().parent().unwrap().join(exe("rilldisk")).exists());
 }
+
+#[test]
+fn a_page_reports_how_many_entries_it_listed() {
+    let json = include_bytes!("fixtures/releases.json");
+    let (releases, listed) = rilldisk_update::parse_release_page(json).unwrap();
+    assert!(listed >= releases.len());
+    assert_eq!(releases.len(), parse_releases(json).unwrap().len());
+}
+
+#[test]
+fn install_refuses_package_managed_binaries_before_downloading() {
+    let release = releases().into_iter().next().unwrap();
+    let plan = Plan {
+        dir: std::path::PathBuf::from("/opt/homebrew/bin"),
+        binaries: vec![std::path::PathBuf::from("/opt/homebrew/bin/rilldisk")],
+    };
+    let error = rilldisk_update::install(&release, &plan, &mut |_, _| {}).unwrap_err();
+    assert!(error.to_string().contains("Homebrew"), "{error}");
+}

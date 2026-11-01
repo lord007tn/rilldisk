@@ -3,7 +3,7 @@
 
 use crate::{
     Channel, Check, DISABLE_ENV, REPOSITORY, Release, current_version, disabled_by_env,
-    parse_releases, select_update, target,
+    parse_release_page, select_update, target,
 };
 use anyhow::{Context, Result, bail};
 use std::{io::Read, time::Duration};
@@ -49,11 +49,24 @@ fn guard(url: &str) -> Result<()> {
     Ok(())
 }
 
-/// Every published (non-draft) release, newest first, as GitHub lists them.
+/// Published (non-draft) releases, newest first, as GitHub lists them: every
+/// page until a short one, up to `MAX_PAGES` pages of `PAGE_SIZE`.
 pub fn fetch_releases() -> Result<Vec<Release>> {
-    let url = format!("https://api.github.com/repos/{REPOSITORY}/releases?per_page=30");
-    let bytes = download(&url, RELEASES_LIMIT, &mut |_, _| {})?;
-    parse_releases(&bytes)
+    const PAGE_SIZE: usize = 100;
+    const MAX_PAGES: usize = 5;
+    let mut releases = Vec::new();
+    for page in 1..=MAX_PAGES {
+        let url = format!(
+            "https://api.github.com/repos/{REPOSITORY}/releases?per_page={PAGE_SIZE}&page={page}"
+        );
+        let bytes = download(&url, RELEASES_LIMIT, &mut |_, _| {})?;
+        let (batch, listed) = parse_release_page(&bytes)?;
+        releases.extend(batch);
+        if listed < PAGE_SIZE {
+            break;
+        }
+    }
+    Ok(releases)
 }
 
 /// Ask GitHub for the newest release on `channel` newer than this build.

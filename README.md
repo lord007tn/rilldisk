@@ -126,7 +126,8 @@ Reclaimable: frees at least 209.4 MiB on disk (20.5 GiB total size) in 8 candida
 ```
 
 <sub>The demo disk is built from sparse files, so its on-disk FREES column is small by
-design. On real disks SIZE and FREES match unless hard links are involved.</sub>
+design. On real disks SIZE and FREES differ when files are hard-linked or sparse (a
+sparse file frees only its allocated blocks).</sub>
 
 **Why FREES matters.** pnpm, Cargo and others hard-link files, so a folder can look
 huge while its data also lives elsewhere. RillDisk tracks file identity and reports

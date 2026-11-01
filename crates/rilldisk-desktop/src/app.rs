@@ -859,7 +859,13 @@ impl RillApp {
                     search.request_focus();
                 }
                 let s = &snapshot.summary;
-                let (text, color) = if s.complete {
+                let (text, color) = if s.complete && s.skipped_mounts > 0 {
+                    // Other mounted filesystems were listed but not scanned.
+                    (
+                        format!("{} mounts not entered", style::count(s.skipped_mounts)),
+                        th.info,
+                    )
+                } else if s.complete {
                     ("Complete".to_string(), th.good)
                 } else if s.cancelled {
                     ("Stopped early · partial".to_string(), th.warn)
@@ -869,9 +875,17 @@ impl RillApp {
                         th.warn,
                     )
                 };
+                let mounts = if s.skipped_mounts > 0 {
+                    format!(
+                        "\n{} mount points here belong to other or virtual filesystems and were not scanned; their sizes are not included. The CLI's --cross-filesystems includes other disks.",
+                        style::count(s.skipped_mounts)
+                    )
+                } else {
+                    String::new()
+                };
                 let chip = w::chip(ui, &text, color).interact(Sense::click());
                 let chip = chip.on_hover_text(format!(
-                    "{} files · {} folders · scanned in {:.2} s (analysis {} ms)\nSize {} · unique {} · on disk {}{}",
+                    "{} files · {} folders · scanned in {:.2} s (analysis {} ms)\nSize {} · unique {} · on disk {}{}{mounts}",
                     style::count(s.files),
                     style::count(s.directories),
                     s.elapsed_ms as f64 / 1000.0,
@@ -2883,6 +2897,18 @@ impl RillApp {
                             .font(style::regular(11.5))
                             .color(th.dim),
                     );
+                    return;
+                }
+                if let Some(reason) = &release.blocked {
+                    ui.label(
+                        RichText::new(reason)
+                            .font(style::regular(11.5))
+                            .color(th.dim),
+                    );
+                    if w::button(ui, Kind::Soft, None, "Open the release page").clicked() {
+                        ui.ctx()
+                            .open_url(egui::OpenUrl::new_tab(&release.notes_url));
+                    }
                     return;
                 }
                 if let Some(command) = &release.update_command {

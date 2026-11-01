@@ -1,6 +1,7 @@
 # Proposal: automated releases and opt-in updates
 
-Status: implemented, November 1, 2026. The desktop UI wiring is pending.
+Status: implemented, November 1, 2026, in the CLI (`rilldisk update`) and the desktop
+(update card with Install and restart; daily check toggled from the sidebar).
 
 AGENTS.md requires a scoped proposal before RillDisk gains network behaviour.
 This document is that scope. Anything not described here is out of scope:

@@ -35,6 +35,13 @@ pub(crate) struct VolumeInfo {
     pub serial: u64,
 }
 
+impl VolumeInfo {
+    /// Windows has no scan-wide caveat to report.
+    pub(crate) fn warning(&self) -> Option<&str> {
+        None
+    }
+}
+
 /// Reparse points (junctions, symlinks, volume mount points) are never traversed,
 /// so a scan stays on the root's volume without any option.
 pub(crate) fn volume_info(root: &Path, _options: &ScanOptions) -> io::Result<VolumeInfo> {

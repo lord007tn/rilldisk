@@ -897,7 +897,8 @@ pub fn find_reclaimable(snapshot: &Snapshot, now_unix_ms: u64) -> ReclaimReport 
                 .and_then(quoted)
             {
                 Some(manifest) => format!("cargo clean --manifest-path {manifest}"),
-                None => rule.action.to_string(),
+                // A bare `cargo clean` would clean whatever project the shell is in.
+                None => "cargo clean --manifest-path <this project's Cargo.toml>".to_string(),
             }
         } else {
             rule.action.to_string()
@@ -1126,11 +1127,13 @@ fn directory_rule(
         "intermediate" | "deriveddatacache" if sibling_ext(".uproject") => &UNREAL,
         ".godot" if sibling("project.godot") => &GODOT,
         "$recycle.bin" => &RECYCLE,
-        // macOS `.Trashes` and freedesktop `.Trash-<uid>` folders at a volume root.
-        ".trashes" => &VOLUME_TRASH,
-        _ if lower
-            .strip_prefix(".trash-")
-            .is_some_and(|uid| !uid.is_empty() && uid.bytes().all(|b| b.is_ascii_digit())) =>
+        // macOS `.Trashes` and freedesktop `.Trash-<uid>` folders live at a volume
+        // root. Scans stay on one filesystem, so that is the top of the scan.
+        ".trashes" if parent == 0 => &VOLUME_TRASH,
+        _ if parent == 0
+            && lower
+                .strip_prefix(".trash-")
+                .is_some_and(|uid| !uid.is_empty() && uid.bytes().all(|b| b.is_ascii_digit())) =>
         {
             &VOLUME_TRASH
         }
@@ -1172,7 +1175,7 @@ fn location_rule(
         {
             let start = components.len() - pattern.len();
             let anchored = match pattern[0] {
-                "~" if !is_home(components, start) => continue,
+                "~" if !is_home(components, start, root_depth(snapshot)) => continue,
                 "appdata" => start >= 2 && components[start - 2] == "users",
                 // Drive prefix (`c:`), root, then `windows`. Unix paths start at `/`.
                 "windows" => start == 2 && !components[0].starts_with(['/', '\\']),
@@ -1192,10 +1195,22 @@ fn location_rule(
 }
 
 /// Whether `components[at]` is a home folder: `/home/<name>`, `/Users/<name>`,
-/// `C:\Users\<name>` or `/root`.
-fn is_home(components: &[String], at: usize) -> bool {
-    (at >= 1 && matches!(components[at - 1].as_str(), "home" | "users"))
+/// `C:\Users\<name>` or `/root`. The `home`/`Users` folder must sit at the
+/// filesystem or drive root, or directly inside the scanned folder; a copy of a
+/// profile deeper down (for example in a backup) is not a home.
+fn is_home(components: &[String], at: usize, scan_root: usize) -> bool {
+    let top = |index: usize| {
+        index == scan_root
+            || (index == 1 && components[0] == "/")
+            || (index == 2 && components[1] == "\\" && components[0].ends_with(':'))
+    };
+    (at >= 1 && matches!(components[at - 1].as_str(), "home" | "users") && top(at - 1))
         || (at == 1 && components[1] == "root" && components[0] == "/")
+}
+
+/// Number of path components of the scanned folder.
+fn root_depth(snapshot: &Snapshot) -> usize {
+    snapshot.path(0).components().count()
 }
 
 /// Split a subtree's files into space only this folder holds and hard-linked space.
@@ -1314,7 +1329,8 @@ fn agent_owner(path: &std::path::Path) -> Option<&'static str> {
         .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
         .collect();
     // `<tool>/worktrees/<something>`: only paths inside the folder count.
-    (0..parts.len().saturating_sub(2)).find_map(|i| {
+    // Innermost first: a Codex worktree inside a Claude Code worktree is Codex's.
+    (0..parts.len().saturating_sub(2)).rev().find_map(|i| {
         match (parts[i].as_str(), parts[i + 1].as_str()) {
             (".codex", "worktrees") => Some("Codex"),
             ("codex", "worktrees") if i > 0 && parts[i - 1] == "openai" => Some("Codex"),

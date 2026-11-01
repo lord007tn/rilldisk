@@ -158,6 +158,15 @@ pub fn install(
     plan: &Plan,
     progress: &mut dyn FnMut(u64, Option<u64>),
 ) -> Result<Installed> {
+    // Package-managed files are never modified, whoever calls this.
+    for binary in &plan.binaries {
+        if let InstallSource::Managed { manager, command } = detect_install(binary) {
+            anyhow::bail!(
+                "{} is managed by {manager}; update it with: {command}",
+                binary.display()
+            );
+        }
+    }
     let target = target().context("no prebuilt RillDisk release exists for this platform")?;
     let name = archive_name(&release.tag, target);
     let archive = release

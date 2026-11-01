@@ -34,6 +34,9 @@ pub(crate) struct VolumeInfo {
     mounts: HashMap<PathBuf, bool>,
     /// Parent directories of `mounts`, so most directories skip the path lookup.
     mount_parents: HashSet<PathBuf>,
+    /// Set when the mount table could not be read: bind mounts of the same
+    /// filesystem cannot be told apart and may be counted twice.
+    warning: Option<String>,
 }
 
 pub(crate) fn volume_info(root: &Path, options: &ScanOptions) -> io::Result<VolumeInfo> {
@@ -52,7 +55,16 @@ pub(crate) fn volume_info(root: &Path, options: &ScanOptions) -> io::Result<Volu
         cross_filesystems: options.cross_filesystems,
         ..Default::default()
     };
-    for mount in mount_table() {
+    let mounts = match read_mount_table() {
+        Ok(mounts) => mounts,
+        Err(error) => {
+            info.warning = Some(format!(
+                "cannot read the mount table ({error}); bind mounts inside this folder may be counted twice"
+            ));
+            Vec::new()
+        }
+    };
+    for mount in mounts {
         if mount.point != root && mount.point.starts_with(root) {
             if let Some(parent) = mount.point.parent() {
                 info.mount_parents.insert(parent.to_path_buf());
@@ -65,6 +77,11 @@ pub(crate) fn volume_info(root: &Path, options: &ScanOptions) -> io::Result<Volu
 }
 
 impl VolumeInfo {
+    /// A problem that makes the result less certain, reported as a scan issue.
+    pub(crate) fn warning(&self) -> Option<&str> {
+        self.warning.as_deref()
+    }
+
     /// Whether the directory `parent/name` (on `device`) must not be entered.
     fn skip(&self, parent: &Path, name: &OsStr, device: u64) -> bool {
         if always_skipped(parent, name) {
@@ -239,9 +256,17 @@ struct Mount {
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn mount_table() -> Vec<Mount> {
-    fs::read("/proc/self/mountinfo")
-        .map(|bytes| parse_mountinfo(&bytes))
-        .unwrap_or_default()
+    read_mount_table().unwrap_or_default()
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn read_mount_table() -> io::Result<Vec<Mount>> {
+    fs::read("/proc/self/mountinfo").map(|bytes| parse_mountinfo(&bytes))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn read_mount_table() -> io::Result<Vec<Mount>> {
+    Ok(mount_table())
 }
 
 /// Parse `/proc/self/mountinfo` (see proc(5)): fields 3-5 are `major:minor`, the
@@ -390,16 +415,15 @@ pub fn volumes() -> Vec<crate::Volume> {
     })
     .into_iter()
     .map(|(mount, total, free)| {
-        let label = labels
-            .get(Path::new(&mount.source))
-            .cloned()
-            .unwrap_or_else(|| {
-                if mount.fstype == "9p" {
-                    mount.source.clone()
-                } else {
-                    String::new()
-                }
-            });
+        let source =
+            fs::canonicalize(&mount.source).unwrap_or_else(|_| PathBuf::from(&mount.source));
+        let label = labels.get(&source).cloned().unwrap_or_else(|| {
+            if mount.fstype == "9p" {
+                mount.source.clone()
+            } else {
+                String::new()
+            }
+        });
         crate::Volume {
             removable: removable(&mount),
             root: mount.point,
@@ -428,10 +452,11 @@ fn linux_volumes(
     let mut seen = HashSet::new();
     let mut result = Vec::new();
     for mount in mounts {
-        if !mount.device.is_empty() && !seen.insert(mount.device.clone()) {
+        if !mount.device.is_empty() && seen.contains(&mount.device) {
             continue;
         }
         if let Some((total, free)) = capacity(&mount).filter(|(total, _)| *total > 0) {
+            seen.insert(mount.device.clone());
             result.push((mount, total, free));
         }
     }
@@ -586,6 +611,19 @@ mod tests {
             ["/", "/home", "/media/me/USB KEY", "/mnt/c"].map(PathBuf::from)
         );
         assert!(linux_volumes(parse_mountinfo(MOUNTINFO), |_| Some((0, 0))).is_empty());
+    }
+
+    #[test]
+    fn a_device_is_listed_through_any_mount_that_reports_capacity() {
+        // `/` cannot be measured, so its device appears through the bind mount.
+        let volumes = linux_volumes(parse_mountinfo(MOUNTINFO), |m| {
+            (m.point != Path::new("/")).then_some((100, 40))
+        });
+        let points: Vec<_> = volumes.iter().map(|(m, ..)| m.point.clone()).collect();
+        assert!(
+            points.contains(&PathBuf::from("/mnt/bind point")),
+            "{points:?}"
+        );
     }
 
     #[test]

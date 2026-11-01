@@ -338,6 +338,11 @@ impl Identity {
 static IS_DARK: AtomicBool = AtomicBool::new(false);
 static IDENTITY: AtomicU8 = AtomicU8::new(0);
 
+/// The active color identity.
+pub fn identity() -> Identity {
+    Identity::ALL[IDENTITY.load(Ordering::Relaxed) as usize]
+}
+
 /// The active theme.
 pub fn t() -> &'static Theme {
     Identity::ALL[IDENTITY.load(Ordering::Relaxed) as usize].theme(IS_DARK.load(Ordering::Relaxed))

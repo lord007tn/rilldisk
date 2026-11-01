@@ -21,16 +21,29 @@ fn main() -> eframe::Result {
     let mut dark = None;
     let mut identity = None;
     let mut size = [1480.0_f32, 920.0];
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1).peekable();
+    // An option's value, unless the next token is another option.
+    let value = |args: &mut std::iter::Peekable<_>| -> Option<String> {
+        let next: Option<&String> = args.peek();
+        next.filter(|v| !v.starts_with("--"))?;
+        args.next()
+    };
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--capture" => capture = args.next().map(PathBuf::from),
-            "--theme" => dark = args.next().map(|theme| theme == "dark"),
+            "--capture" => capture = value(&mut args).map(PathBuf::from),
+            // Unknown values keep the saved or system theme.
+            "--theme" => match value(&mut args).as_deref() {
+                Some("dark") => dark = Some(true),
+                Some("light") => dark = Some(false),
+                _ => {}
+            },
             "--palette" => {
-                identity = args.next().as_deref().and_then(style::Identity::parse);
+                if let Some(found) = value(&mut args).as_deref().and_then(style::Identity::parse) {
+                    identity = Some(found);
+                }
             }
             "--size" => {
-                if let Some((w, h)) = args.next().as_deref().and_then(|s| s.split_once('x')) {
+                if let Some((w, h)) = value(&mut args).as_deref().and_then(|s| s.split_once('x')) {
                     size = [w.parse().unwrap_or(size[0]), h.parse().unwrap_or(size[1])];
                 }
             }

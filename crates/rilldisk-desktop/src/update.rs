@@ -43,6 +43,9 @@ pub struct Release {
     /// Set when a package manager owns this install: show this command
     /// instead of an install button. `install_and_restart` refuses then.
     pub update_command: Option<String>,
+    /// Set when this copy cannot replace itself (for example a renamed program):
+    /// show this instead of an install button.
+    pub blocked: Option<String>,
     inner: up::Release,
 }
 
@@ -138,11 +141,17 @@ fn check_now(trigger: Trigger) -> Result<Option<Release>, String> {
         state.last_check_unix = Some(now);
         let _ = state.save();
     }
+    let mut blocked = None;
     let update_command = match install_source() {
         InstallSource::Managed { command, .. } => Some(command.to_owned()),
         InstallSource::Standalone => {
-            if let Ok(plan) = Plan::for_current_exe() {
-                up::cleanup_previous_update(&plan.dir);
+            match Plan::for_current_exe() {
+                Ok(plan) => up::cleanup_previous_update(&plan.dir),
+                Err(error) => {
+                    blocked = Some(format!(
+                        "This copy cannot update itself ({error:#}). Download the new version from the release page."
+                    ))
+                }
             }
             None
         }
@@ -154,6 +163,7 @@ fn check_now(trigger: Trigger) -> Result<Option<Release>, String> {
         version: inner.version.to_string(),
         notes_url: inner.notes_url.clone(),
         update_command,
+        blocked,
         inner,
     }))
 }
@@ -171,6 +181,9 @@ pub fn install_and_restart(ctx: &egui::Context, release: Release) -> Install {
             return Err(format!(
                 "This copy is managed by a package manager. Update with: {command}"
             ));
+        }
+        if let Some(reason) = release.blocked {
+            return Err(reason);
         }
         let plan = Plan::for_current_exe().map_err(|e| format!("{e:#}"))?;
         let mut last_repaint = 0;

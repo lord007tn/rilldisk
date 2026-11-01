@@ -22,7 +22,13 @@ pub fn load() -> Saved {
     for line in text.lines() {
         match line.split_once('=') {
             Some(("palette", value)) => saved.identity = Identity::parse(value.trim()),
-            Some(("theme", value)) => saved.dark = Some(value.trim() == "dark"),
+            Some(("theme", value)) => {
+                saved.dark = match value.trim() {
+                    "dark" => Some(true),
+                    "light" => Some(false),
+                    _ => None,
+                }
+            }
             _ => {}
         }
     }

@@ -35,7 +35,15 @@ pub struct Tile {
     pub radius: u8,
 }
 
-pub type Key = (usize, bool, [i32; 4], usize, ColorBy, bool, u32);
+pub type Key = (
+    usize,
+    bool,
+    [i32; 4],
+    usize,
+    ColorBy,
+    (style::Identity, bool),
+    u32,
+);
 
 #[derive(Default)]
 pub struct Layout {
@@ -134,7 +142,7 @@ pub fn key(p: &Params) -> Key {
         ],
         p.generation,
         p.color_by,
-        t().dark,
+        (style::identity(), t().dark),
         (p.pixels_per_point * 100.0) as u32 + u32::from(p.compact) * 100_000,
     )
 }

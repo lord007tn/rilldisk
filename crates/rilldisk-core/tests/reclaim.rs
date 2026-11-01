@@ -352,6 +352,12 @@ fn finds_unix_home_caches_trash_and_agent_worktrees() {
     write(&r.join("home/me/.claude-work/worktrees/agent-7/.git"), 40);
     write(&r.join("home/me/.t3/worktrees/repo/t3-1/.git"), 40);
     write(&r.join("home/me/.cursor/worktrees/gone/notes.md"), 700);
+    // A Codex worktree created inside a Claude Code worktree belongs to Codex.
+    write(&r.join("home/me/.claude/worktrees/outer/.git"), 40);
+    write(
+        &r.join("home/me/.claude/worktrees/outer/.codex/worktrees/inner/.git"),
+        40,
+    );
     // A macOS home.
     write(
         &r.join("Users/me/Library/Caches/Homebrew/downloads/x.tar.gz"),
@@ -368,9 +374,18 @@ fn finds_unix_home_caches_trash_and_agent_worktrees() {
     );
     write(&r.join("Users/me/Library/pnpm/store/v3/blob"), 2_000);
     write(&r.join("Users/me/.Trash/old.dmg"), 1_000);
-    // Per-volume trash folders.
-    write(&r.join("media/usb/.Trash-1000/files/x"), 300);
-    write(&r.join("media/disk/.Trashes/501/x"), 300);
+    // Per-volume trash folders sit at the top of the scanned volume.
+    write(&r.join(".Trash-1000/files/x"), 300);
+    write(&r.join(".Trashes/501/x"), 300);
+    // The same names deeper down are ordinary folders.
+    write(&r.join("proj/.Trash-1000/x"), 100);
+    write(&r.join("proj/.Trashes/x"), 100);
+    // A copy of a home folder inside a backup is not a home.
+    write(&r.join("backup/home/me/.cache/pip/x"), 100);
+    write(
+        &r.join("backup/Users/me/Library/Developer/Xcode/DerivedData/App/x"),
+        100,
+    );
     // Look-alikes outside a home folder, or with the wrong shape.
     write(&r.join("proj/.cache/x"), 100);
     write(&r.join("proj/Library/Caches/x"), 100);
@@ -416,6 +431,8 @@ fn finds_unix_home_caches_trash_and_agent_worktrees() {
     assert_eq!(agent.agent, Some("Claude Code"));
     assert_eq!(agent.category, Category::GitWorktree);
     assert_eq!(find(".t3/worktrees/repo/t3-1").agent, Some("T3 Code"));
+    assert_eq!(find(".claude/worktrees/outer").agent, Some("Claude Code"));
+    assert_eq!(find(".codex/worktrees/inner").agent, Some("Codex"));
     let orphan = find(".cursor/worktrees/gone");
     assert_eq!(orphan.label, "Orphaned agent worktree");
     assert_eq!(orphan.agent, Some("Cursor"));
@@ -434,8 +451,15 @@ fn finds_unix_home_caches_trash_and_agent_worktrees() {
         "pnpm store prune"
     );
     assert_eq!(find("Users/me/.Trash").category, Category::RecycleBin);
-    assert_eq!(find("usb/.Trash-1000").category, Category::RecycleBin);
-    assert_eq!(find("disk/.Trashes").category, Category::RecycleBin);
+    let root_trash = |name: &str| {
+        report
+            .candidates
+            .iter()
+            .find(|c| c.path == r.join(name))
+            .unwrap_or_else(|| panic!("missing {name}"))
+    };
+    assert_eq!(root_trash(".Trash-1000").category, Category::RecycleBin);
+    assert_eq!(root_trash(".Trashes").category, Category::RecycleBin);
 
     for false_positive in [
         "proj/.cache",
@@ -443,6 +467,12 @@ fn finds_unix_home_caches_trash_and_agent_worktrees() {
         "src/.Trash-old",
         "notes/.trash",
         "srv/me/.cache/pip",
+        "proj/.Trash-1000",
+        "proj/.Trashes",
+        "backup/home/me/.cache",
+        "backup/home/me/.cache/pip",
+        "Xcode/DerivedData/App",
+        "backup/Users/me/Library/Developer/Xcode/DerivedData",
     ] {
         assert!(
             !report
@@ -471,6 +501,9 @@ fn unix_suggested_commands_omit_unsafe_paths() {
     write(&r.join("plain/.git"), 40);
     write(&r.join(r"back\slash/.git"), 40);
     write(&r.join("cost$HOME/.git"), 40);
+    // A Cargo project whose manifest path cannot be quoted safely.
+    write(&r.join("cash$crate/Cargo.toml"), 40);
+    write(&r.join("cash$crate/target/debug/app"), 4_000);
     let snapshot = scan(r, ScanOptions::default(), Arc::default()).unwrap();
     let report = find_reclaimable(&snapshot, 0);
     let action = |name: &str| {
@@ -486,4 +519,8 @@ fn unix_suggested_commands_omit_unsafe_paths() {
     assert!(plain.ends_with("/plain\""), "{plain}");
     assert_eq!(action(r"back\slash"), "git worktree remove <this folder>");
     assert_eq!(action("cost$HOME"), "git worktree remove <this folder>");
+    assert_eq!(
+        action("cash$crate/target"),
+        "cargo clean --manifest-path <this project's Cargo.toml>"
+    );
 }

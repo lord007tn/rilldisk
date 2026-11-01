@@ -315,7 +315,7 @@ fn write_summary(writer: &mut dyn Write, snapshot: &Snapshot) -> Result<()> {
     if summary.skipped_mounts > 0 {
         writeln!(
             writer,
-            "Not entered: {} mount points of other or virtual filesystems (sizes excluded; see --cross-filesystems)",
+            "Not entered: {} mount points (sizes excluded). Virtual filesystems such as /proc are always skipped; --cross-filesystems includes other disks",
             summary.skipped_mounts
         )?;
     }

@@ -244,7 +244,8 @@ From a terminal in this directory:
 ./rilldisk-desktop
 ```
 
-`rilldisk drives` is Windows-only for now; on macOS and Linux pass a folder.
+`rilldisk drives` lists mounted disks with their capacity; scans stay on one
+filesystem unless you pass `--cross-filesystems`.
 {common_tail}"""
 
 

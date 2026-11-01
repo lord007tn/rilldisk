@@ -165,9 +165,16 @@ struct ApiRelease {
 /// Parse the body of `GET /repos/{owner}/{repo}/releases`. Drafts and tags
 /// that are not `v<semver>` are ignored.
 pub fn parse_releases(json: &[u8]) -> Result<Vec<Release>> {
+    parse_release_page(json).map(|(releases, _)| releases)
+}
+
+/// Like [`parse_releases`], also returning how many entries the page listed
+/// (drafts and unparsable tags included), so callers can tell a short page.
+pub fn parse_release_page(json: &[u8]) -> Result<(Vec<Release>, usize)> {
     let raw: Vec<ApiRelease> =
         serde_json::from_slice(json).context("unexpected GitHub releases response")?;
-    Ok(raw
+    let listed = raw.len();
+    let releases = raw
         .into_iter()
         .filter(|r| !r.draft)
         .filter_map(|r| {
@@ -180,7 +187,8 @@ pub fn parse_releases(json: &[u8]) -> Result<Vec<Release>> {
                 assets: r.assets,
             })
         })
-        .collect())
+        .collect();
+    Ok((releases, listed))
 }
 
 /// The newest release on `channel` that is newer than `current` and ships an

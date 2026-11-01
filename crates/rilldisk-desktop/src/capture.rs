@@ -62,6 +62,7 @@ impl Tour {
         use Target::*;
         let steps = if welcome_only {
             vec![
+                Theme(false),
                 Wait(30),
                 Shot("home"),
                 Theme(true),
@@ -71,6 +72,7 @@ impl Tour {
             ]
         } else {
             vec![
+                Theme(false),
                 WaitData,
                 Wait(24),
                 Shot("overview"),
