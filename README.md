@@ -97,11 +97,11 @@ Reclaimable: frees at least 209.4 MiB on disk (20.5 GiB total size) in 8 candida
 
       SIZE       FREES  SAFETY         IDLE  KIND                       PATH
    6.3 GiB    18.8 MiB  Regenerable      3d  Rust build output          C:\RillDisk Demo\Projects\ferrite-engine\target
-                        -> cargo clean
+                        -> cargo clean --manifest-path "C:\RillDisk Demo\Projects\ferrite-engine\Cargo.toml"
    4.6 GiB   256.0 KiB  Regenerable     20d  Python virtual environment C:\RillDisk Demo\Projects\ml-notebooks\.venv
                         -> Recreate from requirements or pyproject (python -m venv, uv sync)
    2.3 GiB     8.8 MiB  Review first   118d  Git worktree               C:\RillDisk Demo\Projects\ferrite-engine-perf
-                        -> git worktree remove "C:\RillDisk Demo\Projects\ferrite-engine-perf"  (refuses if there are uncommitted changes)
+                        -> git worktree remove "C:\RillDisk Demo\Projects\ferrite-engine-perf"
 ...
 ```
 
@@ -110,11 +110,14 @@ design. On real disks SIZE and FREES match unless hard links are involved.</sub>
 
 **Why FREES matters.** pnpm, Cargo and others hard-link files, so a folder can look
 huge while its data also lives elsewhere. RillDisk tracks file identity and reports
-the space that removing a folder frees *at least*. On the maintainer's machine, 112
-agent worktrees totaled 268 GB on paper but would free 64 GB; RillDisk says so
-up front. The desktop shows the same split ("frees ≥ … · … hard-linked").
+the space that removing a folder actually frees, counting every hard link it found
+in the scan (scan the whole drive for the most accurate figure). On the
+maintainer's machine, 112 agent worktrees totaled 268 GB on paper but would free
+64 GB; RillDisk says so up front. The desktop shows the same split
+("frees ≥ … · … hard-linked").
 
-Worktrees created by Claude Code, Codex, T3 Code, Cursor or Conductor are labeled
+Suggested commands paste as-is into PowerShell or Git Bash, and Git itself refuses
+to remove a worktree that has uncommitted changes. Worktrees created by Claude Code, Codex, T3 Code, Cursor or Conductor are labeled
 with their owner. Folders left in an agent's `worktrees` directory **without** a
 `.git` are flagged as *orphaned*: Git no longer knows them, so `git worktree remove`
 cannot help and they silently keep their full `node_modules`. Totals never double
