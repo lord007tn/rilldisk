@@ -29,9 +29,10 @@ pub(crate) const BACKEND: &str = "portable-walk";
 
 /// Per-scan volume facts shared by every directory read.
 #[derive(Debug, Clone, Copy, Default)]
+// The portable backend reads neither field yet; both are Windows facts today.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) struct VolumeInfo {
     pub allocation_unit: Option<u64>,
-    #[cfg_attr(not(windows), allow(dead_code))]
     pub serial: u64,
 }
 
