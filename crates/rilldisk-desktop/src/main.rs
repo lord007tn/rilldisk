@@ -8,6 +8,9 @@ mod icons;
 mod style;
 mod sunburst;
 mod treemap;
+// Update API for the UI to call; not wired into the interface yet.
+#[allow(dead_code)]
+mod update;
 mod widgets;
 
 use eframe::egui;

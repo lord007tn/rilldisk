@@ -1,0 +1,31 @@
+[package]
+name = "rilldisk-update"
+description = "Opt-in update checks and verified self-replacement for RillDisk binaries"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# The only RillDisk crate that talks to the network. See docs/proposals/updates.md.
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+flate2 = "1.1"
+semver = "1"
+sha2 = "0.11"
+tar = { version = "0.4", default-features = false }
+zip = { version = "9.2", default-features = false, features = ["deflate-flate2"] }
+
+# Windows and macOS use the OS TLS stack and trust store (Schannel,
+# Security.framework): no C toolchain needed and corporate roots just work.
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+ureq = { version = "3.5", default-features = false, features = ["native-tls-no-default"] }
+
+[target.'cfg(not(any(windows, target_os = "macos")))'.dependencies]
+ureq = { version = "3.5", default-features = false, features = ["rustls"] }
+
+[dev-dependencies]
+tempfile = "3"

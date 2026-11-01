@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 rilldisk-core = { path = "../rilldisk-core", version = "0.2.0" }
+rilldisk-update = { path = "../rilldisk-update", version = "0.2.0" }
 eframe = "0.37"
 rfd = "0.17"
 image = { version = "0.25", default-features = false, features = ["png"] }

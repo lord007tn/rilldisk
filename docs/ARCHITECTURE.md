@@ -146,6 +146,18 @@ tiles. Single-child folder chains fold into one header. `--capture DIR` runs a
 scripted tour that injects real pointer events and saves PNG frames for
 documentation.
 
+## Updates and releases
+
+`rilldisk-update` is the only crate with network code and depends on nothing
+else in the workspace. The CLI (`rilldisk update`) and the desktop
+(`src/update.rs`) call it. `rilldisk-core` and MCP never do. It reads the public
+GitHub releases list, picks the newest release on the channel that ships an
+archive for this target, verifies that archive against the release's
+`SHA256SUMS`, and swaps the executables by rename with rollback.
+`.github/workflows/release.yml` and `scripts/package_release.py` produce those
+archives. Scope, privacy and threat model are in
+[proposals/updates.md](proposals/updates.md).
+
 ## Direct NTFS backend
 
 WizTree documents direct MFT access as its NTFS speed advantage. This first
