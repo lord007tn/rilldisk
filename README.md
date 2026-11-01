@@ -34,7 +34,7 @@ your AI assistant sees exactly what you see.
 | **A map, not a list** | Squarified, cushion-shaded treemap rendered on the GPU (wgpu). Hover, click, zoom, breadcrumb back out. Folder chains like `SteamLibrary › … › common` fold into one header. |
 | **Reclaim, explained** | Finds Git worktrees (including forgotten **AI-agent worktrees**), `node_modules`, `target`, `.next`, `.venv`, Unity `Library`, package caches and temp folders — each with a safety level, reason, idle time, the exact command to run, and how much space it **really** frees once hard links are accounted for. |
 | **Built for agents too** | The same engine powers a CLI with JSON output and a local **MCP server**. Claude Code, Codex, Cursor or any MCP client can scan, query and explain your disk. |
-| **Read-only by design** | Metadata only. Never opens, uploads or deletes files. No telemetry, no network listener, no elevation. |
+| **Read-only by design** | Metadata only. Never opens, uploads or deletes files. No telemetry, no network listener, no elevation. The only network request is an [opt-out-able update check](docs/proposals/updates.md) that sends nothing about you. |
 | **Open source** | AGPL-3.0-only, pure Rust: no Electron, no Tauri, no webview, no JavaScript. |
 
 <table>
@@ -66,6 +66,11 @@ and extract it anywhere. It contains two programs:
 
 No installer, no admin rights, no account. Protected system folders appear under
 **Issues** and the result is clearly marked partial.
+
+`rilldisk update --check` reports whether a newer release exists; `rilldisk update`
+downloads it, verifies its SHA-256 and replaces both programs after you confirm.
+Set `RILLDISK_NO_UPDATE_CHECK=1` to turn update checks off entirely
+([details](docs/proposals/updates.md)).
 
 | Shortcut | Action |
 | --- | --- |
@@ -220,8 +225,9 @@ cargo build --release --locked
 .\target\release\rilldisk.exe reclaim $HOME
 ```
 
-The workspace has three crates: `rilldisk-core` (scanner, accounting, reclaim
-rules), `rilldisk` (CLI + MCP) and `rilldisk-desktop` (egui + wgpu). CLI and MCP
+The workspace has four crates: `rilldisk-core` (scanner, accounting, reclaim
+rules), `rilldisk` (CLI + MCP), `rilldisk-desktop` (egui + wgpu) and
+`rilldisk-update` (the only network code: opt-in update checks). CLI and MCP
 builds carry no renderer dependencies. See [architecture](docs/ARCHITECTURE.md).
 
 ```powershell
