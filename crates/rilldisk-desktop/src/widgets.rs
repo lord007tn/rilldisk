@@ -460,3 +460,27 @@ pub fn fit(
     job.wrap = egui::text::TextWrapping::truncate_at_width(width.max(8.0));
     painter.layout_job(job)
 }
+
+/// A floating glass panel: soft shadow and the popup surface.
+pub fn floating(p: &Painter, rect: Rect, radius: u8) {
+    shadow(p, rect, radius);
+    p.rect_filled(rect, radius, t().popup);
+}
+
+/// Ambient radial glow: opaque-ish center fading to nothing at `radius`.
+pub fn glow(p: &Painter, center: Pos2, radius: f32, color: Color32) {
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(center, color);
+    let steps = 96;
+    for i in 0..=steps {
+        let a = i as f32 / steps as f32 * TAU;
+        mesh.colored_vertex(
+            center + vec2(a.cos(), a.sin()) * radius,
+            Color32::TRANSPARENT,
+        );
+    }
+    for i in 1..=steps as u32 {
+        mesh.add_triangle(0, i, i + 1);
+    }
+    p.add(Shape::mesh(mesh));
+}

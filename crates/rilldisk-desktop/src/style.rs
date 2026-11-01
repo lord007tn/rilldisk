@@ -11,7 +11,7 @@ use eframe::egui::{
 use rilldisk_core::Safety;
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU8, Ordering},
 };
 
 pub struct Theme {
@@ -43,99 +43,309 @@ pub struct Theme {
     classes: [Color32; 9],
 }
 
-static LIGHT: Theme = Theme {
-    dark: false,
-    bg: Color32::from_rgb(255, 253, 249),
-    sidebar: Color32::from_rgb(247, 243, 237),
-    card: Color32::from_rgb(244, 240, 233),
-    hover: Color32::from_rgb(236, 231, 223),
-    press: Color32::from_rgb(226, 220, 210),
-    field: Color32::from_rgb(237, 232, 224),
-    popup: Color32::from_rgb(255, 255, 255),
-    text: Color32::from_rgb(31, 27, 24),
-    dim: Color32::from_rgb(112, 104, 96),
-    faint: Color32::from_rgb(160, 152, 143),
-    accent: Color32::from_rgb(239, 108, 56),
-    on_accent: Color32::WHITE,
-    good: Color32::from_rgb(30, 150, 92),
-    info: Color32::from_rgb(52, 120, 226),
-    warn: Color32::from_rgb(201, 128, 10),
-    danger: Color32::from_rgb(214, 64, 52),
-    ink: Color32::from_rgb(40, 32, 28),
-    ink_dim: Color32::from_rgba_premultiplied(40, 32, 28, 150),
-    shadow: Color32::from_rgba_premultiplied(8, 5, 3, 30),
-    stops: [
-        Color32::from_rgb(246, 184, 160),
-        Color32::from_rgb(249, 221, 150),
-        Color32::from_rgb(170, 222, 197),
-        Color32::from_rgb(170, 205, 242),
-        Color32::from_rgb(199, 186, 242),
-        Color32::from_rgb(240, 182, 212),
-    ],
-    classes: [
-        Color32::from_rgb(199, 186, 242),
-        Color32::from_rgb(240, 182, 212),
-        Color32::from_rgb(246, 184, 160),
-        Color32::from_rgb(249, 221, 150),
-        Color32::from_rgb(242, 160, 150),
-        Color32::from_rgb(170, 222, 197),
-        Color32::from_rgb(170, 205, 242),
-        Color32::from_rgb(186, 196, 240),
-        Color32::from_rgb(214, 207, 198),
-    ],
-};
-
-static DARK: Theme = Theme {
+static TIDE_DARK: Theme = Theme {
     dark: true,
-    bg: Color32::from_rgb(26, 21, 35),
-    sidebar: Color32::from_rgb(20, 16, 28),
-    card: Color32::from_rgb(38, 31, 51),
-    hover: Color32::from_rgb(50, 42, 66),
-    press: Color32::from_rgb(60, 51, 79),
-    field: Color32::from_rgb(33, 27, 45),
-    popup: Color32::from_rgb(45, 37, 60),
-    text: Color32::from_rgb(244, 240, 250),
-    dim: Color32::from_rgb(170, 160, 190),
-    faint: Color32::from_rgb(116, 106, 136),
-    accent: Color32::from_rgb(255, 126, 82),
-    on_accent: Color32::from_rgb(30, 14, 8),
-    good: Color32::from_rgb(132, 222, 96),
-    info: Color32::from_rgb(110, 160, 255),
-    warn: Color32::from_rgb(250, 196, 72),
-    danger: Color32::from_rgb(255, 110, 110),
+    bg: Color32::from_rgb(11, 16, 24),
+    sidebar: Color32::from_rgb(8, 12, 19),
+    card: Color32::from_rgb(19, 27, 38),
+    hover: Color32::from_rgb(28, 39, 54),
+    press: Color32::from_rgb(36, 49, 67),
+    field: Color32::from_rgb(15, 22, 32),
+    popup: Color32::from_rgb(24, 33, 47),
+    text: Color32::from_rgb(232, 240, 247),
+    dim: Color32::from_rgb(143, 160, 182),
+    faint: Color32::from_rgb(88, 104, 126),
+    accent: Color32::from_rgb(48, 222, 196),
+    on_accent: Color32::from_rgb(3, 28, 26),
+    good: Color32::from_rgb(74, 222, 128),
+    info: Color32::from_rgb(96, 165, 250),
+    warn: Color32::from_rgb(251, 191, 36),
+    danger: Color32::from_rgb(248, 113, 113),
     ink: Color32::from_rgb(255, 255, 255),
     ink_dim: Color32::from_rgba_premultiplied(190, 190, 190, 190),
     shadow: Color32::from_rgba_premultiplied(0, 0, 0, 110),
     stops: [
-        Color32::from_rgb(84, 118, 250),
-        Color32::from_rgb(124, 92, 246),
-        Color32::from_rgb(178, 80, 238),
-        Color32::from_rgb(226, 78, 196),
-        Color32::from_rgb(246, 104, 140),
-        Color32::from_rgb(251, 144, 92),
+        Color32::from_rgb(32, 201, 170),
+        Color32::from_rgb(34, 190, 234),
+        Color32::from_rgb(59, 141, 247),
+        Color32::from_rgb(99, 102, 241),
+        Color32::from_rgb(139, 92, 246),
+        Color32::from_rgb(192, 132, 252),
     ],
     classes: [
-        Color32::from_rgb(140, 102, 246),
-        Color32::from_rgb(232, 90, 180),
-        Color32::from_rgb(250, 140, 80),
-        Color32::from_rgb(232, 182, 50),
-        Color32::from_rgb(236, 84, 92),
-        Color32::from_rgb(56, 196, 160),
-        Color32::from_rgb(80, 140, 250),
-        Color32::from_rgb(110, 120, 240),
-        Color32::from_rgb(110, 102, 128),
+        Color32::from_rgb(139, 110, 246),
+        Color32::from_rgb(232, 121, 190),
+        Color32::from_rgb(245, 160, 72),
+        Color32::from_rgb(230, 192, 52),
+        Color32::from_rgb(240, 98, 110),
+        Color32::from_rgb(45, 200, 180),
+        Color32::from_rgb(64, 150, 250),
+        Color32::from_rgb(99, 112, 241),
+        Color32::from_rgb(100, 116, 139),
     ],
 };
 
+static TIDE_LIGHT: Theme = Theme {
+    dark: false,
+    bg: Color32::from_rgb(248, 250, 252),
+    sidebar: Color32::from_rgb(240, 244, 248),
+    card: Color32::from_rgb(235, 241, 246),
+    hover: Color32::from_rgb(225, 233, 240),
+    press: Color32::from_rgb(213, 223, 232),
+    field: Color32::from_rgb(229, 236, 242),
+    popup: Color32::from_rgb(255, 255, 255),
+    text: Color32::from_rgb(15, 23, 32),
+    dim: Color32::from_rgb(84, 100, 120),
+    faint: Color32::from_rgb(140, 154, 172),
+    accent: Color32::from_rgb(13, 148, 136),
+    on_accent: Color32::from_rgb(255, 255, 255),
+    good: Color32::from_rgb(22, 150, 74),
+    info: Color32::from_rgb(37, 99, 235),
+    warn: Color32::from_rgb(190, 128, 6),
+    danger: Color32::from_rgb(214, 45, 45),
+    ink: Color32::from_rgb(16, 34, 44),
+    ink_dim: Color32::from_rgba_premultiplied(10, 21, 27, 160),
+    shadow: Color32::from_rgba_premultiplied(1, 2, 3, 30),
+    stops: [
+        Color32::from_rgb(153, 230, 210),
+        Color32::from_rgb(150, 218, 240),
+        Color32::from_rgb(170, 200, 250),
+        Color32::from_rgb(192, 190, 248),
+        Color32::from_rgb(214, 192, 246),
+        Color32::from_rgb(238, 198, 228),
+    ],
+    classes: [
+        Color32::from_rgb(200, 190, 246),
+        Color32::from_rgb(244, 190, 222),
+        Color32::from_rgb(250, 205, 160),
+        Color32::from_rgb(246, 226, 150),
+        Color32::from_rgb(246, 176, 182),
+        Color32::from_rgb(160, 226, 210),
+        Color32::from_rgb(170, 204, 248),
+        Color32::from_rgb(186, 194, 246),
+        Color32::from_rgb(208, 214, 222),
+    ],
+};
+
+static MOSS_DARK: Theme = Theme {
+    dark: true,
+    bg: Color32::from_rgb(16, 18, 16),
+    sidebar: Color32::from_rgb(11, 13, 11),
+    card: Color32::from_rgb(25, 29, 25),
+    hover: Color32::from_rgb(35, 40, 35),
+    press: Color32::from_rgb(44, 50, 44),
+    field: Color32::from_rgb(21, 24, 21),
+    popup: Color32::from_rgb(32, 37, 32),
+    text: Color32::from_rgb(236, 240, 230),
+    dim: Color32::from_rgb(158, 168, 150),
+    faint: Color32::from_rgb(100, 110, 94),
+    accent: Color32::from_rgb(190, 242, 100),
+    on_accent: Color32::from_rgb(24, 34, 6),
+    good: Color32::from_rgb(134, 239, 172),
+    info: Color32::from_rgb(125, 211, 252),
+    warn: Color32::from_rgb(250, 204, 21),
+    danger: Color32::from_rgb(252, 129, 129),
+    ink: Color32::from_rgb(255, 255, 255),
+    ink_dim: Color32::from_rgba_premultiplied(190, 190, 190, 190),
+    shadow: Color32::from_rgba_premultiplied(0, 0, 0, 110),
+    stops: [
+        Color32::from_rgb(160, 220, 80),
+        Color32::from_rgb(84, 200, 112),
+        Color32::from_rgb(40, 180, 152),
+        Color32::from_rgb(48, 150, 186),
+        Color32::from_rgb(200, 176, 96),
+        Color32::from_rgb(226, 140, 72),
+    ],
+    classes: [
+        Color32::from_rgb(150, 130, 230),
+        Color32::from_rgb(226, 120, 170),
+        Color32::from_rgb(236, 160, 72),
+        Color32::from_rgb(222, 190, 60),
+        Color32::from_rgb(232, 100, 96),
+        Color32::from_rgb(84, 200, 112),
+        Color32::from_rgb(72, 150, 220),
+        Color32::from_rgb(120, 130, 220),
+        Color32::from_rgb(110, 120, 104),
+    ],
+};
+
+static MOSS_LIGHT: Theme = Theme {
+    dark: false,
+    bg: Color32::from_rgb(249, 249, 245),
+    sidebar: Color32::from_rgb(241, 242, 236),
+    card: Color32::from_rgb(236, 238, 230),
+    hover: Color32::from_rgb(226, 229, 219),
+    press: Color32::from_rgb(214, 218, 206),
+    field: Color32::from_rgb(230, 233, 224),
+    popup: Color32::from_rgb(255, 255, 255),
+    text: Color32::from_rgb(24, 28, 20),
+    dim: Color32::from_rgb(96, 104, 88),
+    faint: Color32::from_rgb(150, 156, 140),
+    accent: Color32::from_rgb(84, 134, 22),
+    on_accent: Color32::from_rgb(255, 255, 255),
+    good: Color32::from_rgb(22, 150, 74),
+    info: Color32::from_rgb(37, 99, 235),
+    warn: Color32::from_rgb(190, 128, 6),
+    danger: Color32::from_rgb(214, 45, 45),
+    ink: Color32::from_rgb(30, 36, 22),
+    ink_dim: Color32::from_rgba_premultiplied(18, 22, 13, 160),
+    shadow: Color32::from_rgba_premultiplied(2, 2, 1, 30),
+    stops: [
+        Color32::from_rgb(210, 238, 160),
+        Color32::from_rgb(176, 226, 180),
+        Color32::from_rgb(160, 220, 204),
+        Color32::from_rgb(168, 208, 226),
+        Color32::from_rgb(234, 220, 170),
+        Color32::from_rgb(244, 198, 160),
+    ],
+    classes: [
+        Color32::from_rgb(206, 196, 240),
+        Color32::from_rgb(240, 194, 218),
+        Color32::from_rgb(248, 208, 164),
+        Color32::from_rgb(240, 224, 150),
+        Color32::from_rgb(242, 182, 176),
+        Color32::from_rgb(176, 226, 180),
+        Color32::from_rgb(172, 206, 236),
+        Color32::from_rgb(190, 196, 236),
+        Color32::from_rgb(214, 216, 206),
+    ],
+};
+
+static AURORA_DARK: Theme = Theme {
+    dark: true,
+    bg: Color32::from_rgb(12, 12, 15),
+    sidebar: Color32::from_rgb(9, 9, 11),
+    card: Color32::from_rgb(23, 23, 28),
+    hover: Color32::from_rgb(33, 33, 40),
+    press: Color32::from_rgb(42, 42, 51),
+    field: Color32::from_rgb(19, 19, 23),
+    popup: Color32::from_rgb(30, 30, 36),
+    text: Color32::from_rgb(240, 240, 245),
+    dim: Color32::from_rgb(161, 161, 176),
+    faint: Color32::from_rgb(103, 103, 118),
+    accent: Color32::from_rgb(129, 140, 248),
+    on_accent: Color32::from_rgb(10, 10, 30),
+    good: Color32::from_rgb(74, 222, 128),
+    info: Color32::from_rgb(96, 165, 250),
+    warn: Color32::from_rgb(251, 191, 36),
+    danger: Color32::from_rgb(248, 113, 113),
+    ink: Color32::from_rgb(255, 255, 255),
+    ink_dim: Color32::from_rgba_premultiplied(190, 190, 190, 190),
+    shadow: Color32::from_rgba_premultiplied(0, 0, 0, 110),
+    stops: [
+        Color32::from_rgb(52, 211, 153),
+        Color32::from_rgb(34, 211, 238),
+        Color32::from_rgb(96, 165, 250),
+        Color32::from_rgb(129, 140, 248),
+        Color32::from_rgb(192, 132, 252),
+        Color32::from_rgb(240, 150, 240),
+    ],
+    classes: [
+        Color32::from_rgb(139, 110, 246),
+        Color32::from_rgb(232, 121, 190),
+        Color32::from_rgb(245, 160, 72),
+        Color32::from_rgb(230, 192, 52),
+        Color32::from_rgb(240, 98, 110),
+        Color32::from_rgb(45, 200, 180),
+        Color32::from_rgb(64, 150, 250),
+        Color32::from_rgb(99, 112, 241),
+        Color32::from_rgb(100, 116, 139),
+    ],
+};
+
+static AURORA_LIGHT: Theme = Theme {
+    dark: false,
+    bg: Color32::from_rgb(255, 255, 255),
+    sidebar: Color32::from_rgb(247, 247, 249),
+    card: Color32::from_rgb(243, 243, 246),
+    hover: Color32::from_rgb(234, 234, 239),
+    press: Color32::from_rgb(222, 222, 229),
+    field: Color32::from_rgb(238, 238, 242),
+    popup: Color32::from_rgb(255, 255, 255),
+    text: Color32::from_rgb(17, 17, 22),
+    dim: Color32::from_rgb(99, 99, 112),
+    faint: Color32::from_rgb(156, 156, 168),
+    accent: Color32::from_rgb(79, 70, 229),
+    on_accent: Color32::from_rgb(255, 255, 255),
+    good: Color32::from_rgb(22, 150, 74),
+    info: Color32::from_rgb(37, 99, 235),
+    warn: Color32::from_rgb(190, 128, 6),
+    danger: Color32::from_rgb(214, 45, 45),
+    ink: Color32::from_rgb(24, 24, 40),
+    ink_dim: Color32::from_rgba_premultiplied(15, 15, 25, 160),
+    shadow: Color32::from_rgba_premultiplied(1, 1, 3, 30),
+    stops: [
+        Color32::from_rgb(167, 236, 206),
+        Color32::from_rgb(165, 228, 244),
+        Color32::from_rgb(180, 208, 252),
+        Color32::from_rgb(198, 200, 252),
+        Color32::from_rgb(222, 198, 252),
+        Color32::from_rgb(246, 204, 246),
+    ],
+    classes: [
+        Color32::from_rgb(200, 190, 246),
+        Color32::from_rgb(244, 190, 222),
+        Color32::from_rgb(250, 205, 160),
+        Color32::from_rgb(246, 226, 150),
+        Color32::from_rgb(246, 176, 182),
+        Color32::from_rgb(160, 226, 210),
+        Color32::from_rgb(170, 204, 248),
+        Color32::from_rgb(186, 194, 246),
+        Color32::from_rgb(208, 214, 222),
+    ],
+};
+
+/// A color identity. Each has a paper (light) and a night (dark) variant.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Identity {
+    /// Water: aqua on deep ink. The RillDisk brand.
+    Tide,
+    /// Lichen green on graphite.
+    Moss,
+    /// Neutral zinc with an indigo accent and aurora charts.
+    Aurora,
+}
+
+impl Identity {
+    pub const ALL: [Identity; 3] = [Identity::Tide, Identity::Moss, Identity::Aurora];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Identity::Tide => "Tide",
+            Identity::Moss => "Moss",
+            Identity::Aurora => "Aurora",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|i| i.name().eq_ignore_ascii_case(text))
+    }
+
+    pub fn theme(self, dark: bool) -> &'static Theme {
+        match (self, dark) {
+            (Identity::Tide, false) => &TIDE_LIGHT,
+            (Identity::Tide, true) => &TIDE_DARK,
+            (Identity::Moss, false) => &MOSS_LIGHT,
+            (Identity::Moss, true) => &MOSS_DARK,
+            (Identity::Aurora, false) => &AURORA_LIGHT,
+            (Identity::Aurora, true) => &AURORA_DARK,
+        }
+    }
+}
+
 static IS_DARK: AtomicBool = AtomicBool::new(false);
+static IDENTITY: AtomicU8 = AtomicU8::new(0);
 
 /// The active theme.
 pub fn t() -> &'static Theme {
-    if IS_DARK.load(Ordering::Relaxed) {
-        &DARK
-    } else {
-        &LIGHT
-    }
+    Identity::ALL[IDENTITY.load(Ordering::Relaxed) as usize].theme(IS_DARK.load(Ordering::Relaxed))
+}
+
+/// Chart gradient stops of the active theme (for the logo and swatches).
+pub fn stops() -> &'static [Color32; 6] {
+    &t().stops
 }
 
 pub fn safety_color(safety: Safety) -> Color32 {
@@ -319,8 +529,15 @@ pub fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts());
 }
 
-pub fn apply(ctx: &egui::Context, dark: bool) {
+pub fn apply(ctx: &egui::Context, identity: Identity, dark: bool) {
     IS_DARK.store(dark, Ordering::Relaxed);
+    IDENTITY.store(
+        Identity::ALL
+            .iter()
+            .position(|&i| i == identity)
+            .unwrap_or(0) as u8,
+        Ordering::Relaxed,
+    );
     let th = t();
     let mut v = if dark {
         Visuals::dark()
@@ -494,10 +711,10 @@ pub fn icon(size: u32) -> egui::IconData {
     let mut rgba = vec![0_u8; (size * size * 4) as usize];
     let s = size as f32;
     let blocks: [(f32, f32, f32, f32, Color32); 4] = [
-        (0.17, 0.17, 0.56, 0.83, Color32::from_rgb(255, 126, 82)),
-        (0.60, 0.17, 0.83, 0.47, Color32::from_rgb(170, 205, 242)),
-        (0.60, 0.51, 0.83, 0.68, Color32::from_rgb(249, 221, 150)),
-        (0.60, 0.72, 0.83, 0.83, Color32::from_rgb(170, 222, 197)),
+        (0.17, 0.17, 0.56, 0.83, Color32::from_rgb(48, 222, 196)),
+        (0.60, 0.17, 0.83, 0.47, Color32::from_rgb(59, 141, 247)),
+        (0.60, 0.51, 0.83, 0.68, Color32::from_rgb(139, 92, 246)),
+        (0.60, 0.72, 0.83, 0.83, Color32::from_rgb(192, 132, 252)),
     ];
     let rounded = |fx: f32, fy: f32, x0: f32, y0: f32, x1: f32, y1: f32, r: f32| {
         let cx = fx.clamp(x0 + r, x1 - r);
@@ -514,7 +731,7 @@ pub fn icon(size: u32) -> egui::IconData {
             if !rounded(fx, fy, 0.0, 0.0, 1.0, 1.0, 0.22) {
                 continue;
             }
-            let mut color = Color32::from_rgb(34, 27, 46);
+            let mut color = Color32::from_rgb(11, 16, 24);
             for (x0, y0, x1, y1, c) in blocks {
                 if rounded(fx, fy, x0, y0, x1, y1, 0.05) {
                     color = c;

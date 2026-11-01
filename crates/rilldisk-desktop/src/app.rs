@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 use crate::capture::Tour;
 use crate::icons::{self, Icon};
-use crate::style::{self, FileClass, t};
+use crate::style::{self, FileClass, Identity, t};
 use crate::sunburst::{self, Hit, Rings};
 use crate::treemap::{self, ColorBy, Params};
 use crate::widgets::{self as w, Kind};
@@ -13,6 +13,9 @@ use rilldisk_core::{
     Candidate, Category, EntryKind, ReclaimReport, Safety, ScanControl, ScanOptions, Snapshot,
     TypeStat, Volume, file_types, find_reclaimable, largest_files, scan, volumes,
 };
+mod canvas;
+mod triage;
+
 use std::{
     collections::{HashMap, HashSet},
     f32::consts::TAU,
@@ -30,6 +33,35 @@ pub enum Tab {
     Types,
     Issues,
     Search,
+}
+
+/// Overall window layout.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Shell {
+    /// Sidebar, tabs and an overview of cards.
+    Dashboard,
+    /// The chart fills the window; controls float over it.
+    Canvas,
+    /// A reclaim inbox: categories, suggestions and an inspector.
+    Triage,
+}
+
+impl Shell {
+    pub const ALL: [Shell; 3] = [Shell::Dashboard, Shell::Canvas, Shell::Triage];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Shell::Dashboard => "Dashboard",
+            Shell::Canvas => "Canvas",
+            Shell::Triage => "Triage",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|s| s.name().eq_ignore_ascii_case(text))
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -123,6 +155,8 @@ enum Action {
     ScanThen(String, Tab, Option<Category>),
     Pick(usize),
     Theme(bool),
+    Identity(Identity),
+    Shell(Shell),
 }
 
 pub struct RillApp {
@@ -152,10 +186,16 @@ pub struct RillApp {
     pub safety_filter: Option<Safety>,
     pub category_filter: Option<Category>,
     pub picked: HashSet<usize>,
+    /// Candidate shown in the triage inspector.
+    pub inspect: Option<usize>,
     pub highlight: bool,
     toast: Option<(String, f64)>,
     pub dark: bool,
-    applied_dark: Option<bool>,
+    pub identity: Identity,
+    applied: Option<(Identity, bool)>,
+    pub shell: Shell,
+    /// Treemap of the inspected suggestion (triage).
+    inspect_map: treemap::Layout,
     after_scan: Option<(Tab, Option<Category>)>,
     pub tour: Option<Tour>,
     pub injected: Vec<egui::Event>,
@@ -178,11 +218,13 @@ impl RillApp {
         cc: &eframe::CreationContext<'_>,
         path: Option<String>,
         dark: Option<bool>,
+        identity: Identity,
+        shell: Shell,
         tour: Option<Tour>,
     ) -> Self {
         style::install_fonts(&cc.egui_ctx);
-        let dark = dark.unwrap_or(cc.egui_ctx.system_theme() == Some(egui::Theme::Dark));
-        style::apply(&cc.egui_ctx, dark);
+        let dark = dark.unwrap_or(cc.egui_ctx.system_theme() != Some(egui::Theme::Light));
+        style::apply(&cc.egui_ctx, identity, dark);
         let home = home_dir();
         let places = [
             ("Home", Icon::Home, String::new()),
@@ -229,10 +271,14 @@ impl RillApp {
             safety_filter: None,
             category_filter: None,
             picked: HashSet::new(),
+            inspect: None,
             highlight: false,
             toast: None,
             dark,
-            applied_dark: Some(dark),
+            identity,
+            applied: Some((identity, dark)),
+            shell,
+            inspect_map: Default::default(),
             after_scan: None,
             tour,
             injected: Vec::new(),
@@ -327,6 +373,7 @@ impl RillApp {
         self.generation += 1;
         self.search_results = None;
         self.picked.clear();
+        self.inspect = None;
         self.data = Some(Arc::new(data));
         match self.after_scan.take() {
             Some((tab, category)) => {
@@ -422,6 +469,13 @@ impl RillApp {
                     }
                 }
                 Action::Theme(dark) => self.dark = dark,
+                Action::Identity(identity) => self.identity = identity,
+                Action::Shell(shell) => {
+                    self.shell = shell;
+                    if shell == Shell::Canvas && self.tab == Tab::Overview {
+                        self.tab = Tab::Explore;
+                    }
+                }
             }
         }
     }
@@ -640,6 +694,14 @@ impl RillApp {
                 );
             });
             ui.add_space(10.0);
+            if let Some(shell) = shell_picker(ui, self.shell) {
+                actions.push(Action::Shell(shell));
+            }
+            ui.add_space(8.0);
+            if let Some(identity) = identity_picker(ui, self.identity) {
+                actions.push(Action::Identity(identity));
+            }
+            ui.add_space(8.0);
             let mut dark = self.dark;
             if w::segmented(
                 ui,
@@ -1342,9 +1404,38 @@ impl RillApp {
     fn explore(&mut self, ui: &mut Ui, data: &Data) -> Vec<Action> {
         let mut actions = Vec::new();
         let th = t();
-        let snapshot = &data.snapshot;
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
+            self.chart_controls(ui);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let snapshot = &data.snapshot;
+                let entry = &snapshot.entries[self.zoom];
+                ui.label(
+                    RichText::new(format!(
+                        "{} · {}",
+                        style::bytes(self.size(snapshot, self.zoom)),
+                        style::plural(entry.file_count, "file")
+                    ))
+                    .color(th.dim),
+                );
+            });
+        });
+        ui.add_space(12.0);
+        let full = ui.available_rect_before_wrap();
+        ui.allocate_rect(full, Sense::hover());
+        let panel_w = (full.width() * 0.3).clamp(300.0, 380.0);
+        let chart_rect =
+            Rect::from_min_max(full.min, pos2(full.right() - panel_w - 14.0, full.bottom()));
+        let panel_rect = Rect::from_min_max(pos2(chart_rect.right() + 14.0, full.top()), full.max);
+        ui.painter().rect_filled(chart_rect, 16, th.card);
+        actions.extend(self.chart_area(ui, data, chart_rect.shrink(10.0), chart_rect));
+        actions.extend(self.side_panel(ui, data, panel_rect, th.card));
+        actions
+    }
+
+    /// Map/Rings, color mode and the cleanable highlight toggle.
+    fn chart_controls(&mut self, ui: &mut Ui) {
+        {
             w::segmented(
                 ui,
                 &mut self.chart,
@@ -1383,27 +1474,15 @@ impl RillApp {
             {
                 self.highlight = !self.highlight;
             }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let entry = &snapshot.entries[self.zoom];
-                ui.label(
-                    RichText::new(format!(
-                        "{} · {}",
-                        style::bytes(self.size(snapshot, self.zoom)),
-                        style::plural(entry.file_count, "file")
-                    ))
-                    .color(th.dim),
-                );
-            });
-        });
-        ui.add_space(12.0);
-        let full = ui.available_rect_before_wrap();
-        ui.allocate_rect(full, Sense::hover());
-        let panel_w = (full.width() * 0.3).clamp(300.0, 380.0);
-        let chart_rect =
-            Rect::from_min_max(full.min, pos2(full.right() - panel_w - 14.0, full.bottom()));
-        let panel_rect = Rect::from_min_max(pos2(chart_rect.right() + 14.0, full.top()), full.max);
-        ui.painter().rect_filled(chart_rect, 16, th.card);
-        let inner = chart_rect.shrink(10.0);
+        }
+    }
+
+    /// The interactive chart inside `inner`; `clip` bounds its painting.
+    fn chart_area(&mut self, ui: &mut Ui, data: &Data, inner: Rect, clip: Rect) -> Vec<Action> {
+        let mut actions = Vec::new();
+        let th = t();
+        let snapshot = &data.snapshot;
+        let chart_rect = clip;
         let params = Params {
             root: self.zoom,
             rect: inner,
@@ -1612,16 +1691,15 @@ impl RillApp {
         } else if response.clicked() && self.chart == Chart::Rings {
             actions.push(Action::Up);
         }
-        actions.extend(self.side_panel(ui, data, panel_rect));
         actions
     }
 
     /// Contents of the hovered folder (or the shown one), like a Finder column.
-    fn side_panel(&mut self, ui: &mut Ui, data: &Data, rect: Rect) -> Vec<Action> {
+    fn side_panel(&mut self, ui: &mut Ui, data: &Data, rect: Rect, fill: Color32) -> Vec<Action> {
         let mut actions = Vec::new();
         let th = t();
         let snapshot = &data.snapshot;
-        ui.painter().rect_filled(rect, 16, th.card);
+        ui.painter().rect_filled(rect, 16, fill);
         let focus = match self.hovered {
             Some(id) if snapshot.entries[id].kind == EntryKind::Directory => id,
             Some(id) => snapshot.entries[id].parent_id.unwrap_or(self.zoom),
@@ -1798,7 +1876,6 @@ impl RillApp {
         let mut actions = Vec::new();
         let th = t();
         let report = &data.reclaim;
-        let snapshot = &data.snapshot;
         if report.candidates.is_empty() {
             empty_state(
                 ui,
@@ -1810,7 +1887,11 @@ impl RillApp {
         }
         // Summary
         let head = ui.available_rect_before_wrap();
-        let head = Rect::from_min_size(head.min, vec2(head.width(), 96.0));
+        let narrow = head.width() < 820.0;
+        let head = Rect::from_min_size(
+            head.min,
+            vec2(head.width(), if narrow { 132.0 } else { 96.0 }),
+        );
         ui.allocate_rect(head, Sense::hover());
         let p = ui.painter().clone();
         p.rect_filled(head, 16, th.card);
@@ -1842,17 +1923,23 @@ impl RillApp {
             caption,
             style::regular(12.0),
             th.faint,
-            inner.width() * 0.55,
+            if narrow {
+                inner.width()
+            } else {
+                inner.width() * 0.55
+            },
         );
         p.galley(inner.left_top() + vec2(0.0, 44.0), galley, th.faint);
-        let mut filters = ui.new_child(
-            UiBuilder::new()
-                .max_rect(Rect::from_min_max(
-                    pos2(inner.center().x, inner.top()),
-                    inner.max,
-                ))
-                .layout(Layout::right_to_left(Align::Min)),
-        );
+        let filter_rect = if narrow {
+            Rect::from_min_max(pos2(inner.left(), inner.bottom() - 32.0), inner.max)
+        } else {
+            Rect::from_min_max(pos2(inner.center().x, inner.top()), inner.max)
+        };
+        let mut filters = ui.new_child(UiBuilder::new().max_rect(filter_rect).layout(if narrow {
+            Layout::left_to_right(Align::Min)
+        } else {
+            Layout::right_to_left(Align::Min)
+        }));
         let mut safety = self.safety_filter;
         let count = |s: Safety| report.candidates.iter().filter(|c| c.safety == s).count();
         let labels = [
@@ -1994,149 +2081,169 @@ impl RillApp {
                             );
                         }
                         Row::Item(i) => {
-                            let c = &report.candidates[*i];
-                            let card = rect.shrink2(vec2(0.0, 3.0));
-                            let picked = self.picked.contains(i);
-                            p.rect_filled(
-                                card,
-                                12,
-                                if response.hovered() {
-                                    th.hover
-                                } else {
-                                    th.card
-                                },
-                            );
-                            let check = w::check(
-                                p,
-                                pos2(card.left() + 22.0, card.center().y),
-                                picked,
-                                response.hovered(),
-                            );
-                            let color = style::safety_color(c.safety);
-                            let tile = Rect::from_min_size(
-                                pos2(check.right() + 12.0, card.center().y - 17.0),
-                                vec2(34.0, 34.0),
-                            );
-                            p.rect_filled(
-                                tile,
-                                10,
-                                style::alpha(color, if th.dark { 46 } else { 34 }),
-                            );
-                            icons::paint(p, tile.shrink(9.0), category_icon(c), color);
-                            let text_x = tile.right() + 12.0;
-                            let right_w = 150.0;
-                            let text_w = card.right() - text_x - right_w;
-                            let mut title = c.label.to_string();
-                            if let Some(agent) = c.agent {
-                                title = format!("{title} · {agent}");
-                            }
-                            let galley =
-                                w::fit(p, title, style::semibold(13.5), th.text, text_w - 110.0);
-                            let title_w = galley.size().x;
-                            p.galley(pos2(text_x, card.top() + 11.0), galley, th.text);
-                            let mut chip_x = text_x + title_w + 8.0;
-                            let chip = w::chip_at(
-                                p,
-                                pos2(chip_x, card.top() + 20.0),
-                                c.safety.label(),
-                                color,
-                            );
-                            chip_x = chip.right() + 6.0;
-                            if c.nested_in.is_some() && chip_x + 60.0 < text_x + text_w {
-                                w::chip_at(p, pos2(chip_x, card.top() + 20.0), "nested", th.faint);
-                            }
-                            let path = w::fit(
-                                p,
-                                c.path.display().to_string(),
-                                style::mono(11.5),
-                                th.faint,
-                                text_w,
-                            );
-                            p.galley(pos2(text_x, card.top() + 34.0), path, th.faint);
-                            let size = frees(c, self.allocated);
-                            p.text(
-                                pos2(card.right() - 16.0, card.top() + 12.0),
-                                Align2::RIGHT_TOP,
-                                style::bytes(size),
-                                style::semibold(15.0),
-                                th.text,
-                            );
-                            let idle = match c.idle_days {
-                                Some(0) => "active today".to_string(),
-                                Some(1) => "idle 1 day".to_string(),
-                                Some(d) => format!("idle {d} days"),
-                                None => String::new(),
-                            };
-                            let detail = if c.shared_bytes > 0 {
-                                format!(
-                                    "of {} · {}",
-                                    style::bytes(size_metric(c, self.allocated)),
-                                    idle
-                                )
-                            } else {
-                                idle
-                            };
-                            p.text(
-                                pos2(card.right() - 16.0, card.top() + 34.0),
-                                Align2::RIGHT_TOP,
-                                detail,
-                                style::regular(11.5),
-                                th.faint,
-                            );
-                            // Row actions appear on hover.
-                            let mut action_rect = None;
-                            if response.hovered() || response.contains_pointer() {
-                                let r = Rect::from_min_size(
-                                    pos2(card.right() - right_w - 108.0, card.center().y - 16.0),
-                                    vec2(104.0, 32.0),
-                                );
-                                p.rect_filled(r.expand(4.0), 10, th.hover);
-                                action_rect = Some(r);
-                            }
-                            let mut clicked_action = false;
-                            if let Some(r) = action_rect {
-                                let mut bar = ui.new_child(
-                                    UiBuilder::new()
-                                        .max_rect(r)
-                                        .layout(Layout::left_to_right(Align::Center)),
-                                );
-                                bar.spacing_mut().item_spacing.x = 4.0;
-                                if w::icon_button(
-                                    &mut bar,
-                                    Icon::Terminal,
-                                    &format!("Copy command:\n{}", c.suggested_action),
-                                )
-                                .clicked()
-                                {
-                                    actions
-                                        .push(Action::Copy(c.suggested_action.clone(), "command"));
-                                    clicked_action = true;
-                                }
-                                if w::icon_button(&mut bar, Icon::Copy, "Copy path").clicked() {
-                                    actions
-                                        .push(Action::Copy(c.path.display().to_string(), "path"));
-                                    clicked_action = true;
-                                }
-                                if w::icon_button(&mut bar, Icon::Eye, "Show in Explore").clicked()
-                                {
-                                    actions.push(Action::Explore(c.entry_id));
-                                    self.highlight = true;
-                                    clicked_action = true;
-                                }
-                            }
-                            let tip = format!("{}\n\nSuggested: {}", c.reason, c.suggested_action);
-                            let response = response.on_hover_text(tip);
-                            if response.clicked() && !clicked_action {
-                                actions.push(Action::Pick(*i));
-                            }
-                            response.context_menu(|ui| {
-                                entry_menu(ui, snapshot, c.entry_id, &mut actions)
-                            });
+                            actions
+                                .extend(self.candidate_card(ui, data, *i, rect, response, false));
                         }
                     }
                 }
             });
         actions.extend(self.plan_bar(ui, data, list_rect));
+        actions
+    }
+
+    /// One reclaim suggestion as a card. In triage mode a click inspects it and
+    /// only the checkbox adds it to the plan; otherwise a click toggles the plan.
+    fn candidate_card(
+        &mut self,
+        ui: &mut Ui,
+        data: &Data,
+        i: usize,
+        rect: Rect,
+        response: egui::Response,
+        triage: bool,
+    ) -> Vec<Action> {
+        let mut actions = Vec::new();
+        let th = t();
+        let report = &data.reclaim;
+        let snapshot = &data.snapshot;
+        let p = ui.painter().clone();
+        let p = &p;
+        let c = &report.candidates[i];
+        let card = rect.shrink2(vec2(0.0, 3.0));
+        let picked = self.picked.contains(&i);
+        let inspected = triage && self.inspect == Some(i);
+        p.rect_filled(
+            card,
+            12,
+            if inspected {
+                style::alpha(th.accent, if th.dark { 40 } else { 28 })
+            } else if response.hovered() {
+                th.hover
+            } else {
+                th.card
+            },
+        );
+        let check = w::check(
+            p,
+            pos2(card.left() + 22.0, card.center().y),
+            picked,
+            response.hovered(),
+        );
+        let color = style::safety_color(c.safety);
+        let tile = Rect::from_min_size(
+            pos2(check.right() + 12.0, card.center().y - 17.0),
+            vec2(34.0, 34.0),
+        );
+        p.rect_filled(tile, 10, style::alpha(color, if th.dark { 46 } else { 34 }));
+        icons::paint(p, tile.shrink(9.0), category_icon(c), color);
+        let text_x = tile.right() + 12.0;
+        let right_w = 150.0;
+        let text_w = card.right() - text_x - right_w;
+        let mut title = c.label.to_string();
+        if let Some(agent) = c.agent {
+            title = format!("{title} · {agent}");
+        }
+        let galley = w::fit(p, title, style::semibold(13.5), th.text, text_w - 110.0);
+        let title_w = galley.size().x;
+        p.galley(pos2(text_x, card.top() + 11.0), galley, th.text);
+        let mut chip_x = text_x + title_w + 8.0;
+        let chip = w::chip_at(p, pos2(chip_x, card.top() + 20.0), c.safety.label(), color);
+        chip_x = chip.right() + 6.0;
+        if c.nested_in.is_some() && chip_x + 60.0 < text_x + text_w {
+            w::chip_at(p, pos2(chip_x, card.top() + 20.0), "nested", th.faint);
+        }
+        let path = w::fit(
+            p,
+            c.path.display().to_string(),
+            style::mono(11.5),
+            th.faint,
+            text_w,
+        );
+        p.galley(pos2(text_x, card.top() + 34.0), path, th.faint);
+        let size = frees(c, self.allocated);
+        p.text(
+            pos2(card.right() - 16.0, card.top() + 12.0),
+            Align2::RIGHT_TOP,
+            style::bytes(size),
+            style::semibold(15.0),
+            th.text,
+        );
+        let idle = match c.idle_days {
+            Some(0) => "active today".to_string(),
+            Some(1) => "idle 1 day".to_string(),
+            Some(d) => format!("idle {d} days"),
+            None => String::new(),
+        };
+        let detail = if c.shared_bytes > 0 {
+            format!(
+                "of {} · {}",
+                style::bytes(size_metric(c, self.allocated)),
+                idle
+            )
+        } else {
+            idle
+        };
+        p.text(
+            pos2(card.right() - 16.0, card.top() + 34.0),
+            Align2::RIGHT_TOP,
+            detail,
+            style::regular(11.5),
+            th.faint,
+        );
+        // Row actions appear on hover.
+        let mut action_rect = None;
+        if !triage && (response.hovered() || response.contains_pointer()) {
+            let r = Rect::from_min_size(
+                pos2(card.right() - right_w - 108.0, card.center().y - 16.0),
+                vec2(104.0, 32.0),
+            );
+            p.rect_filled(r.expand(4.0), 10, th.hover);
+            action_rect = Some(r);
+        }
+        let mut clicked_action = false;
+        if let Some(r) = action_rect {
+            let mut bar = ui.new_child(
+                UiBuilder::new()
+                    .max_rect(r)
+                    .layout(Layout::left_to_right(Align::Center)),
+            );
+            bar.spacing_mut().item_spacing.x = 4.0;
+            if w::icon_button(
+                &mut bar,
+                Icon::Terminal,
+                &format!("Copy command:\n{}", c.suggested_action),
+            )
+            .clicked()
+            {
+                actions.push(Action::Copy(c.suggested_action.clone(), "command"));
+                clicked_action = true;
+            }
+            if w::icon_button(&mut bar, Icon::Copy, "Copy path").clicked() {
+                actions.push(Action::Copy(c.path.display().to_string(), "path"));
+                clicked_action = true;
+            }
+            if w::icon_button(&mut bar, Icon::Eye, "Show in Explore").clicked() {
+                actions.push(Action::Explore(c.entry_id));
+                self.highlight = true;
+                clicked_action = true;
+            }
+        }
+        let response = if triage {
+            response
+        } else {
+            response.on_hover_text(format!("{}\n\nSuggested: {}", c.reason, c.suggested_action))
+        };
+        if response.clicked() && !clicked_action {
+            let on_check = response
+                .interact_pointer_pos()
+                .is_some_and(|pos| check.expand(10.0).contains(pos));
+            if triage && !on_check {
+                self.inspect = Some(i);
+            } else {
+                actions.push(Action::Pick(i));
+            }
+        }
+        response.context_menu(|ui| entry_menu(ui, snapshot, c.entry_id, &mut actions));
         actions
     }
 
@@ -2699,9 +2806,9 @@ impl RillApp {
 impl eframe::App for RillApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        if self.applied_dark != Some(self.dark) {
-            style::apply(&ctx, self.dark);
-            self.applied_dark = Some(self.dark);
+        if self.applied != Some((self.identity, self.dark)) {
+            style::apply(&ctx, self.identity, self.dark);
+            self.applied = Some((self.identity, self.dark));
         }
         self.poll(&ctx);
         let mut actions = self.shortcuts(&ctx);
@@ -2714,6 +2821,10 @@ impl eframe::App for RillApp {
                     None => self.home(ui),
                 });
             actions.extend(central.inner);
+        } else if self.shell == Shell::Canvas {
+            actions.extend(self.canvas(ui));
+        } else if self.shell == Shell::Triage {
+            actions.extend(self.triage(ui));
         } else {
             let side = egui::Panel::left("sidebar")
                 .exact_size(248.0)
@@ -2831,6 +2942,20 @@ fn agent_color(agent: &str) -> Color32 {
     }
 }
 
+fn safety_help(safety: Safety) -> &'static str {
+    match safety {
+        Safety::Regenerable => {
+            "Project tools rebuild or reinstall this from your source files (npm install, cargo build)."
+        }
+        Safety::Cache => {
+            "Downloaded or generated on demand; removing it costs time or bandwidth later."
+        }
+        Safety::Review => {
+            "May hold work that exists nowhere else, such as uncommitted changes. Look before removing."
+        }
+    }
+}
+
 fn category_title(category: Category) -> &'static str {
     match category {
         Category::GitWorktree => "Git worktrees",
@@ -2880,33 +3005,76 @@ fn class_bar(
     }
 }
 
+/// The mark: a rounded tile holding a stream of treemap blocks in theme colors.
 fn logo(p: &egui::Painter, rect: Rect) {
+    let th = t();
     let s = rect.width();
-    p.rect_filled(rect, (s * 0.24) as u8, Color32::from_rgb(34, 27, 46));
+    let stops = style::stops();
+    let tile = if th.dark { th.card } else { th.text };
+    p.rect_filled(rect, (s * 0.26) as u8, tile);
     let r = |x0: f32, y0: f32, x1: f32, y1: f32| {
         Rect::from_min_max(rect.min + vec2(x0, y0) * s, rect.min + vec2(x1, y1) * s)
     };
-    let radius = (s * 0.06).max(1.0) as u8;
-    p.rect_filled(
-        r(0.17, 0.17, 0.56, 0.83),
-        radius,
-        Color32::from_rgb(255, 126, 82),
-    );
-    p.rect_filled(
-        r(0.60, 0.17, 0.83, 0.47),
-        radius,
-        Color32::from_rgb(170, 205, 242),
-    );
-    p.rect_filled(
-        r(0.60, 0.51, 0.83, 0.68),
-        radius,
-        Color32::from_rgb(249, 221, 150),
-    );
-    p.rect_filled(
-        r(0.60, 0.72, 0.83, 0.83),
-        radius,
-        Color32::from_rgb(170, 222, 197),
-    );
+    let radius = (s * 0.07).max(1.0) as u8;
+    p.rect_filled(r(0.18, 0.18, 0.55, 0.82), radius, th.accent);
+    p.rect_filled(r(0.60, 0.18, 0.82, 0.46), radius, stops[2]);
+    p.rect_filled(r(0.60, 0.51, 0.82, 0.66), radius, stops[3]);
+    p.rect_filled(r(0.60, 0.71, 0.82, 0.82), radius, stops[5]);
+}
+
+/// Layout switcher; returns a newly chosen shell.
+fn shell_picker(ui: &mut Ui, current: Shell) -> Option<Shell> {
+    let mut shell = current;
+    let options: Vec<(Shell, Option<Icon>, &str)> =
+        Shell::ALL.iter().map(|&s| (s, None, s.name())).collect();
+    (w::segmented(ui, &mut shell, &options, "Layout") && shell != current).then_some(shell)
+}
+
+/// Three swatches; returns a newly chosen identity.
+fn identity_picker(ui: &mut Ui, current: Identity) -> Option<Identity> {
+    let th = t();
+    let mut chosen = None;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        for identity in Identity::ALL {
+            let theme = identity.theme(th.dark);
+            let (rect, response) = ui.allocate_exact_size(vec2(64.0, 30.0), Sense::click());
+            let p = ui.painter();
+            let active = identity == current;
+            p.rect_filled(
+                rect,
+                9,
+                if active {
+                    th.hover
+                } else if response.hovered() {
+                    style::alpha(th.hover, 140)
+                } else {
+                    Color32::TRANSPARENT
+                },
+            );
+            let dot = pos2(rect.left() + 14.0, rect.center().y);
+            p.circle_filled(dot, 7.0, theme.accent);
+            p.text(
+                pos2(rect.left() + 26.0, rect.center().y),
+                Align2::LEFT_CENTER,
+                identity.name(),
+                if active {
+                    style::semibold(12.0)
+                } else {
+                    style::regular(12.0)
+                },
+                if active { th.text } else { th.dim },
+            );
+            if response
+                .on_hover_text(format!("{} palette", identity.name()))
+                .clicked()
+                && !active
+            {
+                chosen = Some(identity);
+            }
+        }
+    });
+    chosen
 }
 
 fn crumb(ui: &mut Ui, text: &str, last: bool) -> egui::Response {
