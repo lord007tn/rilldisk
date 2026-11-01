@@ -455,7 +455,8 @@ fn finds_unix_home_caches_trash_and_agent_worktrees() {
         report
             .candidates
             .iter()
-            .find(|c| c.path == r.join(name))
+            // The scan reports the resolved root (macOS temp is behind /var -> /private/var).
+            .find(|c| c.path == snapshot.summary.root.join(name))
             .unwrap_or_else(|| panic!("missing {name}"))
     };
     assert_eq!(root_trash(".Trash-1000").category, Category::RecycleBin);
