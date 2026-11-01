@@ -3,7 +3,7 @@
 //!
 //! Pointer movement and clicks are injected as ordinary egui input events, so the
 //! recording exercises the same code paths as a person using the app.
-use crate::app::{RillApp, Tab as View, pointer_for};
+use crate::app::{Chart, RillApp, Tab as View, pointer_for};
 use eframe::egui::{self, Pos2, pos2};
 use rilldisk_core::Category;
 use std::{
@@ -31,11 +31,15 @@ pub enum Step {
     Record(bool),
     Move(Target, u32),
     Click(Target),
-    Zoom(Target),
-    ZoomRoot,
     Tab(View),
     Highlight(bool),
     Search(&'static str),
+    ChartKind(Chart),
+    /// Back to the scanned root.
+    Root,
+    Theme(bool),
+    /// Tick the largest candidates of a category in Clean up.
+    Pick(Category, usize),
     Quit,
 }
 
@@ -57,46 +61,82 @@ impl Tour {
         use Step::*;
         use Target::*;
         let steps = if welcome_only {
-            vec![Wait(30), Shot("welcome"), Quit]
+            vec![
+                Theme(false),
+                Wait(30),
+                Shot("home"),
+                Theme(true),
+                Wait(20),
+                Shot("home-dark"),
+                Quit,
+            ]
         } else {
             vec![
+                Theme(false),
                 WaitData,
-                Wait(20),
-                Record(true),
-                Wait(10),
-                Move(Entry("Videos"), 24),
-                Wait(14),
-                Move(Entry("Projects/ferrite-engine/target"), 24),
-                Wait(14),
-                Click(Entry("Projects/ferrite-engine/target")),
-                Wait(16),
-                Highlight(true),
-                Wait(18),
-                Move(Candidate(Category::GitWorktree), 24),
-                Wait(20),
-                Shot("map"),
-                Tab(View::Reclaim),
-                Wait(30),
-                Shot("reclaim"),
-                Tab(View::Map),
-                Highlight(false),
-                Zoom(Entry("Projects")),
-                Wait(20),
-                Move(Entry("Projects/atlas-web/node_modules"), 24),
-                Wait(20),
-                Shot("zoom"),
-                ZoomRoot,
-                Tab(View::Types),
                 Wait(24),
-                Shot("types"),
+                Shot("overview"),
+                Record(true),
+                Wait(8),
+                Move(Entry("Projects"), 22),
+                Wait(16),
+                Tab(View::Explore),
+                Wait(10),
+                Move(Entry("Videos"), 22),
+                Wait(12),
+                Move(Entry("Projects/ferrite-engine/target"), 22),
+                Wait(18),
+                Shot("explore"),
+                Highlight(true),
+                Wait(14),
+                Move(Candidate(Category::GitWorktree), 22),
+                Wait(18),
+                Shot("cleanable"),
+                Highlight(false),
+                ChartKind(Chart::Rings),
+                Wait(12),
+                Move(Entry("Games"), 22),
+                Wait(10),
+                Move(Entry("Projects"), 18),
+                Wait(8),
+                Click(Entry("Projects")),
+                Wait(16),
+                Move(Entry("Projects/atlas-web/node_modules"), 22),
+                Wait(18),
+                Shot("rings"),
+                Tab(View::Cleanup),
+                Wait(14),
+                Pick(Category::GitWorktree, 2),
+                Pick(Category::BuildOutput, 1),
+                Wait(18),
+                Shot("cleanup"),
                 Tab(View::Largest),
-                Wait(20),
+                Wait(18),
                 Record(false),
                 Shot("largest"),
+                Tab(View::Types),
+                Wait(14),
+                Shot("types"),
                 Search("worktree"),
                 Wait(30),
                 Shot("search"),
+                Theme(true),
+                Root,
+                Tab(View::Overview),
+                Wait(24),
+                Shot("overview-dark"),
+                Tab(View::Explore),
                 Wait(10),
+                Move(Entry("Videos"), 10),
+                Wait(14),
+                Shot("rings-dark"),
+                ChartKind(Chart::Map),
+                Wait(14),
+                Shot("explore-dark"),
+                Tab(View::Cleanup),
+                Wait(16),
+                Shot("cleanup-dark"),
+                Wait(6),
                 Quit,
             ]
         };
@@ -114,6 +154,25 @@ impl Tour {
             pending: Arc::default(),
         }
     }
+}
+
+/// Synthetic drives for screenshots, so public media shows no real machine.
+pub fn demo_volumes() -> Vec<rilldisk_core::Volume> {
+    const GB: u64 = 1 << 30;
+    [
+        ("C:\\", "Local Disk", 954 * GB, 212 * GB),
+        ("D:\\", "Projects", 1863 * GB, 1210 * GB),
+    ]
+    .into_iter()
+    .map(|(root, label, total, free)| rilldisk_core::Volume {
+        root: PathBuf::from(root),
+        label: label.into(),
+        filesystem: "NTFS".into(),
+        total_bytes: total,
+        free_bytes: free,
+        removable: false,
+    })
+    .collect()
 }
 
 fn save(ctx: &egui::Context, pending: &Arc<AtomicUsize>, path: PathBuf) {
@@ -217,18 +276,32 @@ pub fn advance(app: &mut RillApp, ctx: &egui::Context) {
                 tour.release = Some(pos);
             }
         }
-        Step::Zoom(target) => {
-            if let Some(id) = resolve(app, target) {
-                app.zoom = id;
-            }
-        }
-        Step::ZoomRoot => app.zoom = 0,
         Step::Tab(tab) => app.tab = tab,
-        Step::Highlight(on) => app.highlight_reclaim = on,
+        Step::Highlight(on) => app.highlight = on,
         Step::Search(text) => {
             app.search = text.into();
             app.run_search();
             app.tab = View::Search;
+        }
+        Step::ChartKind(chart) => app.chart = chart,
+        Step::Root => {
+            app.zoom = 0;
+            app.selected = None;
+        }
+        Step::Theme(dark) => app.dark = dark,
+        Step::Pick(category, n) => {
+            if let Some(data) = &app.data {
+                let picks: Vec<usize> = data
+                    .reclaim
+                    .candidates
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.category == category)
+                    .take(n)
+                    .map(|(i, _)| i)
+                    .collect();
+                app.picked.extend(picks);
+            }
         }
         Step::Quit => {
             if tour.pending.load(Ordering::SeqCst) == 0 {

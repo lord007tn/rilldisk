@@ -28,3 +28,35 @@ an explanation of why a graphical screenshot is not useful.
 PRs ready for review must not remain drafts. CI must not automatically build
 Docker images on pull requests. Do not commit credentials, local scan inventories
 or reports containing private filenames.
+
+## Commit messages
+
+Use [Conventional Commits](https://www.conventionalcommits.org/): `type(scope): summary`
+in the imperative, for example `fix(scan): keep junction loops out of totals`.
+Release notes are generated from these by changelogithub
+(`changelogithub.config.json`):
+
+| Type | Use for | In release notes |
+| --- | --- | --- |
+| `feat:` | user-visible capability | Features |
+| `fix:` | user-visible bug fix | Bug Fixes |
+| `perf:` | measurable speed or memory change | Performance |
+| `docs:` | documentation only | Documentation |
+| `ci:` / `chore:` / `test:` / `refactor:` | workflows, tooling, tests, internals | hidden |
+
+Mark breaking changes with `!` (`feat!: ...`) or a `BREAKING CHANGE:` footer.
+Optional scopes: `core`, `cli`, `mcp`, `desktop`, `reclaim`, `update`, `release`.
+Squash-merge titles must follow the same format.
+
+## Releases
+
+Releases are cut by pushing a `v<semver>` tag; see
+[docs/proposals/updates.md](docs/proposals/updates.md#cutting-a-release). The tag
+must equal `[workspace.package] version` and point at a commit on `main`; a
+`-beta.N` / `-rc.N` suffix publishes a pre-release. Until 1.0, fixes and small
+features ship as patch releases (`0.1.x`); the minor version moves only for a
+substantial change. Each release publishes its archives, `SHA256SUMS`,
+`BUILD-MANIFEST.json` and the `latest.yml` update feed together. Run the Release workflow
+manually on a branch for a dry run that builds and packages every target without
+publishing. Network code belongs only in `crates/rilldisk-update`, and MCP must
+not gain update tools.

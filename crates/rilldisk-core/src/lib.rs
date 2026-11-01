@@ -82,6 +82,11 @@ pub struct Summary {
     pub files: u64,
     pub directories: u64,
     pub skipped_links: u64,
+    /// Directories recorded but not entered because they belong to another
+    /// filesystem (a mount point) or to a virtual one such as `/proc`. Their sizes
+    /// are not included. Always zero on Windows, where mount points are reparse
+    /// points and count as `skipped_links`.
+    pub skipped_mounts: u64,
     pub hard_link_duplicates: u64,
     pub logical_bytes: u64,
     pub unique_logical_bytes: u64,
@@ -238,6 +243,9 @@ pub struct ScanOptions {
     pub threads: usize,
     /// A deliberate memory bound; reaching it yields a partial snapshot.
     pub max_entries: usize,
+    /// Unix: also enter other mounted filesystems below the root (like `du` without
+    /// `-x`). Virtual filesystems are skipped either way. Ignored on Windows.
+    pub cross_filesystems: bool,
 }
 
 impl Default for ScanOptions {
@@ -246,6 +254,7 @@ impl Default for ScanOptions {
             // Enumeration is latency-bound; more workers than cores helps on SSDs.
             threads: std::thread::available_parallelism().map_or(8, |n| n.get().clamp(8, 32)),
             max_entries: DEFAULT_MAX_ENTRIES,
+            cross_filesystems: false,
         }
     }
 }
@@ -271,6 +280,7 @@ fn read_task(walk: Arc<Walk>, key: usize, path: PathBuf) {
         // Once the entry budget has refused a record the result is partial anyway;
         // until then, children still get a chance (an empty folder costs nothing).
         if raw.kind != EntryKind::Directory
+            || raw.skipped
             || control.should_stop()
             || control.limit_reached.load(Ordering::Relaxed)
         {
@@ -335,6 +345,8 @@ pub(crate) struct RawEntry {
     allocated: Option<u64>,
     modified: Option<u64>,
     identity: Option<(u64, u64)>,
+    /// A directory the backend decided not to enter (another or virtual filesystem).
+    skipped: bool,
     /// Task key of a subdirectory a worker already queued for reading.
     key: Option<usize>,
 }
@@ -363,8 +375,9 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
     if !verbatim.is_dir() {
         bail!("scan root must be a directory");
     }
-    // Reparse points are never traversed, so one scan stays on the root's volume.
-    let volume = platform::volume_info(&verbatim)?;
+    // Links are never traversed; each backend also keeps the scan on the root's
+    // filesystem (Windows: reparse points; Unix: device and mount checks).
+    let volume = platform::volume_info(&verbatim, &options)?;
     let start = Instant::now();
     let root_modified = std::fs::symlink_metadata(&verbatim)
         .and_then(|m| m.modified())
@@ -379,6 +392,7 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
         files: 0,
         directories: 1,
         skipped_links: 0,
+        skipped_mounts: 0,
         hard_link_duplicates: 0,
         logical_bytes: 0,
         unique_logical_bytes: 0,
@@ -402,6 +416,15 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
         multiple_links: false,
         fully_listed: false,
     }];
+    if let Some(warning) = volume.warning() {
+        add_issue(
+            &mut summary,
+            ScanIssue {
+                path: root.clone(),
+                message: warning.to_string(),
+            },
+        );
+    }
     let mut first_link: HashMap<(u64, u64), usize, IdentityHasher> = HashMap::default();
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(options.threads)
@@ -531,6 +554,8 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
                 match raw.kind {
                     EntryKind::Directory => {
                         summary.directories += 1;
+                        // Never listed, so it stays `fully_listed: false`.
+                        summary.skipped_mounts += u64::from(raw.skipped);
                         if let Some(child) = raw.key {
                             if ids.len() <= child {
                                 ids.resize(child + 1, usize::MAX);

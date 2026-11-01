@@ -1,15 +1,16 @@
 # Architecture
 
-Status: phase one plus the first desktop release, November 1, 2026.
+Status: phase one plus the first desktop release and the Linux/macOS backend,
+November 1, 2026.
 
 ```text
                     ┌─ rilldisk (CLI): table / JSON / JSONL, reclaim, drives
 rilldisk-core ──────┼─ rilldisk mcp: stdio, background job, paginated queries
-  scan · reclaim    └─ rilldisk-desktop: egui on wgpu, treemap, tree, reclaim
+  scan · reclaim    └─ rilldisk-desktop: egui on wgpu, overview, treemap, rings, clean up
   stats · volumes
        │
        ├─ Windows: batched Win32 directory metadata
-       └─ portable walk: development / test fallback
+       └─ Linux, macOS: readdir + one no-follow stat, mount-aware
 ```
 
 ## Phase-one contracts
@@ -54,6 +55,58 @@ partial result. Progress counters update during enumeration. Paths, frontier cop
 the hard-link set and query sorting add memory. Five million entries can require substantial RAM. A
 compact name arena and indexed queries should follow profiling, not precede it.
 
+## Unix backend (Linux, macOS)
+
+`unix-readdir` plugs into the same parallel walk, so scheduling, the shared entry
+budget, cancellation and stall reporting are identical to Windows. Each directory
+is listed with `std::fs::read_dir` (`getdents64` on Linux, `readdir` on macOS).
+The listing's type (`d_type`) is enough for symlinks, sockets, FIFOs and devices,
+which therefore cost no further call. Regular files and directories get one
+no-follow metadata call each: `statx`/`fstatat` relative to the open directory
+handle on Linux, `lstat` on macOS. Symlinks are listed as links and never followed.
+
+* **Allocation** is `st_blocks * 512` (512-byte units on both kernels), so sparse
+  files report what they occupy. Directory blocks are excluded, as on Windows.
+* **Hard links** use `(st_dev, st_ino)`. Only files with `st_nlink > 1` enter the
+  identity table; a single-link file cannot be a duplicate, so the table stays
+  small. First-encounter attribution, `unique_logical_bytes`,
+  `hard_link_duplicate` and `multiple_links` behave exactly as on Windows.
+* **Times** come from `st_mtime` with nanoseconds, truncated to milliseconds.
+* **Unreadable folders** (`EACCES`) and entries that vanish between listing and
+  `stat` become issues, and the result is partial.
+
+A scan stays on the root's filesystem by default, like `du -x`. At scan start the
+backend records the root's device and, on Linux, every mount point below the root
+from `/proc/self/mountinfo` (macOS: `getfsstat`). A directory on another device, or
+listed as a mount point (which also catches same-device bind mounts), is recorded
+as a directory but not entered: `fully_listed` stays false, its sizes are not
+included, and `summary.skipped_mounts` counts it. `ScanOptions::cross_filesystems`
+(`--cross-filesystems`) enters real filesystems, but virtual ones are always
+skipped: `/proc`, `/sys`, `/dev` and `/run` at the top of the tree, and any mount of
+type proc, sysfs, devtmpfs, tmpfs, cgroup, overlay, squashfs (snaps), autofs and
+similar. On macOS `/dev`, `/Volumes` and `/System/Volumes` are always skipped when
+reached from `/`. `/System/Volumes/Data` holds the same files that firmlinks such as
+`/Users` and `/Applications` show, so the Data volume's device counts as part of a
+root on the system volume and its own mount point is never entered twice.
+
+Known gaps: bind mounts are entered with `--cross-filesystems` and can then repeat
+content; APFS clones and btrfs/XFS reflinks share blocks that `st_blocks` reports
+once per file, so allocation over-counts them; btrfs subvolumes have their own
+device numbers and are skipped without the option (as with `du -x`).
+
+`volumes()` lists disk-backed filesystems. Linux reads `/proc/self/mountinfo`,
+keeps ext*, XFS, btrfs, ZFS, FAT/exFAT/NTFS and similar plus WSL `drvfs` drives,
+drops pseudo, overlay, snap, network and `/boot` mounts, shows one row per
+`major:minor` (the shortest mount point), and reads capacity with `statvfs`. Labels
+come from `/dev/disk/by-label`; removable media from sysfs or `/media`. macOS lists
+`/` and browsable local volumes under `/Volumes` with `getfsstat`. `free_bytes` is
+`f_bfree`, matching the Windows total-free figure.
+
+Measured so far (Linux under WSL2 only; macOS is verified by CI tests, not timed):
+file and folder counts of `/usr` and `/` match `find -xdev`, unique bytes match
+`du --apparent-size` apart from symlink lengths, and allocated bytes match `du -B1`
+apart from directory blocks. See [PERFORMANCE.md](PERFORMANCE.md#linux-wsl2-observation).
+
 ## MCP state
 
 The official `rmcp` SDK owns transport/protocol negotiation. The executable
@@ -84,14 +137,42 @@ contents are read and nothing is modified.
 
 `rilldisk-desktop` is a separate crate on eframe/egui with the wgpu renderer, so
 CLI and MCP builds carry no GPU dependencies. Scans and analysis (reclaim, types,
-largest files) run on a worker thread; the UI thread only polls progress counters
-and swaps in a finished `Arc<Snapshot>`. The tree is virtualized (only visible
-rows are laid out). The treemap is a squarified layout computed once per (zoom
-root, size metric, canvas size) and cached as a single vertex mesh with four-
-corner cushion shading, capped at 120,000 tiles; hit testing walks the cached
-tiles. Single-child folder chains fold into one header. `--capture DIR` runs a
-scripted tour that injects real pointer events and saves PNG frames for
-documentation.
+largest files, agent grouping) run on a worker thread; the UI thread only polls
+progress counters and swaps in a finished `Arc<Snapshot>`.
+
+* **Design tokens** live in `style.rs`: three color identities (Tide, Moss,
+  Aurora), each with a light and dark theme, read through one `t()` accessor.
+  Surfaces are separated by tone, not outlines. Fonts are the platform's own
+  (Segoe UI Variable, SF, or a common Linux sans) with a variable-weight semibold.
+  The chosen palette and theme are remembered in a small `desktop.txt` beside the
+  update preferences.
+* **Treemap** (`treemap.rs`): squarified layout of up to four levels below the
+  shown folder, computed once per (root, metric, canvas, theme) and tessellated
+  with egui's feathering into one cached mesh of rounded tiles (capped at 40,000).
+  Hit testing walks the cached tiles; single-child folder chains fold into one
+  label. Tiles are colored by top-level folder (a gradient position shared with
+  the rings) or by file type.
+* **Rings** (`sunburst.rs`): a six-level sunburst built into one mesh of
+  anti-aliased annular sectors (each a 4 × n vertex grid whose outer rows fade over
+  one pixel) and hit-tested in polar coordinates.
+* **Views**: Overview, Explore (map or rings plus a virtualized folder list),
+  Clean up (virtualized, grouped by category, with a plan that is only ever copied
+  to the clipboard), Largest files, File types, Unread and Search.
+
+`--capture DIR` runs a scripted tour that injects real pointer events and saves PNG
+frames for documentation, with invented drives in place of the real ones.
+
+## Updates and releases
+
+`rilldisk-update` is the only crate with network code and depends on nothing
+else in the workspace. The CLI (`rilldisk update`) and the desktop
+(`src/update.rs`) call it. `rilldisk-core` and MCP never do. It reads the public
+GitHub releases list, picks the newest release on the channel that ships an
+archive for this target, verifies that archive against the release's
+`SHA256SUMS`, and swaps the executables by rename with rollback.
+`.github/workflows/release.yml` and `scripts/package_release.py` produce those
+archives. Scope, privacy and threat model are in
+[proposals/updates.md](proposals/updates.md).
 
 ## Direct NTFS backend
 

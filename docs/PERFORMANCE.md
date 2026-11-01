@@ -1,6 +1,7 @@
 # Performance measurements
 
-The phase-one backend is `win32-batched-directory`. It does not read the MFT.
+The Windows backend is `win32-batched-directory`. It does not read the MFT. Linux
+and macOS use `unix-readdir` (see [ARCHITECTURE.md](ARCHITECTURE.md)).
 Do not describe it as faster than another product without comparable measurements.
 
 ## Reproduce the synthetic benchmark
@@ -59,7 +60,7 @@ several coding agents), so ranges are reported and no samples were dropped.
 
 Changes measured along the way, same workspace unless noted:
 
-* Group barrier of 16 folders (v0.1.0-alpha.1 design), 8 threads: 14.5 s.
+* Group barrier of 16 folders (first prototype design), 8 threads: 14.5 s.
 * Barrier of 4,096 folders, 24 threads, volume identity read once: about 5.5 s,
   but one unresponsive folder under `C:\Users` stalled all progress for minutes
   (422 s total).
@@ -73,3 +74,46 @@ Changes measured along the way, same workspace unless noted:
 
 Still not measured: cold-cache runs after cache eviction, elevated runs, and a
 like-for-like comparison with WizTree's MFT mode.
+
+## Linux (WSL2) observation
+
+November 1, 2026, release build, WSL2 Ubuntu (kernel 6.18, glibc 2.43) on the same
+Core Ultra 9 285HX, 24 logical CPUs, ext4 on the WSL virtual disk, ordinary user,
+default settings. Warm cache: the page cache was not dropped (no root), and the
+machine was busy with other builds. macOS is built and tested in CI but has no
+timing yet.
+
+Synthetic benchmark (`scripts/benchmark.py`, 50,000 one-KiB files in 257 folders,
+fixture on ext4 via `TMPDIR`, five fresh processes each):
+
+| Threads | Scanner times (ms) | Median | Process median |
+| ---: | --- | ---: | ---: |
+| 1 | 77, 79, 86, 81, 78 | 79 ms | 92.9 ms |
+| 8 | 30, 10, 14, 12, 11 | 12 ms | 22.5 ms |
+
+With the fixture on tmpfs (`/tmp`) the 8-thread median was also 12 ms.
+
+Real trees, `rilldisk scan ROOT --format json --output FILE`, three runs:
+
+| Root | Files / folders | Scanner time | Process wall time | Peak RSS |
+| --- | ---: | ---: | ---: | ---: |
+| `/usr` | 36,589 / 4,510 | 24 ms | 0.05–0.07 s | ~14 MB |
+| `/` (one filesystem) | 329,291 / 33,236 | 274 ms | 0.95–1.12 s warm; 26.8 s first run | ~74–89 MB |
+
+Process time for `/` is dominated by writing the 360,000-entry JSON file. The first
+`/` run read most of the tree for the first time since boot; it is not a controlled
+cold-cache measurement.
+
+Accounting checks on `/usr`:
+
+* Files and folders equal `find /usr -xdev -type f` / `-type d` (36,589 / 4,510).
+* Unique bytes 1,455,154,218 plus 51,917 bytes of symlink targets equal
+  `du -sx --apparent-size -B1` (1,455,206,135) exactly.
+* Allocated bytes 1,540,386,816 plus 19,603,456 bytes of directory blocks and 4,096
+  bytes of symlink blocks equal `du -sxB1` (1,559,994,368) exactly.
+* 116 hard-link duplicates; three mount points below `/usr` (WSL driver and library
+  mounts) were recorded and not entered.
+
+On `/`, a sorted path-by-path comparison with `find / -xdev -type f` differed only
+in files another process was creating and deleting in a build directory during the
+runs. The 27 issues were folders that an ordinary user cannot read.

@@ -4,8 +4,13 @@
 
 mod app;
 mod capture;
+mod icons;
+mod settings;
 mod style;
+mod sunburst;
 mod treemap;
+mod update;
+mod widgets;
 
 use eframe::egui;
 use std::{path::PathBuf, sync::Arc};
@@ -13,13 +18,32 @@ use std::{path::PathBuf, sync::Arc};
 fn main() -> eframe::Result {
     let mut path = None;
     let mut capture = None;
+    let mut dark = None;
+    let mut identity = None;
     let mut size = [1480.0_f32, 920.0];
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1).peekable();
+    // An option's value, unless the next token is another option.
+    let value = |args: &mut std::iter::Peekable<_>| -> Option<String> {
+        let next: Option<&String> = args.peek();
+        next.filter(|v| !v.starts_with('-'))?;
+        args.next()
+    };
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--capture" => capture = args.next().map(PathBuf::from),
+            "--capture" => capture = value(&mut args).map(PathBuf::from),
+            // Unknown values keep the saved or system theme.
+            "--theme" => match value(&mut args).as_deref() {
+                Some("dark") => dark = Some(true),
+                Some("light") => dark = Some(false),
+                _ => {}
+            },
+            "--palette" => {
+                if let Some(found) = value(&mut args).as_deref().and_then(style::Identity::parse) {
+                    identity = Some(found);
+                }
+            }
             "--size" => {
-                if let Some((w, h)) = args.next().as_deref().and_then(|s| s.split_once('x')) {
+                if let Some((w, h)) = value(&mut args).as_deref().and_then(|s| s.split_once('x')) {
                     size = [w.parse().unwrap_or(size[0]), h.parse().unwrap_or(size[1])];
                 }
             }
@@ -34,7 +58,7 @@ fn main() -> eframe::Result {
                     );
                 }
                 println!(
-                    "rilldisk-desktop [PATH] [--size WIDTHxHEIGHT] [--capture DIR]\n\nOpens the RillDisk desktop app. PATH starts a scan immediately.\n--capture runs a scripted tour and saves screenshots to DIR (development)."
+                    "rilldisk-desktop [PATH] [--theme light|dark] [--palette tide|moss|aurora] [--size WIDTHxHEIGHT] [--capture DIR]\n\nOpens the RillDisk desktop app. PATH starts a scan immediately.\n--capture runs a scripted tour and saves screenshots to DIR (development)."
                 );
                 return Ok(());
             }
@@ -47,7 +71,7 @@ fn main() -> eframe::Result {
             .with_title("RillDisk")
             .with_app_id("rilldisk")
             .with_inner_size(size)
-            .with_min_inner_size([960.0, 600.0])
+            .with_min_inner_size([1100.0, 680.0])
             .with_icon(Arc::new(style::icon(64))),
         centered: true,
         ..Default::default()
@@ -55,6 +79,6 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "RillDisk",
         options,
-        Box::new(move |cc| Ok(Box::new(app::RillApp::new(cc, path, tour)))),
+        Box::new(move |cc| Ok(Box::new(app::RillApp::new(cc, path, dark, identity, tour)))),
     )
 }

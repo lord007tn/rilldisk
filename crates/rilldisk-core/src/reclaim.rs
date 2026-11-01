@@ -89,6 +89,9 @@ pub struct Candidate {
     pub category: Category,
     pub safety: Safety,
     pub label: &'static str,
+    /// AI coding agent that created this worktree, when its location says so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<&'static str>,
     pub reason: String,
     pub suggested_action: String,
     pub logical_bytes: u64,
@@ -155,7 +158,8 @@ const fn rule(
 }
 
 /// Well-known cache locations, matched against trailing path components.
-/// `*` matches any single component.
+/// `*` matches any single component. A leading `~` matches a user's home folder
+/// (`/home/<name>`, `/Users/<name>`, `/root` or `C:\Users\<name>`) and nothing else.
 const LOCATIONS: &[(&[&str], Rule)] = {
     use Category::*;
     use Safety::*;
@@ -297,7 +301,7 @@ const LOCATIONS: &[(&[&str], Rule)] = {
                 Cache,
                 "Cargo registry",
                 "Downloaded crates; Cargo re-fetches them.",
-                "cargo cache --autoclean (cargo-cache), or delete registry\\cache and registry\\src",
+                "cargo cache --autoclean (cargo-cache), or delete the cache and src folders inside it",
             ),
         ),
         (
@@ -307,7 +311,7 @@ const LOCATIONS: &[(&[&str], Rule)] = {
                 Cache,
                 "Cargo git checkouts",
                 "Git dependencies; Cargo re-fetches them.",
-                "Delete .cargo\\git\\checkouts; Cargo re-fetches on build",
+                "Delete the checkouts folder inside it; Cargo re-fetches on build",
             ),
         ),
         (
@@ -468,6 +472,266 @@ const LOCATIONS: &[(&[&str], Rule)] = {
                 "VS Code extension downloads",
                 "Cached extension installers.",
                 "Delete while VS Code is closed",
+            ),
+        ),
+        (
+            &["~", ".cache"],
+            rule(
+                AppCache,
+                Review,
+                "User cache folder",
+                "Per-user application caches (XDG). Apps recreate them, but some are slow to restore; known caches inside are listed separately.",
+                "Quit apps, then remove what you no longer need; prefer the commands listed for folders inside",
+            ),
+        ),
+        (
+            &["~", "library", "caches"],
+            rule(
+                AppCache,
+                Review,
+                "macOS user caches",
+                "Per-user application caches. Apps recreate them, but some are slow to restore; known caches inside are listed separately.",
+                "Quit apps, then remove what you no longer need; prefer the commands listed for folders inside",
+            ),
+        ),
+        (
+            &["~", "library", "caches", "homebrew"],
+            rule(
+                PackageCache,
+                Cache,
+                "Homebrew cache",
+                "Downloaded bottles and source archives.",
+                "brew cleanup --prune=all",
+            ),
+        ),
+        (
+            &["~", ".cache", "homebrew"],
+            rule(
+                PackageCache,
+                Cache,
+                "Homebrew cache",
+                "Downloaded bottles and source archives.",
+                "brew cleanup --prune=all",
+            ),
+        ),
+        (
+            &["~", ".cache", "pip"],
+            rule(
+                PackageCache,
+                Cache,
+                "pip cache",
+                "Downloaded Python wheels.",
+                "pip cache purge",
+            ),
+        ),
+        (
+            &["~", "library", "caches", "pip"],
+            rule(
+                PackageCache,
+                Cache,
+                "pip cache",
+                "Downloaded Python wheels.",
+                "pip cache purge",
+            ),
+        ),
+        (
+            &["~", ".cache", "uv"],
+            rule(
+                PackageCache,
+                Cache,
+                "uv cache",
+                "Downloaded Python packages.",
+                "uv cache clean",
+            ),
+        ),
+        (
+            &["~", "library", "caches", "uv"],
+            rule(
+                PackageCache,
+                Cache,
+                "uv cache",
+                "Downloaded Python packages.",
+                "uv cache clean",
+            ),
+        ),
+        (
+            &["~", ".cache", "go-build"],
+            rule(
+                PackageCache,
+                Cache,
+                "Go build cache",
+                "Compiled Go packages.",
+                "go clean -cache",
+            ),
+        ),
+        (
+            &["~", "library", "caches", "go-build"],
+            rule(
+                PackageCache,
+                Cache,
+                "Go build cache",
+                "Compiled Go packages.",
+                "go clean -cache",
+            ),
+        ),
+        (
+            &["~", ".cache", "yarn"],
+            rule(
+                PackageCache,
+                Cache,
+                "Yarn cache",
+                "Downloaded Yarn packages.",
+                "yarn cache clean",
+            ),
+        ),
+        (
+            &["~", "library", "caches", "yarn"],
+            rule(
+                PackageCache,
+                Cache,
+                "Yarn cache",
+                "Downloaded Yarn packages.",
+                "yarn cache clean",
+            ),
+        ),
+        (
+            &["~", ".cache", "pnpm"],
+            rule(
+                PackageCache,
+                Cache,
+                "pnpm cache",
+                "pnpm metadata cache.",
+                "pnpm cache delete",
+            ),
+        ),
+        (
+            &["~", "library", "caches", "pnpm"],
+            rule(
+                PackageCache,
+                Cache,
+                "pnpm cache",
+                "pnpm metadata cache.",
+                "pnpm cache delete",
+            ),
+        ),
+        (
+            &["~", ".cache", "ms-playwright"],
+            rule(
+                PackageCache,
+                Cache,
+                "Playwright browsers",
+                "Downloaded test browsers.",
+                "npx playwright uninstall --all",
+            ),
+        ),
+        (
+            &["~", "library", "caches", "ms-playwright"],
+            rule(
+                PackageCache,
+                Cache,
+                "Playwright browsers",
+                "Downloaded test browsers.",
+                "npx playwright uninstall --all",
+            ),
+        ),
+        (
+            &["~", ".npm", "_cacache"],
+            rule(
+                PackageCache,
+                Cache,
+                "npm cache",
+                "Downloaded npm packages; re-fetched on demand.",
+                "npm cache clean --force",
+            ),
+        ),
+        (
+            &["~", ".pnpm-store"],
+            rule(
+                PackageCache,
+                Cache,
+                "pnpm store",
+                "Content-addressed pnpm package store.",
+                "pnpm store prune",
+            ),
+        ),
+        (
+            &["~", ".local", "share", "pnpm", "store"],
+            rule(
+                PackageCache,
+                Cache,
+                "pnpm store",
+                "Content-addressed pnpm package store.",
+                "pnpm store prune",
+            ),
+        ),
+        (
+            &["~", "library", "pnpm", "store"],
+            rule(
+                PackageCache,
+                Cache,
+                "pnpm store",
+                "Content-addressed pnpm package store.",
+                "pnpm store prune",
+            ),
+        ),
+        (
+            &["~", "library", "developer", "xcode", "deriveddata"],
+            rule(
+                BuildOutput,
+                Regenerable,
+                "Xcode DerivedData",
+                "Xcode build products and indexes; rebuilt on the next build.",
+                "Quit Xcode, then delete; Xcode rebuilds it",
+            ),
+        ),
+        (
+            &["~", "library", "developer", "xcode", "ios devicesupport"],
+            rule(
+                AppCache,
+                Cache,
+                "iOS device support",
+                "Debug symbols copied from connected devices; copied again on the next connection.",
+                "Delete versions for devices you no longer use",
+            ),
+        ),
+        (
+            &["~", "library", "developer", "coresimulator", "caches"],
+            rule(
+                AppCache,
+                Review,
+                "Simulator caches",
+                "CoreSimulator caches, including dyld caches for installed runtimes.",
+                "Quit Simulator and Xcode, then delete; rebuilt when a simulator boots",
+            ),
+        ),
+        (
+            &["~", "library", "developer", "coresimulator", "devices"],
+            rule(
+                AppCache,
+                Review,
+                "Simulator devices",
+                "Simulator devices with installed apps and their data.",
+                "xcrun simctl delete unavailable, or remove devices in Xcode > Devices and Simulators",
+            ),
+        ),
+        (
+            &["~", ".trash"],
+            rule(
+                RecycleBin,
+                Review,
+                "Trash",
+                "Files moved to the Trash.",
+                "Review, then empty the Trash in Finder",
+            ),
+        ),
+        (
+            &["~", ".local", "share", "trash"],
+            rule(
+                RecycleBin,
+                Review,
+                "Trash",
+                "Files moved to the Trash.",
+                "Review, then empty the Trash from your file manager",
             ),
         ),
     ]
@@ -633,17 +897,22 @@ pub fn find_reclaimable(snapshot: &Snapshot, now_unix_ms: u64) -> ReclaimReport 
                 .and_then(quoted)
             {
                 Some(manifest) => format!("cargo clean --manifest-path {manifest}"),
-                None => rule.action.to_string(),
+                // A bare `cargo clean` would clean whatever project the shell is in.
+                None => "cargo clean --manifest-path <this project's Cargo.toml>".to_string(),
             }
         } else {
             rule.action.to_string()
         };
+        let agent = (rule.category == Category::GitWorktree)
+            .then(|| agent_owner(&path.join("x")))
+            .flatten();
         candidates.push(Candidate {
             entry_id: *id,
             path,
             category: rule.category,
             safety: *safety,
             label: rule.label,
+            agent,
             reason,
             suggested_action,
             logical_bytes: entry.logical_bytes,
@@ -815,6 +1084,13 @@ fn directory_rule(
         "Deleted files waiting in the Recycle Bin.",
         "Review, then empty the Recycle Bin",
     );
+    static VOLUME_TRASH: Rule = rule(
+        RecycleBin,
+        Review,
+        "Trash",
+        "Files moved to the Trash on this volume.",
+        "Review, then empty the Trash from your file manager or Finder",
+    );
 
     let rule: &'static Rule = match lower.as_str() {
         "node_modules" if sibling("package.json") => &NODE,
@@ -851,16 +1127,28 @@ fn directory_rule(
         "intermediate" | "deriveddatacache" if sibling_ext(".uproject") => &UNREAL,
         ".godot" if sibling("project.godot") => &GODOT,
         "$recycle.bin" => &RECYCLE,
+        // macOS `.Trashes` and freedesktop `.Trash-<uid>` folders live at a volume
+        // root. Scans stay on one filesystem, so that is the top of the scan.
+        ".trashes" if parent == 0 && is_volume_root(snapshot) => &VOLUME_TRASH,
+        _ if parent == 0
+            && is_volume_root(snapshot)
+            && lower
+                .strip_prefix(".trash-")
+                .is_some_and(|uid| !uid.is_empty() && uid.bytes().all(|b| b.is_ascii_digit())) =>
+        {
+            &VOLUME_TRASH
+        }
         _ if lower.starts_with("cmake-build-") && sibling("cmakelists.txt") => &CMAKE,
         _ => return location_rule(snapshot, id, &lower),
     };
     Some((rule, None, rule.safety))
 }
 
-/// Known locations match trailing components. Profile (`AppData`) and system
-/// (`Windows`) rules must also sit where Windows puts them (`...\Users\<name>\AppData`,
-/// `<drive>:\Windows`); a look-alike elsewhere may be a copy or backup, so it is
-/// downgraded to Review.
+/// Known locations match trailing components, whatever the separator. Profile
+/// (`AppData`) and system (`Windows`) rules must also sit where Windows puts them
+/// (`...\Users\<name>\AppData`, `<drive>:\Windows`); a look-alike elsewhere may be a
+/// copy or backup, so it is downgraded to Review. Home (`~`) rules only match a real
+/// home folder, because names like `.cache` are common inside projects.
 fn location_rule(
     snapshot: &Snapshot,
     id: usize,
@@ -884,13 +1172,14 @@ fn location_rule(
                 .iter()
                 .rev()
                 .zip(components.iter().rev())
-                .all(|(p, c)| *p == "*" || p == c)
+                .all(|(p, c)| matches!(*p, "*" | "~") || p == c)
         {
             let start = components.len() - pattern.len();
             let anchored = match pattern[0] {
+                "~" if !is_home(components, start, root_depth(snapshot)) => continue,
                 "appdata" => start >= 2 && components[start - 2] == "users",
-                // Prefix (`c:`), root, then `windows`.
-                "windows" => start == 2,
+                // Drive prefix (`c:`), root, then `windows`. Unix paths start at `/`.
+                "windows" => start == 2 && !components[0].starts_with(['/', '\\']),
                 _ => true,
             };
             if anchored {
@@ -904,6 +1193,47 @@ fn location_rule(
         }
     }
     None
+}
+
+/// Whether `components[at]` is a home folder: `/home/<name>`, `/Users/<name>`,
+/// `C:\Users\<name>` or `/root`. The `home`/`Users` folder must sit at the
+/// filesystem or drive root, or directly inside the scanned folder; a copy of a
+/// profile deeper down (for example in a backup) is not a home.
+fn is_home(components: &[String], at: usize, scan_root: usize) -> bool {
+    let top = |index: usize| {
+        index == scan_root
+            || (index == 1 && components[0] == "/")
+            || (index == 2 && components[1] == "\\" && components[0].ends_with(':'))
+    };
+    (at >= 1 && matches!(components[at - 1].as_str(), "home" | "users") && top(at - 1))
+        || (at == 1 && components[1] == "root" && components[0] == "/")
+}
+
+/// Whether the scanned folder is the top of a volume: `/`, a drive root, or a
+/// standard mount location (`/Volumes/<disk>`, `/mnt/<disk>`, `/media/<disk>`,
+/// `/media/<user>/<disk>`, `/run/media/<user>/<disk>`).
+fn is_volume_root(snapshot: &Snapshot) -> bool {
+    volume_root_path(&snapshot.summary.root)
+}
+
+fn volume_root_path(root: &std::path::Path) -> bool {
+    let parts: Vec<String> = root
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+        .collect();
+    let names: Vec<&str> = parts.iter().map(String::as_str).collect();
+    match names.as_slice() {
+        ["/"] => true,
+        [drive, "\\"] if drive.ends_with(':') => true,
+        ["/", "volumes" | "mnt" | "media", _] => true,
+        ["/", "media", _, _] | ["/", "run", "media", _, _] => true,
+        _ => false,
+    }
+}
+
+/// Number of path components of the scanned folder.
+fn root_depth(snapshot: &Snapshot) -> usize {
+    snapshot.path(0).components().count()
 }
 
 /// Split a subtree's files into space only this folder holds and hard-linked space.
@@ -1002,25 +1332,69 @@ fn child_named(snapshot: &Snapshot, id: usize, name: &str) -> Option<usize> {
 }
 
 /// Double-quote a path for a copied command when that is safe in both PowerShell
-/// and POSIX shells; otherwise return None so callers omit it.
+/// and POSIX shells; otherwise return None so callers omit it. On Unix a backslash
+/// is an ordinary filename byte that POSIX double quotes may still interpret.
 fn quoted(path: &std::path::Path) -> Option<String> {
     let text = path.to_str()?;
-    (!text.contains(['"', '$', '`', '\'', '%', '!', '\n', '\r'])).then(|| format!("\"{text}\""))
+    let special: &[char] = if cfg!(windows) {
+        &['"', '$', '`', '\'', '%', '!']
+    } else {
+        &['"', '$', '`', '\'', '%', '!', '\\']
+    };
+    (!text.contains(special) && !text.contains(char::is_control)).then(|| format!("\"{text}\""))
 }
 
+/// The AI agent whose worktree folder holds `path`. Matches whole path components,
+/// so `/` and `\` separators behave the same.
 fn agent_owner(path: &std::path::Path) -> Option<&'static str> {
-    let text = path.to_string_lossy().to_lowercase().replace('/', "\\");
-    let owners = [
-        ("\\.codex\\worktrees\\", "Codex"),
-        ("\\openai\\codex\\worktrees\\", "Codex"),
-        ("\\.claude\\worktrees\\", "Claude Code"),
-        ("\\.t3\\worktrees\\", "T3 Code"),
-        ("\\.cursor\\worktrees\\", "Cursor"),
-        ("\\conductor\\workspaces\\", "Conductor"),
-    ];
-    if let Some((_, owner)) = owners.iter().find(|(needle, _)| text.contains(needle)) {
-        return Some(owner);
+    let parts: Vec<String> = path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+        .collect();
+    // `<tool>/worktrees/<something>`: only paths inside the folder count.
+    // Innermost first: a Codex worktree inside a Claude Code worktree is Codex's.
+    (0..parts.len().saturating_sub(2)).rev().find_map(|i| {
+        match (parts[i].as_str(), parts[i + 1].as_str()) {
+            (".codex", "worktrees") => Some("Codex"),
+            ("codex", "worktrees") if i > 0 && parts[i - 1] == "openai" => Some("Codex"),
+            (".claude", "worktrees") => Some("Claude Code"),
+            // Profile-specific agent homes such as `.claude-work/worktrees`.
+            (tool, "worktrees") if tool.starts_with(".claude-") => Some("Claude Code"),
+            (".t3", "worktrees") => Some("T3 Code"),
+            (".cursor", "worktrees") => Some("Cursor"),
+            ("conductor", "workspaces") => Some("Conductor"),
+            _ => None,
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::volume_root_path;
+    use std::path::Path;
+
+    #[cfg(unix)]
+    #[test]
+    fn recognizes_unix_volume_roots_only() {
+        for root in [
+            "/",
+            "/Volumes/USB",
+            "/mnt/data",
+            "/media/disk",
+            "/media/me/USB",
+            "/run/media/me/USB",
+        ] {
+            assert!(volume_root_path(Path::new(root)), "{root}");
+        }
+        for root in ["/home/me/project", "/Volumes/USB/backup", "/mnt"] {
+            assert!(!volume_root_path(Path::new(root)), "{root}");
+        }
     }
-    // Profile-specific agent homes such as `.claude-work\worktrees`.
-    (text.contains("\\.claude-") && text.contains("\\worktrees\\")).then_some("Claude Code")
+
+    #[cfg(windows)]
+    #[test]
+    fn recognizes_drive_roots_only() {
+        assert!(volume_root_path(Path::new(r"D:\")));
+        assert!(!volume_root_path(Path::new(r"D:\Projects")));
+    }
 }

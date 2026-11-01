@@ -37,7 +37,8 @@
 * Cleanup proposals with live identity revalidation and explicit user approval.
 * Recycle-bin-first execution, protected paths, auditable results and recovery.
 * Separate capability for mutation; the read-only MCP remains the default.
-* Platform-native macOS/Linux scanners and distribution after Windows qualification.
+* macOS/Linux distribution (the native Unix scanner, CLI, MCP and desktop already
+  build and pass CI), plus measured macOS performance.
 
 No guaranteed scan-time promises, unattended deletion or auto-elevation are part
 of phase one. Open a focused issue for proposals; measurements drive priorities.

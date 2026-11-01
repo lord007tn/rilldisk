@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-use super::VolumeInfo;
-use crate::{Batch, EntryKind, RawEntry, ScanControl, ScanIssue};
+use crate::{Batch, EntryKind, RawEntry, ScanControl, ScanIssue, ScanOptions};
 use std::{
     ffi::OsString,
     fs::{File, OpenOptions},
@@ -29,7 +28,23 @@ use windows_sys::Win32::System::WindowsProgramming::{DRIVE_FIXED, DRIVE_REMOVABL
 
 pub(crate) const BACKEND: &str = "win32-batched-directory";
 
-pub(crate) fn volume_info(root: &Path) -> io::Result<VolumeInfo> {
+/// Per-scan volume facts shared by every directory read.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct VolumeInfo {
+    pub allocation_unit: Option<u64>,
+    pub serial: u64,
+}
+
+impl VolumeInfo {
+    /// Windows has no scan-wide caveat to report.
+    pub(crate) fn warning(&self) -> Option<&str> {
+        None
+    }
+}
+
+/// Reparse points (junctions, symlinks, volume mount points) are never traversed,
+/// so a scan stays on the root's volume without any option.
+pub(crate) fn volume_info(root: &Path, _options: &ScanOptions) -> io::Result<VolumeInfo> {
     let directory = OpenOptions::new()
         .access_mode(FILE_READ_ATTRIBUTES)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
@@ -227,6 +242,7 @@ fn parse_record(bytes: &[u8], offset: usize, volume: u64) -> io::Result<(Option<
             }),
             modified: filetime_to_unix_ms(record.LastWriteTime),
             identity: (record.FileId != 0).then_some((volume, record.FileId as u64)),
+            skipped: false,
             key: None,
         }),
         next,

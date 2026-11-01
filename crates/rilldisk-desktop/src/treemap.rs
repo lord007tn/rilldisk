@@ -1,22 +1,26 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Squarified treemap: layout once per (root, metric, size), render as one GPU mesh.
-use crate::style::{self, FileClass};
-use eframe::egui::{Color32, Mesh, Pos2, Rect, pos2, vec2};
-use eframe::epaint::WHITE_UV;
+//! Squarified treemap with soft, rounded tiles. Laid out and tessellated once per
+//! (root, metric, size, theme) and drawn as a single cached GPU mesh.
+use crate::style::{self, FileClass, t};
+use crate::widgets::fit;
+use eframe::egui::{
+    Align2, Color32, CornerRadius, Mesh, Painter, Pos2, Rect, Shape, Stroke, StrokeKind,
+    epaint::{RectShape, TessellationOptions, Tessellator},
+    pos2, vec2,
+};
 use rilldisk_core::{EntryKind, Snapshot};
 use std::sync::Arc;
 
 /// Upper bound on tiles per layout; keeps frames cheap on multi-million-entry scans.
-const MAX_TILES: usize = 120_000;
-const HEADER: f32 = 17.0;
+const MAX_TILES: usize = 40_000;
+/// Nesting levels drawn below the current folder.
+const MAX_DEPTH: u16 = 4;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum TileKind {
-    File(FileClass),
-    /// A directory whose children are drawn inside it.
-    Dir,
-    /// A directory too small to subdivide.
-    Collapsed,
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum ColorBy {
+    #[default]
+    Folder,
+    Kind,
 }
 
 #[derive(Clone, Copy)]
@@ -25,12 +29,27 @@ pub struct Tile {
     pub id: u32,
     /// Deepest folder of a single-child folder chain drawn inside this tile.
     pub chain: u32,
-    pub kind: TileKind,
+    pub depth: u16,
+    pub is_dir: bool,
+    pub color: Color32,
+    pub radius: u8,
 }
+
+pub type Key = (
+    usize,
+    bool,
+    [i32; 4],
+    usize,
+    ColorBy,
+    (style::Identity, bool),
+    u32,
+);
 
 #[derive(Default)]
 pub struct Layout {
-    pub key: Option<(usize, bool, [i32; 4], usize)>,
+    /// Tile count at which the folder being placed stops (see `build`).
+    limit: usize,
+    pub key: Option<Key>,
     pub tiles: Vec<Tile>,
     pub mesh: Arc<Mesh>,
     pub truncated: bool,
@@ -56,46 +75,8 @@ pub fn size_of(snapshot: &Snapshot, id: usize, allocated: bool) -> u64 {
     }
 }
 
-pub fn build(
-    snapshot: &Snapshot,
-    root: usize,
-    rect: Rect,
-    allocated: bool,
-    generation: usize,
-) -> Layout {
-    let key = (
-        root,
-        allocated,
-        [
-            rect.min.x as i32,
-            rect.min.y as i32,
-            rect.max.x as i32,
-            rect.max.y as i32,
-        ],
-        generation,
-    );
-    let mut layout = Layout {
-        key: Some(key),
-        ..Default::default()
-    };
-    let mut mesh = Mesh::default();
-    subdivide(snapshot, root, rect, 0, allocated, &mut layout, &mut mesh);
-    layout.mesh = Arc::new(mesh);
-    layout
-}
-
-fn subdivide(
-    snapshot: &Snapshot,
-    id: usize,
-    inner: Rect,
-    depth: u16,
-    allocated: bool,
-    layout: &mut Layout,
-    mesh: &mut Mesh,
-) {
-    if inner.width() < 2.0 || inner.height() < 2.0 {
-        return;
-    }
+/// Children with a size, largest first.
+pub fn sized_children(snapshot: &Snapshot, id: usize, allocated: bool) -> Vec<(u32, f64)> {
     let mut items: Vec<(u32, f64)> = snapshot
         .children(id)
         .iter()
@@ -105,75 +86,336 @@ fn subdivide(
     if allocated {
         items.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
     }
+    items
+}
+
+/// Folds chains like SteamLibrary > steamapps > common into their deepest folder.
+pub fn chain_end(snapshot: &Snapshot, id: u32) -> u32 {
+    let mut chain = id;
+    while let [only] = snapshot.children(chain as usize)
+        && snapshot.entries[*only as usize].kind == EntryKind::Directory
+    {
+        chain = *only;
+    }
+    chain
+}
+
+pub fn file_color(snapshot: &Snapshot, id: usize) -> Color32 {
+    FileClass::of(&style::extension_of(&snapshot.name(id))).color()
+}
+
+/// Nested tiles: lighter on paper, so each level reads as a frame around the
+/// next; slightly lighter at night too.
+fn nested(base: Color32, depth: u16) -> Color32 {
+    let th = t();
+    if th.dark {
+        style::shade(base, depth)
+    } else {
+        let lift = [0.0, 0.34, 0.52, 0.64][depth.min(3) as usize];
+        style::mix(base, th.bg, lift)
+    }
+}
+
+pub fn neutral(depth: u16) -> Color32 {
+    let th = t();
+    style::mix(th.card, th.faint, 0.18 + depth as f32 * 0.07)
+}
+
+pub struct Params {
+    pub root: usize,
+    pub rect: Rect,
+    pub allocated: bool,
+    pub generation: usize,
+    pub color_by: ColorBy,
+    pub pixels_per_point: f32,
+    /// Compact mode: smaller gaps and no headers (overview card).
+    pub compact: bool,
+}
+
+pub fn key(p: &Params) -> Key {
+    (
+        p.root,
+        p.allocated,
+        [
+            p.rect.min.x as i32,
+            p.rect.min.y as i32,
+            p.rect.max.x as i32,
+            p.rect.max.y as i32,
+        ],
+        p.generation,
+        p.color_by,
+        (style::identity(), t().dark),
+        (p.pixels_per_point * 100.0) as u32 + u32::from(p.compact) * 100_000,
+    )
+}
+
+pub fn build(snapshot: &Snapshot, params: &Params) -> Layout {
+    let mut layout = Layout {
+        key: Some(key(params)),
+        ..Default::default()
+    };
+    let mut shapes = Vec::new();
+    let items = sized_children(snapshot, params.root, params.allocated);
+    let total: f64 = items.iter().map(|i| i.1).sum();
     let mut placed = Vec::with_capacity(items.len().min(4096));
-    squarify(&items, inner, &mut placed);
+    squarify(&items, params.rect, &mut placed);
+    // Hue follows each top-level item's position in the size order, exactly like
+    // the rings view, so a folder keeps its color across views.
+    let mut offsets = std::collections::HashMap::with_capacity(items.len());
+    let mut cumulative = 0.0;
+    for (id, size) in &items {
+        offsets.insert(*id, ((cumulative + size / 2.0) / total.max(1.0)) as f32);
+        cumulative += size;
+    }
+    // Share the tile budget out by size, carrying unused budget forward, so a
+    // huge first folder cannot leave the others without tiles.
+    let sizes: std::collections::HashMap<u32, f64> = items.iter().copied().collect();
+    let mut remaining_size = total;
     for (child, rect) in placed {
         if layout.tiles.len() >= MAX_TILES {
             layout.truncated = true;
-            return;
+            break;
         }
-        let entry = &snapshot.entries[child as usize];
-        let rect = rect.shrink(0.5);
-        if rect.width() < 0.6 || rect.height() < 0.6 {
-            continue;
-        }
-        if entry.kind == EntryKind::Directory {
-            let open = rect.width() >= 28.0 && rect.height() >= 24.0;
-            let kind = if open {
-                TileKind::Dir
-            } else {
-                TileKind::Collapsed
-            };
-            // Fold chains like SteamLibrary > steamapps > common into one header.
-            let mut chain = child;
-            while let [only] = snapshot.children(chain as usize)
-                && snapshot.entries[*only as usize].kind == EntryKind::Directory
-            {
-                chain = *only;
-            }
-            layout.tiles.push(Tile {
-                rect,
-                id: child,
-                chain,
-                kind,
-            });
-            let shade = (0.95 + depth as f32 * 0.07).min(1.35);
-            if open {
-                flat(mesh, rect, style::scale(style::DIR_FILL, shade));
-                let header = if rect.height() >= 44.0 && rect.width() >= 64.0 {
-                    HEADER
-                } else {
-                    2.0
-                };
-                let mut body = rect.shrink(2.0);
-                body.min.y = rect.min.y + header;
-                subdivide(
-                    snapshot,
-                    chain as usize,
-                    body,
-                    depth + 1,
-                    allocated,
-                    layout,
-                    mesh,
-                );
-            } else {
-                cushion(
-                    mesh,
-                    rect,
-                    style::scale(Color32::from_rgb(71, 85, 105), 0.9),
-                );
-            }
-        } else {
-            let class = FileClass::of(&style::extension_of(&snapshot.name(child as usize)));
-            layout.tiles.push(Tile {
-                rect,
-                id: child,
-                chain: child,
-                kind: TileKind::File(class),
-            });
-            cushion(mesh, rect, class.color());
+        let size = sizes.get(&child).copied().unwrap_or(0.0);
+        let budget = MAX_TILES - layout.tiles.len();
+        let share = (budget as f64 * size / remaining_size.max(1.0)) as usize;
+        remaining_size -= size;
+        layout.limit = layout.tiles.len() + share.clamp(64.min(budget), budget);
+        let base = match params.color_by {
+            ColorBy::Folder => style::chart(offsets[&child], 0),
+            ColorBy::Kind => Color32::TRANSPARENT,
+        };
+        place(
+            snapshot,
+            params,
+            child,
+            rect,
+            0,
+            base,
+            &mut layout,
+            &mut shapes,
+        );
+    }
+    let mut mesh = Mesh::default();
+    let mut tessellator = Tessellator::new(
+        params.pixels_per_point,
+        TessellationOptions::default(),
+        [1, 1],
+        Vec::new(),
+    );
+    for shape in shapes {
+        match shape {
+            Plain(rect, color) => mesh.add_colored_rect(rect, color),
+            Round(shape) => tessellator.tessellate_rect(&shape, &mut mesh),
         }
     }
+    layout.mesh = Arc::new(mesh);
+    layout
+}
+
+enum Paint {
+    Plain(Rect, Color32),
+    Round(RectShape),
+}
+use Paint::{Plain, Round};
+
+#[allow(clippy::too_many_arguments)]
+fn place(
+    snapshot: &Snapshot,
+    params: &Params,
+    id: u32,
+    slot: Rect,
+    depth: u16,
+    base: Color32,
+    layout: &mut Layout,
+    shapes: &mut Vec<Paint>,
+) {
+    if layout.tiles.len() >= layout.limit {
+        layout.truncated = true;
+        return;
+    }
+    let gap = match (params.compact, depth) {
+        (true, 0) => 4.0,
+        (true, _) => 2.0,
+        (false, 0) => 6.0,
+        (false, 1) => 3.0,
+        _ => 2.0,
+    };
+    let rect = slot.shrink(gap / 2.0);
+    if rect.width() < 2.0 || rect.height() < 2.0 {
+        return;
+    }
+    let entry = &snapshot.entries[id as usize];
+    let is_dir = entry.kind == EntryKind::Directory;
+    let color = match params.color_by {
+        ColorBy::Folder => nested(base, depth),
+        ColorBy::Kind if is_dir => neutral(depth),
+        ColorBy::Kind => style::shade(file_color(snapshot, id as usize), depth.min(1)),
+    };
+    let wanted: f32 = match depth {
+        0 => 10.0,
+        1 => 7.0,
+        2 => 5.0,
+        _ => 3.0,
+    };
+    let radius = wanted
+        .min(rect.width() / 2.0)
+        .min(rect.height() / 2.0)
+        .floor();
+    let chain = if is_dir { chain_end(snapshot, id) } else { id };
+    layout.tiles.push(Tile {
+        rect,
+        id,
+        chain,
+        depth,
+        is_dir,
+        color,
+        radius: radius as u8,
+    });
+    if radius >= 1.0 && rect.width() > 6.0 && rect.height() > 6.0 {
+        shapes.push(Round(RectShape::filled(
+            rect,
+            CornerRadius::same(radius as u8),
+            color,
+        )));
+    } else {
+        shapes.push(Plain(rect, color));
+    }
+    if !is_dir || depth + 1 >= MAX_DEPTH {
+        return;
+    }
+    let header = header_height(rect, depth, params.compact);
+    let pad = if depth == 0 { 6.0 } else { 3.0 };
+    let mut body = rect.shrink(pad);
+    body.min.y = rect.min.y + header.max(pad);
+    if body.width() < 12.0 || body.height() < 12.0 {
+        return;
+    }
+    let items = sized_children(snapshot, chain as usize, params.allocated);
+    let mut placed = Vec::with_capacity(items.len().min(1024));
+    squarify(&items, body, &mut placed);
+    for (child, slot) in placed {
+        place(
+            snapshot,
+            params,
+            child,
+            slot,
+            depth + 1,
+            base,
+            layout,
+            shapes,
+        );
+        if layout.truncated {
+            return;
+        }
+    }
+}
+
+/// Space reserved at the top of a folder tile for its label.
+pub fn header_height(rect: Rect, depth: u16, compact: bool) -> f32 {
+    match depth {
+        0 if !compact && rect.height() >= 80.0 && rect.width() >= 80.0 => 40.0,
+        0 if rect.height() >= 50.0 && rect.width() >= 60.0 => 22.0,
+        1 if !compact && rect.height() >= 60.0 && rect.width() >= 70.0 => 20.0,
+        _ => 0.0,
+    }
+}
+
+fn label_for(snapshot: &Snapshot, tile: &Tile) -> String {
+    let (top, end) = (tile.id as usize, tile.chain as usize);
+    if top == end {
+        snapshot.name(top).into_owned()
+    } else if snapshot.entries[end].parent_id == Some(top) {
+        format!("{} › {}", snapshot.name(top), snapshot.name(end))
+    } else {
+        format!("{} › … › {}", snapshot.name(top), snapshot.name(end))
+    }
+}
+
+/// Names and sizes on tiles that have room for them.
+pub fn paint_labels(
+    painter: &Painter,
+    layout: &Layout,
+    snapshot: &Snapshot,
+    allocated: bool,
+    compact: bool,
+) {
+    for tile in &layout.tiles {
+        let (ink, ink_dim) = ink_on(tile.color);
+        let r = tile.rect;
+        let header = if tile.is_dir {
+            header_height(r, tile.depth, compact)
+        } else {
+            0.0
+        };
+        // Only label tiles wide enough to show a useful part of the name.
+        let roomy = r.width() >= 96.0;
+        let two_lines = (tile.is_dir && header >= 40.0)
+            || (!tile.is_dir && tile.depth <= 1 && roomy && r.height() >= 44.0);
+        let one_line = (tile.is_dir && header >= 20.0 && roomy)
+            || (!tile.is_dir && roomy && r.height() >= 24.0 && !compact);
+        if !two_lines && !one_line {
+            continue;
+        }
+        let pad = if tile.depth == 0 { 9.0 } else { 6.0 };
+        let width = r.width() - pad * 2.0;
+        let name = label_for(snapshot, tile);
+        let size = style::bytes(size_of(snapshot, tile.id as usize, allocated));
+        let top = r.min + vec2(pad, if tile.depth == 0 { 7.0 } else { 4.0 });
+        let name_font = style::semibold(if tile.depth == 0 { 12.5 } else { 11.0 });
+        if two_lines {
+            let galley = fit(painter, name, name_font, ink, width);
+            painter.galley(top, galley, ink);
+            let galley = fit(painter, size, style::regular(11.0), ink_dim, width);
+            painter.galley(top + vec2(0.0, 16.0), galley, ink_dim);
+        } else {
+            let galley = fit(painter, name, name_font, ink, width - 50.0);
+            let name_w = galley.size().x;
+            painter.galley(top, galley, ink);
+            if width - name_w > 46.0 {
+                painter.text(
+                    top + vec2(name_w + 6.0, 1.0),
+                    Align2::LEFT_TOP,
+                    size,
+                    style::regular(10.5),
+                    ink_dim,
+                );
+            }
+        }
+    }
+}
+
+/// Label colors readable on `fill`: dark ink on light tiles, white on dark ones.
+pub fn ink_on(fill: Color32) -> (Color32, Color32) {
+    let luminance =
+        (0.2126 * fill.r() as f32 + 0.7152 * fill.g() as f32 + 0.0722 * fill.b() as f32) / 255.0;
+    if luminance > 0.6 {
+        let ink = Color32::from_rgb(22, 26, 32);
+        (ink, Color32::from_rgba_unmultiplied(22, 26, 32, 165))
+    } else {
+        (
+            Color32::WHITE,
+            Color32::from_rgba_unmultiplied(255, 255, 255, 190),
+        )
+    }
+}
+
+/// Hover or selection ring that follows the tile's rounding.
+pub fn outline(painter: &Painter, tile: &Tile, color: Color32, width: f32) {
+    painter.rect_stroke(
+        tile.rect,
+        tile.radius,
+        Stroke::new(width, color),
+        StrokeKind::Inside,
+    );
+}
+
+pub fn wash(painter: &Painter, tile: &Tile, color: Color32) {
+    painter.add(Shape::Rect(RectShape::filled(
+        tile.rect,
+        CornerRadius::same(tile.radius),
+        color,
+    )));
 }
 
 /// Bruls/Huizing/van Wijk squarified layout. `items` must be sorted descending.
@@ -239,32 +481,6 @@ pub fn squarify(items: &[(u32, f64)], rect: Rect, out: &mut Vec<(u32, Rect)>) {
         }
         i = j;
     }
-}
-
-fn flat(mesh: &mut Mesh, rect: Rect, color: Color32) {
-    mesh.add_colored_rect(rect, color);
-}
-
-/// Four-corner gradient approximating a cushion: lit from the top left.
-fn cushion(mesh: &mut Mesh, rect: Rect, color: Color32) {
-    let base = mesh.vertices.len() as u32;
-    let light = style::scale(color, 1.18);
-    let mid = style::scale(color, 0.92);
-    let dark = style::scale(color, 0.62);
-    for (pos, c) in [
-        (rect.left_top(), light),
-        (rect.right_top(), mid),
-        (rect.right_bottom(), dark),
-        (rect.left_bottom(), mid),
-    ] {
-        mesh.vertices.push(eframe::epaint::Vertex {
-            pos,
-            uv: WHITE_UV,
-            color: c,
-        });
-    }
-    mesh.indices
-        .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 
 #[cfg(test)]

@@ -1,0 +1,276 @@
+# Builds, packages and publishes RillDisk releases.
+#
+# * Push a tag `vX.Y.Z` or `vX.Y.Z-alpha.N` that matches [workspace.package]
+#   version and points at a commit on main: builds every target, writes
+#   SHA256SUMS + BUILD-MANIFEST.json + latest.yml, generates notes with changelogithub,
+#   attests build provenance and publishes the GitHub release. A tag with a
+#   `-suffix` is published as a pre-release.
+# * Run it manually (workflow_dispatch) on any branch for a dry run: the same
+#   builds, packages and notes are produced as workflow artifacts, nothing is
+#   published.
+#
+# No caches are restored here so a release build cannot pick up state written
+# by pull-request runs. No Docker images are built.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      version: ${{ steps.plan.outputs.version }}
+      prerelease: ${{ steps.plan.outputs.prerelease }}
+      publish: ${{ steps.plan.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: plan
+        name: Resolve tag, version and channel
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
+          if [[ "$EVENT" == "push" && "$REF_TYPE" == "tag" ]]; then
+            tag="$REF_NAME"
+            if [[ "$tag" != "v$version" ]]; then
+              echo "::error::Tag $tag does not match the workspace version $version. Set [workspace.package] version = \"${tag#v}\" (and the path-dependency versions) before tagging."
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+              echo "::error::Release tags must point at a commit that is on main."
+              exit 1
+            fi
+            publish=true
+          else
+            tag="v$version"
+            publish=false
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::$tag is not v<semver>."
+            exit 1
+          fi
+          prerelease=false
+          if [[ "$tag" == *-* ]]; then prerelease=true; fi
+          {
+            echo "tag=$tag"
+            echo "version=${tag#v}"
+            echo "prerelease=$prerelease"
+            echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Release plan"
+            echo "| tag | pre-release | publish |"
+            echo "| --- | --- | --- |"
+            echo "| \`$tag\` | $prerelease | $publish |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: plan
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-2025
+            native: true
+          # 22.04 keeps the glibc requirement low (2.35).
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            native: true
+          - target: aarch64-apple-darwin
+            os: macos-15
+            native: true
+          # Cross-compiled on Apple silicon; the SDK covers both architectures.
+          - target: x86_64-apple-darwin
+            os: macos-15
+            native: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+      - if: runner.os == 'Linux'
+        name: Install desktop build dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libx11-dev
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked --target "${{ matrix.target }}" -p rilldisk -p rilldisk-desktop
+      - if: matrix.native
+        name: Smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/rilldisk"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then bin="$bin.exe"; fi
+          "$bin" --version
+          # The opt-out must stop every update request.
+          set +e
+          RILLDISK_NO_UPDATE_CHECK=1 "$bin" update --check
+          code=$?
+          set -e
+          test "$code" -eq 11
+          python scripts/test_mcp.py "$bin"
+      - name: Package
+        shell: bash
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
+          CI_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          python scripts/package_release.py package --target "${{ matrix.target }}" \
+            --tag "$TAG" --commit "$GITHUB_SHA" --out dist --ci-url "$CI_URL"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  notes:
+    name: Release notes
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+      - name: Generate notes with changelogithub
+        shell: bash
+        env:
+          # Read-only token: changelogithub resolves commit authors' GitHub logins.
+          GITHUB_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          PUBLISH: ${{ needs.plan.outputs.publish }}
+        run: |
+          set -euo pipefail
+          to="$TAG"
+          if [[ "$PUBLISH" != "true" ]]; then to="$GITHUB_SHA"; fi
+          # --output writes the markdown and skips changelogithub's own release creation.
+          npx --yes changelogithub@15.0.5 --to "$to" --output release-notes.md
+          cat release-notes.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-notes
+          path: release-notes.md
+          if-no-files-found: error
+          retention-days: 7
+
+  assemble:
+    name: Checksums and manifest
+    needs: [plan, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist
+      - name: Write SHA256SUMS, BUILD-MANIFEST.json and latest.yml
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
+          CI_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 scripts/package_release.py finalize --tag "$TAG" --commit "$GITHUB_SHA" --out dist --ci-url "$CI_URL"
+          (cd dist && sha256sum --check --strict SHA256SUMS)
+          test "$(ls dist/rilldisk-* | wc -l)" -eq 4
+          {
+            echo "### Release assets"
+            echo '```'
+            ls -l dist
+            echo
+            cat dist/SHA256SUMS
+            echo
+            cat dist/latest.yml
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub release
+    needs: [plan, notes, assemble]
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # Add required reviewers to this environment to gate publishing.
+    environment: release
+    permissions:
+      contents: write # create the release and upload assets
+      id-token: write # Sigstore signing for build provenance
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-assets
+          path: dist
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-notes
+          path: notes
+      - name: Verify checksums
+        run: cd dist && sha256sum --check --strict SHA256SUMS
+      # Verify with: gh attestation verify <archive> --repo lord007tn/rilldisk
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/rilldisk-*
+      - name: Create release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          PRERELEASE: ${{ needs.plan.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          flags=(--repo "$GITHUB_REPOSITORY" --verify-tag --title "RillDisk $VERSION" --notes-file notes/release-notes.md)
+          if [[ "$PRERELEASE" == "true" ]]; then flags+=(--prerelease --latest=false); else flags+=(--latest); fi
+          # gh uploads every asset to a draft and publishes only when all are
+          # attached, so updaters never see a release without SHA256SUMS or the
+          # latest.yml feed that releases/latest/download/latest.yml serves.
+          gh release create "$TAG" "${flags[@]}" dist/rilldisk-* dist/SHA256SUMS dist/BUILD-MANIFEST.json dist/latest.yml
