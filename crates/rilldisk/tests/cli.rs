@@ -30,6 +30,18 @@ fn cli_json_jsonl_and_partial_exit_codes() {
     let first: serde_json::Value = serde_json::from_str(lines.lines().next().unwrap()).unwrap();
     assert_eq!(first["type"], "summary");
     assert_eq!(first["data"]["complete"], false);
+    let table = Command::new(env!("CARGO_BIN_EXE_rilldisk"))
+        .arg("scan")
+        .arg(root.path())
+        .args(["--max-entries", "1"])
+        .output()
+        .unwrap();
+    assert_eq!(table.status.code(), Some(2));
+    assert!(
+        String::from_utf8(table.stdout)
+            .unwrap()
+            .contains("PARTIAL:")
+    );
 }
 
 #[test]
@@ -46,4 +58,20 @@ fn cli_never_overwrites_an_existing_report() {
         .unwrap();
     assert!(!output.status.success());
     assert_eq!(fs::read_to_string(output_path).unwrap(), "preserve me");
+}
+
+#[test]
+fn broken_pipe_preserves_partial_scan_exit_status() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("file.txt"), b"data").unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rilldisk"))
+        .arg("scan")
+        .arg(root.path())
+        .args(["--format", "json", "--max-entries", "1"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    assert_eq!(child.wait().unwrap().code(), Some(2));
 }

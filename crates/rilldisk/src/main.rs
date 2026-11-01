@@ -6,7 +6,10 @@ use std::{
     fs::OpenOptions,
     io::{self, BufWriter, Write},
     path::PathBuf,
-    sync::{Arc, atomic::Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 mod mcp;
@@ -58,7 +61,7 @@ enum Format {
     Jsonl,
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main(worker_threads = 2)]
 async fn main() -> Result<std::process::ExitCode> {
     let cli = Cli::parse();
     match cli.command {
@@ -79,9 +82,14 @@ async fn main() -> Result<std::process::ExitCode> {
             max_entries,
         } => {
             let control = Arc::new(ScanControl::default());
+            let exporting = Arc::new(AtomicBool::new(false));
+            let signal_exporting = exporting.clone();
             let signal_control = control.clone();
             let signal = tokio::spawn(async move {
-                if tokio::signal::ctrl_c().await.is_ok() {
+                while tokio::signal::ctrl_c().await.is_ok() {
+                    if signal_exporting.load(Ordering::Relaxed) {
+                        std::process::exit(130);
+                    }
                     signal_control.cancel();
                 }
             });
@@ -100,9 +108,16 @@ async fn main() -> Result<std::process::ExitCode> {
                 scan(&path, options(threads, max_entries), control)
             })
             .await;
-            signal.abort();
             progress.abort();
             let snapshot = snapshot??;
+            exporting.store(true, Ordering::Relaxed);
+            let exit_code = std::process::ExitCode::from(if snapshot.summary.complete {
+                0
+            } else if snapshot.summary.cancelled {
+                130
+            } else {
+                2
+            });
             let mut writer: Box<dyn Write> = match output {
                 Some(path) => Box::new(BufWriter::new(
                     OpenOptions::new()
@@ -154,6 +169,13 @@ async fn main() -> Result<std::process::ExitCode> {
                                 .map(human)
                                 .unwrap_or("unknown".into())
                         )?;
+                        if !snapshot.summary.complete {
+                            writeln!(
+                                writer,
+                                "PARTIAL: {} issues; cancelled={}",
+                                snapshot.summary.issue_count, snapshot.summary.cancelled
+                            )?;
+                        }
                         writeln!(writer, "\n{:>12}  {:>12}  PATH", "LOGICAL", "ALLOCATED")?;
                         for entry in snapshot.query(None, None, true, 0, top as usize).1 {
                             writeln!(
@@ -182,7 +204,7 @@ async fn main() -> Result<std::process::ExitCode> {
                         .downcast_ref::<serde_json::Error>()
                         .is_some_and(|e| e.io_error_kind() == Some(io::ErrorKind::BrokenPipe))
                 {
-                    return Ok(std::process::ExitCode::SUCCESS);
+                    return Ok(exit_code);
                 }
                 return Err(error);
             }
@@ -194,11 +216,9 @@ async fn main() -> Result<std::process::ExitCode> {
                 for issue in &snapshot.summary.issues {
                     eprintln!("{}: {}", issue.path.display(), issue.message);
                 }
-                return Ok(std::process::ExitCode::from(
-                    if snapshot.summary.cancelled { 130 } else { 2 },
-                ));
             }
-            Ok(std::process::ExitCode::SUCCESS)
+            signal.abort();
+            Ok(exit_code)
         }
     }
 }

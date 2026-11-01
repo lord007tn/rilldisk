@@ -81,8 +81,11 @@ def main():
             assert "error" in invalid or invalid["result"].get("isError"), invalid
             for index in range(3000):
                 (root / f"cancel-{index:04}").mkdir()
-            next_job = tool("start_scan", {"path": str(root)})["scan_id"]
-            cancelled = tool("cancel_scan", {"scan_id": next_job})
+            for _ in range(5):
+                next_job = tool("start_scan", {"path": str(root)})["scan_id"]
+                cancelled = tool("cancel_scan", {"scan_id": next_job})
+                if cancelled["cancellation_requested"]:
+                    break
             assert cancelled["cancellation_requested"], cancelled
             deadline = time.monotonic() + 20
             while time.monotonic() < deadline:

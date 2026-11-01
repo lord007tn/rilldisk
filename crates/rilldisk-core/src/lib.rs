@@ -4,14 +4,14 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 
 mod platform;
 
@@ -28,6 +28,7 @@ pub enum EntryKind {
 pub struct Entry {
     pub id: usize,
     pub parent_id: Option<usize>,
+    #[serde(serialize_with = "serialize_path")]
     pub path: PathBuf,
     pub kind: EntryKind,
     /// Subtree bytes for directories; one file's length otherwise.
@@ -41,6 +42,7 @@ pub struct Entry {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanIssue {
+    #[serde(serialize_with = "serialize_path")]
     pub path: PathBuf,
     pub message: String,
 }
@@ -48,6 +50,7 @@ pub struct ScanIssue {
 #[derive(Debug, Clone, Serialize)]
 pub struct Summary {
     pub schema_version: u32,
+    #[serde(serialize_with = "serialize_path")]
     pub root: PathBuf,
     pub backend: &'static str,
     pub started_unix_ms: u128,
@@ -71,11 +74,19 @@ pub struct Snapshot {
     pub entries: Vec<Entry>,
 }
 
+fn serialize_path<S: Serializer>(
+    path: &Path,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_str(&path.to_string_lossy())
+}
+
 #[derive(Debug, Default)]
 pub struct ScanControl {
     pub cancel: AtomicBool,
     pub files: AtomicU64,
     pub directories: AtomicU64,
+    remaining_entries: AtomicUsize,
 }
 
 impl ScanControl {
@@ -84,6 +95,33 @@ impl ScanControl {
     }
     pub fn is_cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
+    }
+    pub(crate) fn record(&self, kind: EntryKind) -> bool {
+        let mut remaining = self.remaining_entries.load(Ordering::Relaxed);
+        loop {
+            if remaining == 0 {
+                return false;
+            }
+            match self.remaining_entries.compare_exchange_weak(
+                remaining,
+                remaining - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(value) => remaining = value,
+            }
+        }
+        match kind {
+            EntryKind::File => {
+                self.files.fetch_add(1, Ordering::Relaxed);
+            }
+            EntryKind::Directory => {
+                self.directories.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        true
     }
 }
 
@@ -165,7 +203,11 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
         .num_threads(options.threads)
         .build()?;
     control.directories.store(1, Ordering::Relaxed);
-    // Small groups keep temporary enumeration storage bounded on wide trees.
+    control.files.store(0, Ordering::Relaxed);
+    control
+        .remaining_entries
+        .store(options.max_entries - 1, Ordering::Relaxed);
+    // All workers reserve from one budget before retaining an entry.
     'walk: while !frontier.is_empty() && !control.is_cancelled() {
         let mut next = Vec::new();
         for chunk in frontier.chunks(options.threads * 2) {
@@ -175,14 +217,7 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
             let batches: Vec<_> = pool.install(|| {
                 chunk
                     .par_iter()
-                    .map(|(_, path)| {
-                        platform::read_directory(
-                            path,
-                            &control,
-                            options.max_entries,
-                            allocation_unit,
-                        )
-                    })
+                    .map(|(_, path)| platform::read_directory(path, &control, allocation_unit))
                     .collect()
             });
             for ((parent, _), batch) in chunk.iter().zip(batches) {
@@ -190,18 +225,6 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
                     add_issue(&mut summary, issue);
                 }
                 for raw in batch.entries {
-                    if entries.len() >= options.max_entries {
-                        let path = summary.root.clone();
-                        add_issue(
-                            &mut summary,
-                            ScanIssue {
-                                path,
-                                message: "entry limit reached; increase --max-entries to scan more"
-                                    .into(),
-                            },
-                        );
-                        break 'walk;
-                    }
                     let duplicate = raw.kind == EntryKind::File
                         && raw.identity.is_some_and(|id| !seen.insert(id));
                     let unique = if duplicate { 0 } else { raw.logical };
@@ -233,10 +256,17 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
                     });
                 }
             }
-            control.files.store(summary.files, Ordering::Relaxed);
-            control
-                .directories
-                .store(summary.directories, Ordering::Relaxed);
+        }
+        if !next.is_empty() && control.remaining_entries.load(Ordering::Relaxed) == 0 {
+            let path = summary.root.clone();
+            add_issue(
+                &mut summary,
+                ScanIssue {
+                    path,
+                    message: "entry limit reached; unscanned directories remain".into(),
+                },
+            );
+            break;
         }
         frontier = next;
     }

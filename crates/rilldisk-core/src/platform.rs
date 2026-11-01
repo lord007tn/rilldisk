@@ -16,7 +16,6 @@ pub(crate) fn allocation_unit(_root: &std::path::Path) -> std::io::Result<Option
 pub(crate) fn read_directory(
     path: &std::path::Path,
     control: &crate::ScanControl,
-    limit: usize,
     _allocation_unit: Option<u64>,
 ) -> crate::Batch {
     use crate::{Batch, EntryKind, RawEntry, ScanIssue};
@@ -30,13 +29,6 @@ pub(crate) fn read_directory(
                 break;
             }
             let item = item?;
-            if batch.entries.len() >= limit {
-                batch.issues.push(ScanIssue {
-                    path: path.into(),
-                    message: "directory entry limit reached".into(),
-                });
-                break;
-            }
             let metadata = match item.path().symlink_metadata() {
                 Ok(value) => value,
                 Err(error) => {
@@ -66,6 +58,13 @@ pub(crate) fn read_directory(
             };
             #[cfg(not(unix))]
             let (allocated, identity) = (None, None);
+            if !control.record(kind) {
+                batch.issues.push(ScanIssue {
+                    path: path.into(),
+                    message: "entry limit reached".into(),
+                });
+                break;
+            }
             batch.entries.push(RawEntry {
                 path: item.path(),
                 kind,

@@ -20,6 +20,8 @@ Only one scan/snapshot is retained. A new scan expires the previous completed ID
 queries with that ID fail rather than returning another scan's data. Queries run
 against immutable in-memory results, not additional live reads. MCP currently
 does not export full snapshots or expose destructive operations.
+Two queries may run concurrently; a capacity error means the client should retry
+after an outstanding query finishes.
 
 Scan roots are canonicalized, and paths outside them are rejected, including a
 symlink root pointing outside the allowed directory. This is not a security

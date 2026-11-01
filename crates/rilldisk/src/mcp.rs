@@ -13,13 +13,14 @@ use std::{
     path::PathBuf,
     sync::{Arc, atomic::Ordering},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 #[derive(Clone)]
 struct DiskServer {
     roots: Arc<Vec<PathBuf>>,
     options: ScanOptions,
     state: Arc<Mutex<State>>,
+    query_gate: Arc<Semaphore>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -82,8 +83,13 @@ impl DiskServer {
         )
     )]
     fn allowed_roots(&self) -> Result<CallToolResult, ErrorData> {
+        let roots: Vec<_> = self
+            .roots
+            .iter()
+            .map(|path| path.to_string_lossy())
+            .collect();
         output(
-            json!({"roots": self.roots, "max_entries": self.options.max_entries,
+            json!({"roots": roots, "max_entries": self.options.max_entries,
             "threads": self.options.threads, "read_only": true}),
         )
     }
@@ -190,6 +196,10 @@ impl DiskServer {
         &self,
         Parameters(input): Parameters<QueryInput>,
     ) -> Result<CallToolResult, ErrorData> {
+        let permit =
+            self.query_gate.clone().try_acquire_owned().map_err(|_| {
+                invalid("query capacity reached; retry after another query finishes")
+            })?;
         let limit = input.limit.unwrap_or(50);
         if !(1..=500).contains(&limit) {
             return Err(invalid("limit must be between 1 and 500"));
@@ -213,6 +223,7 @@ impl DiskServer {
             return Err(invalid("unknown parent_id"));
         }
         let value = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             let offset = input.offset.unwrap_or(0);
             let (total, entries) = snapshot.query(input.parent_id, input.query.as_deref(), input.files_only.unwrap_or(false), offset, limit);
             json!({"scan_id": input.scan_id, "complete": snapshot.summary.complete, "total": total,
@@ -278,6 +289,7 @@ pub async fn serve(roots: Vec<PathBuf>, options: ScanOptions) -> Result<()> {
         roots: Arc::new(roots),
         options,
         state: Arc::new(Mutex::new(State::default())),
+        query_gate: Arc::new(Semaphore::new(2)),
         tool_router: DiskServer::tool_router(),
     };
     let state = server.state.clone();

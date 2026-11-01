@@ -605,6 +605,7 @@ dependencies = [
  "anyhow",
  "rayon",
  "serde",
+ "serde_json",
  "tempfile",
  "windows-sys",
 ]

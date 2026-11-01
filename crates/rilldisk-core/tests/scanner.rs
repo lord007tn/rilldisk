@@ -177,3 +177,57 @@ fn resident_ntfs_data_has_no_separate_allocated_clusters() {
     assert_eq!(snapshot.summary.logical_bytes, 17);
     assert_eq!(snapshot.summary.allocated_bytes, Some(0));
 }
+
+#[test]
+fn exports_non_unicode_filenames_as_lossy_text_without_losing_the_inventory() {
+    let root = tempfile::tempdir().unwrap();
+    #[cfg(windows)]
+    let name = {
+        use std::os::windows::ffi::OsStringExt;
+        std::ffi::OsString::from_wide(&[98, 97, 100, 45, 0xD800])
+    };
+    #[cfg(unix)]
+    let name = {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(vec![98, 97, 100, 45, 255])
+    };
+    fs::write(root.path().join(name), b"data").unwrap();
+    let snapshot = scan(root.path(), ScanOptions::default(), Arc::default()).unwrap();
+    assert!(snapshot.summary.complete);
+    assert_eq!(snapshot.summary.files, 1);
+    let json = serde_json::to_value(&snapshot).unwrap();
+    assert!(
+        json["entries"][1]["path"]
+            .as_str()
+            .unwrap()
+            .ends_with("bad-\u{fffd}")
+    );
+    assert_eq!(json["summary"]["logical_bytes"], 4);
+}
+
+#[test]
+fn parallel_directories_share_one_record_budget() {
+    let root = tempfile::tempdir().unwrap();
+    for directory in 0..32 {
+        let path = root.path().join(format!("dir-{directory}"));
+        fs::create_dir(&path).unwrap();
+        for file in 0..50 {
+            fs::write(path.join(format!("file-{file}")), b"data").unwrap();
+        }
+    }
+    let control = Arc::new(ScanControl::default());
+    let snapshot = scan(
+        root.path(),
+        ScanOptions {
+            threads: 8,
+            max_entries: 100,
+        },
+        control.clone(),
+    )
+    .unwrap();
+    assert!(!snapshot.summary.complete);
+    assert_eq!(snapshot.entries.len(), 100);
+    assert_eq!(snapshot.summary.directories, 33);
+    assert_eq!(snapshot.summary.files, 67);
+    assert_eq!(control.files.load(std::sync::atomic::Ordering::Relaxed), 67);
+}

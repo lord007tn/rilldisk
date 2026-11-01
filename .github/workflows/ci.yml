@@ -30,6 +30,8 @@ jobs:
         run: python scripts/test_mcp.py target/release/rilldisk.exe
       - if: runner.os != 'Windows'
         run: python scripts/test_mcp.py target/release/rilldisk
+      - if: runner.os != 'Windows'
+        run: python scripts/test_cli_signals.py target/release/rilldisk
       - if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:

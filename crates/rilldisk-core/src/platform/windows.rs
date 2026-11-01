@@ -59,14 +59,13 @@ pub(crate) fn allocation_unit(root: &Path) -> io::Result<Option<u64>> {
 pub(crate) fn read_directory(
     path: &Path,
     control: &ScanControl,
-    limit: usize,
     allocation_unit: Option<u64>,
 ) -> Batch {
     let mut batch = Batch {
         entries: Vec::new(),
         issues: Vec::new(),
     };
-    if let Err(error) = enumerate(path, control, limit, allocation_unit, &mut batch) {
+    if let Err(error) = enumerate(path, control, allocation_unit, &mut batch) {
         batch.issues.push(ScanIssue {
             path: path.into(),
             message: error.to_string(),
@@ -78,7 +77,6 @@ pub(crate) fn read_directory(
 fn enumerate(
     path: &Path,
     control: &ScanControl,
-    limit: usize,
     allocation_unit: Option<u64>,
     batch: &mut Batch,
 ) -> io::Result<()> {
@@ -124,8 +122,8 @@ fn enumerate(
             }
             let (entry, next) = parse_record(bytes, offset, path, volume.VolumeSerialNumber)?;
             if let Some(mut entry) = entry {
-                if batch.entries.len() >= limit {
-                    return Err(io::Error::other("directory entry limit reached"));
+                if !control.record(entry.kind) {
+                    return Err(io::Error::other("entry limit reached"));
                 }
                 // NTFS resident data uses MFT space, not a separately allocated data cluster.
                 // Directory records can report its byte-rounded resident length as AllocationSize.
@@ -182,7 +180,8 @@ fn parse_record(
     let record = unsafe { std::ptr::read_unaligned(rest.as_ptr().cast::<FILE_ID_BOTH_DIR_INFO>()) };
     let length = record.FileNameLength as usize;
     let next = record.NextEntryOffset as usize;
-    if !length.is_multiple_of(2)
+    if length == 0
+        || !length.is_multiple_of(2)
         || header + length > rest.len()
         || (next != 0 && (next < header + length || next > rest.len()))
     {
@@ -232,6 +231,7 @@ mod tests {
     fn rejects_invalid_native_records() {
         assert!(parse_record(&[], 0, Path::new("C:\\"), 1).is_err());
         let mut bytes = vec![0_u8; 256];
+        assert!(parse_record(&bytes, 0, Path::new("C:\\"), 1).is_err());
         let name_length = offset_of!(FILE_ID_BOTH_DIR_INFO, FileNameLength);
         bytes[name_length..name_length + 4].copy_from_slice(&u32::MAX.to_le_bytes());
         assert!(parse_record(&bytes, 0, Path::new("C:\\"), 1).is_err());

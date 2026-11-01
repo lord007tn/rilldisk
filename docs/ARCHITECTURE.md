@@ -41,9 +41,10 @@ Windows regression test independently confirms absence of extents with
 `FSCTL_GET_RETRIEVAL_POINTERS`; logical bytes remain unchanged.
 
 Cancellation is cooperative between directory batches and records. A blocking
-filesystem operation can delay it. The entry limit and capped error details bound
-retained records, but paths, temporary directory batches, the hard-link set and
-query sorting add memory. Five million entries can require substantial RAM. A
+filesystem operation can delay it. Every worker atomically reserves a record from
+one shared budget before retaining it, bounding the combined arena and in-flight
+records. Progress counters update during enumeration. Paths, frontier copies,
+the hard-link set and query sorting add memory. Five million entries can require substantial RAM. A
 compact name arena and indexed queries should follow profiling, not precede it.
 
 ## MCP state
@@ -56,6 +57,8 @@ workers. A completed snapshot is shared immutably. A later scan replaces it and
 invalidates its ID. Status polling and cancellation remain available during work.
 Shutdown requests cancellation. Tool output is paginated and has explicit
 completion/error metadata. Filenames are untrusted data, including prompt-like text.
+At most two snapshot queries run concurrently; excess callers receive a retryable
+capacity error. Permits remain held until blocking query work actually finishes.
 
 ## Native desktop direction
 
