@@ -89,6 +89,9 @@ pub struct Candidate {
     pub category: Category,
     pub safety: Safety,
     pub label: &'static str,
+    /// AI coding agent that created this worktree, when its location says so.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<&'static str>,
     pub reason: String,
     pub suggested_action: String,
     pub logical_bytes: u64,
@@ -638,12 +641,16 @@ pub fn find_reclaimable(snapshot: &Snapshot, now_unix_ms: u64) -> ReclaimReport 
         } else {
             rule.action.to_string()
         };
+        let agent = (rule.category == Category::GitWorktree)
+            .then(|| agent_owner(&path.join("x")))
+            .flatten();
         candidates.push(Candidate {
             entry_id: *id,
             path,
             category: rule.category,
             safety: *safety,
             label: rule.label,
+            agent,
             reason,
             suggested_action,
             logical_bytes: entry.logical_bytes,

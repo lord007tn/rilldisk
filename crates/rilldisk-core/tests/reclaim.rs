@@ -118,8 +118,10 @@ fn finds_regenerable_folders_worktrees_and_caches_without_false_positives() {
     let tracked = find("worktrees/agent-1");
     assert_eq!(tracked.label, "Git worktree");
     assert!(tracked.reason.contains("Claude Code"), "{}", tracked.reason);
+    assert_eq!(tracked.agent, Some("Claude Code"));
     let orphan = find("worktrees/wf_1");
     assert_eq!(orphan.label, "Orphaned agent worktree");
+    assert_eq!(orphan.agent, Some("Claude Code"));
     assert_eq!(orphan.safety, Safety::Review);
     assert!(orphan.suggested_action.contains("git worktree prune"));
     assert_eq!(find("wf_1/node_modules").nested_in, Some(orphan.entry_id));
