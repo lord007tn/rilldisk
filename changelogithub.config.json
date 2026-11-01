@@ -1,0 +1,15 @@
+{
+  "types": {
+    "feat": { "title": "🚀 Features" },
+    "fix": { "title": "🐞 Bug Fixes" },
+    "perf": { "title": "🏎 Performance" },
+    "docs": { "title": "📝 Documentation" }
+  },
+  "titles": {
+    "breakingChanges": "🚨 Breaking Changes"
+  },
+  "contributors": true,
+  "capitalize": true,
+  "group": true,
+  "emoji": true
+}
