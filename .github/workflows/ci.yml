@@ -19,6 +19,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - if: runner.os == 'Linux'
+        name: Install desktop build dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libx11-dev
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
@@ -36,4 +39,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: rilldisk-windows-x86_64
-          path: target/release/rilldisk.exe
+          path: |
+            target/release/rilldisk.exe
+            target/release/rilldisk-desktop.exe

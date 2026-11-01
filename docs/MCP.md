@@ -14,7 +14,27 @@ network server. Stdout contains only protocol messages.
    `offset` and `limit`. Root entry ID is 0. Results are ordered by logical size
    descending and entry ID ascending. `next_offset: null` ends pagination. Default
    page size is 50, maximum 500.
-5. Call `cancel_scan` to request cooperative cancellation. Poll until it stops.
+5. Call `find_reclaimable` with the ID to list likely reclaimable folders: linked
+   Git worktrees (with the AI agent that created them), orphaned agent worktrees,
+   build output, dependency folders, package caches, temp folders and the Recycle
+   Bin. Filter with `category` (`git_worktree`, `build_output`, `dependencies`,
+   `package_cache`, `app_cache`, `temporary`, `recycle_bin`) and `min_bytes`
+   (default 1 MiB). Each candidate has `safety` (`regenerable`, `cache`,
+   `review`), `reason`, `idle_days`, `file_count`, `exclusive_bytes` (on-disk
+   space removing it frees at least), `shared_bytes` (hard-linked elsewhere),
+   `nested_in` and a
+   `suggested_action` for the user to run. Totals count outermost candidates only.
+6. Call `file_types` for space per extension.
+7. Call `cancel_scan` to request cooperative cancellation. Poll until it stops.
+
+Entries (schema version 2) carry `name`, full `path`, `parent_id`, `kind`,
+`logical_bytes`, `unique_logical_bytes`, `allocated_bytes`, `modified_unix_ms`
+(directories: newest in subtree), `file_count`, `hard_link_duplicate` and
+`multiple_links` (another name of the same file exists in the scan).
+
+Reclaim suggestions come from names, entry kinds and marker files only. They are
+advice, not authorization: confirm with the user, prefer the suggested tool
+command, and treat `review` candidates as possibly unique work.
 
 Only one scan/snapshot is retained. A new scan expires the previous completed ID;
 queries with that ID fail rather than returning another scan's data. Queries run

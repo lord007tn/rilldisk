@@ -1,11 +1,12 @@
 # Architecture
 
-Status: phase-one implementation, November 1, 2026.
+Status: phase one plus the first desktop release, November 1, 2026.
 
 ```text
-                    ┌─ CLI: table / JSON / JSONL
-rilldisk-core ──────┼─ MCP: stdio, background job, paginated queries
-                    └─ native Rust GPU desktop (next phase)
+                    ┌─ rilldisk (CLI): table / JSON / JSONL, reclaim, drives
+rilldisk-core ──────┼─ rilldisk mcp: stdio, background job, paginated queries
+  scan · reclaim    └─ rilldisk-desktop: egui on wgpu, treemap, tree, reclaim
+  stats · volumes
        │
        ├─ Windows: batched Win32 directory metadata
        └─ portable walk: development / test fallback
@@ -14,13 +15,18 @@ rilldisk-core ──────┼─ MCP: stdio, background job, paginated que
 ## Phase-one contracts
 
 The core stores a flat arena of entries. Parent IDs always precede children, so a
-reverse pass computes subtree totals in linear time. Paths are retained as native
-`PathBuf` values; JSON serialization is textual. Entries have stable IDs within
+reverse pass computes subtree totals, file counts and newest modification times in
+linear time. Each entry stores only its final name (`Box<OsStr>`); full paths are
+rebuilt from the parent chain on demand (`Snapshot::path`, `Snapshot::view`). This
+roughly halves memory on multi-million-entry scans. A compressed child index
+(offsets + IDs, sorted by size) serves tree browsing, treemap layout and
+`parent_id` queries without scanning the arena. JSON serialization is textual. Entries have stable IDs within
 one scan, not across scans. Filesystem mutations can change names and sizes while
 enumeration runs. The engine does not promise a point-in-time snapshot.
 
-Each generation of directories is processed in small parallel groups using an
-explicit Rayon pool. The Win32 backend uses a directory handle opened with sharing
+Each generation of directories is processed in groups of up to 4,096 on an
+explicit Rayon pool (default: logical cores, clamped to 8-32), so work stealing
+balances uneven folders without a per-group barrier dominating. The Win32 backend uses a directory handle opened with sharing
 for read/write/delete and `FILE_FLAG_OPEN_REPARSE_POINT`, checks its attributes,
 then requests `FileIdBothDirectoryInfo` records in a reusable 64 KiB aligned buffer.
 Native buffer offsets and UTF-16 lengths are checked before records are decoded.
@@ -43,7 +49,8 @@ Windows regression test independently confirms absence of extents with
 Cancellation is cooperative between directory batches and records. A blocking
 filesystem operation can delay it. Every worker atomically reserves a record from
 one shared budget before retaining it, bounding the combined arena and in-flight
-records. Progress counters update during enumeration. Paths, frontier copies,
+records. Reaching the bound (default 30 million entries) produces one issue and a
+partial result. Progress counters update during enumeration. Paths, frontier copies,
 the hard-link set and query sorting add memory. Five million entries can require substantial RAM. A
 compact name arena and indexed queries should follow profiling, not precede it.
 
@@ -60,13 +67,31 @@ completion/error metadata. Filenames are untrusted data, including prompt-like t
 At most two snapshot queries run concurrently; excess callers receive a retryable
 capacity error. Permits remain held until blocking query work actually finishes.
 
-## Native desktop direction
+## Reclaim analysis
 
-The desktop will be a separate Rust crate consuming the same core. Use a Rust GPU
-renderer (initial candidate: egui on wgpu), a virtualized tree/list, and a treemap
-with hit testing. Scan work and aggregation stay off the render thread. Measure
-frame time and resident memory on Windows before choosing a more custom renderer.
-No JavaScript, web UI, Tauri or Electron is part of the architecture.
+`find_reclaimable` walks the finished snapshot once. Directory rules match names
+plus marker siblings or children (`target` + `Cargo.toml`, `node_modules` +
+`package.json`, `.venv` containing `pyvenv.cfg`, Unity `Library` beside `Assets`
+and `ProjectSettings`). A `.git` *file* marks a linked worktree unless the
+enclosing repository declares submodules. Children of an AI agent's `worktrees`
+folder with no `.git` are orphaned worktrees. Known cache locations match trailing
+path components. Candidates nested inside a regenerable or cache candidate are
+dropped; candidates inside a worktree are kept with `nested_in` and excluded from
+totals. Idle days come from the newest modification time in the subtree. No file
+contents are read and nothing is modified.
+
+## Desktop
+
+`rilldisk-desktop` is a separate crate on eframe/egui with the wgpu renderer, so
+CLI and MCP builds carry no GPU dependencies. Scans and analysis (reclaim, types,
+largest files) run on a worker thread; the UI thread only polls progress counters
+and swaps in a finished `Arc<Snapshot>`. The tree is virtualized (only visible
+rows are laid out). The treemap is a squarified layout computed once per (zoom
+root, size metric, canvas size) and cached as a single vertex mesh with four-
+corner cushion shading, capped at 120,000 tiles; hit testing walks the cached
+tiles. Single-child folder chains fold into one header. `--capture DIR` runs a
+scripted tour that injects real pointer events and saves PNG frames for
+documentation.
 
 ## Direct NTFS backend
 
