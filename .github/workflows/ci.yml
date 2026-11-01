@@ -1,0 +1,39 @@
+name: Rust
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+      - run: cargo build --release --locked
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - if: runner.os == 'Windows'
+        run: python scripts/test_mcp.py target/release/rilldisk.exe
+      - if: runner.os != 'Windows'
+        run: python scripts/test_mcp.py target/release/rilldisk
+      - if: runner.os != 'Windows'
+        run: python scripts/test_cli_signals.py target/release/rilldisk
+      - if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rilldisk-windows-x86_64
+          path: target/release/rilldisk.exe

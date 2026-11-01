@@ -1,0 +1,21 @@
+[package]
+name = "rilldisk"
+description = "Native Rust disk intelligence for humans and AI assistants"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+rilldisk-core = { path = "../rilldisk-core", version = "0.1.0" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "sync", "signal"] }
+rmcp = { version = "3.8", features = ["transport-io", "schemars"] }
+
+[dev-dependencies]
+tempfile = "3"
