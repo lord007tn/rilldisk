@@ -24,7 +24,21 @@ interpreting a speed difference. Record filesystem, hardware, storage, versions,
 scan order, warm/cold conditions and background activity. Never publish personal
 filenames or raw inventories.
 
-## Measurement status
+## Initial local observation
 
-Local product comparisons and benchmark research are scheduled after development
-validation. Results will be recorded separately with their actual scope and limits.
+November 1, 2026, source `f28860e`, release build, Windows 11 build 26200,
+Core Ultra 9 285HX, Phison 2 TB NVMe, NTFS. A separate comparison harness used a
+previously visited 50,000-file fixture, rotated scan order, ordinary user privileges,
+and five fresh processes. Cache state and background activity were not controlled.
+
+Core enumeration/aggregation times: **62, 32, 112, 152, 31 ms** (median **62 ms**).
+Process times: **9780.08, 82.28, 247.07, 263.38, 80.19 ms** (median **247.07 ms**).
+The large first-process delay occurred outside measured core enumeration; its
+cause is unknown and the sample is retained. Core timing excludes root resolution,
+volume setup, report formatting and process startup/shutdown.
+
+These observations do not establish a whole-drive speed advantage. Comparisons
+against installed products and live private directories are retained separately
+without publishing their inventories. WizTree's elevated direct-MFT mode was not
+measured. Whole-volume qualification and memory/startup profiling remain in
+[issue 3](https://github.com/lord007tn/rilldisk/issues/3).

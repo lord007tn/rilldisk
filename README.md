@@ -12,6 +12,10 @@ webview, embedded model, cloud account, or telemetry.
 
 ## Get started
 
+Portable Windows x64 previews are available on the [releases page](https://github.com/lord007tn/rilldisk/releases).
+Extract the archive and run `rilldisk.exe` from a terminal. This preview provides
+the CLI and MCP server; the graphical desktop is a later milestone.
+
 Build on Windows x64 with [Rust stable](https://rustup.rs/), Visual Studio C++ Build
 Tools and the Windows SDK. Use a Developer PowerShell if Cargo cannot find the linker.
 
