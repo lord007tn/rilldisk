@@ -293,3 +293,44 @@ fn install_refuses_package_managed_binaries_before_downloading() {
     let error = rilldisk_update::install(&release, &plan, &mut |_, _| {}).unwrap_err();
     assert!(error.to_string().contains("Homebrew"), "{error}");
 }
+
+#[test]
+fn the_yaml_feed_describes_an_installable_release_with_checksums() {
+    let release = rilldisk_update::parse_feed(include_bytes!("fixtures/latest.yml")).unwrap();
+    assert_eq!(release.tag, "v0.1.0");
+    assert_eq!(release.version, Version::new(0, 1, 0));
+    assert!(!release.prerelease);
+    assert!(release.installable_for(WINDOWS));
+    assert!(release.installable_for(LINUX));
+    assert!(!release.installable_for("aarch64-apple-darwin"));
+    let linux = archive_name("v0.1.0", LINUX);
+    // Checksums are normalized to lowercase hex.
+    assert_eq!(
+        release.checksums[&linux],
+        "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809"
+    );
+    let newer = select_update(
+        std::slice::from_ref(&release),
+        &Version::parse("0.0.9").unwrap(),
+        Channel::Stable,
+        WINDOWS,
+    );
+    assert_eq!(newer.map(|r| r.tag.as_str()), Some("v0.1.0"));
+}
+
+#[test]
+fn a_feed_pointing_elsewhere_or_with_bad_checksums_is_rejected() {
+    let feed = String::from_utf8(include_bytes!("fixtures/latest.yml").to_vec()).unwrap();
+    for (from, to) in [
+        (
+            "https://github.com/lord007tn/rilldisk/releases/download/v0.1.0/rilldisk-v0.1.0-x86_64-pc",
+            "https://evil.example/rilldisk-v0.1.0-x86_64-pc",
+        ),
+        ("sha256: 0f343b", "sha256: zz343b"),
+        ("tag: v0.1.0", "tag: v9.9.9"),
+    ] {
+        let bad = feed.replacen(from, to, 1);
+        assert_ne!(bad, feed);
+        assert!(rilldisk_update::parse_feed(bad.as_bytes()).is_err(), "{to}");
+    }
+}

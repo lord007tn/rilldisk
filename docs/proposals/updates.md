@@ -74,14 +74,43 @@ those installs and leaves them alone.
    Conventional Commits since the previous tag. `changelogithub.config.json`
    shows Features, Bug Fixes, Performance, Documentation and Breaking Changes.
    `ci:`, `chore:`, `test:`, `refactor:` and untyped commits are left out.
-4. **Assemble.** `package_release.py finalize` writes `SHA256SUMS` and a
-   release-wide `BUILD-MANIFEST.json`, then checks the sums with
-   `sha256sum --check`.
+4. **Assemble.** `package_release.py finalize` writes `SHA256SUMS`, a
+   release-wide `BUILD-MANIFEST.json` and the `latest.yml` update feed, then
+   checks the sums with `sha256sum --check`.
 5. **Publish** (tag pushes only, `release` environment). Creates a Sigstore
    build-provenance attestation for every archive (`gh attestation verify
    <archive> --repo lord007tn/rilldisk`). Then `gh release create --verify-tag`
    uploads every asset to a draft before publishing, so an updater never sees
-   a release without `SHA256SUMS`.
+   a release without `SHA256SUMS` or `latest.yml`.
+
+### The update feed
+
+Every release carries `latest.yml`, in the spirit of electron-updater's feed:
+
+```yaml
+# RillDisk update feed: read by `rilldisk update` and the desktop app.
+version: 0.1.0
+tag: v0.1.0
+prerelease: false
+releaseDate: '2026-11-01T18:00:00Z'
+notes: https://github.com/lord007tn/rilldisk/releases/tag/v0.1.0
+files:
+  - target: x86_64-pc-windows-msvc
+    name: rilldisk-v0.1.0-x86_64-pc-windows-msvc.zip
+    url: https://github.com/lord007tn/rilldisk/releases/download/v0.1.0/rilldisk-v0.1.0-x86_64-pc-windows-msvc.zip
+    sha256: <64 hex digits>
+    size: 8898788
+  # ... one entry per target
+```
+
+The stable channel reads it through GitHub's fixed link to the newest stable
+release, `https://github.com/lord007tn/rilldisk/releases/latest/download/latest.yml`:
+one small request with no API rate limit, and the checksum arrives with the
+release description. If that fails (for example a release without a feed), the
+updater falls back to the releases API and `SHA256SUMS`. Pre-releases always use
+the API, because GitHub's "latest" link never points at a pre-release. A feed is
+rejected unless its tag matches its version, every URL is this repository's
+download link for that tag and file, and every checksum is 64 hex digits.
 
 Manual `workflow_dispatch` runs are dry runs. They do everything except
 publish, and the archives, sums and notes stay as workflow artifacts for seven
@@ -97,10 +126,11 @@ Archive names are the contract between packaging and the updater:
 ### Cutting a release
 
 1. Set `version` in `[workspace.package]` and the path-dependency `version =`
-   requirements to the new version (for example `0.3.0` or `0.3.0-alpha.1`),
-   run `cargo check` to refresh `Cargo.lock`, and merge to `main` as
-   `chore(release): v0.3.0`.
-2. `git tag v0.3.0 <main sha> && git push origin v0.3.0`.
+   requirements to the new version (for example `0.1.1`, or `0.2.0-beta.1` for
+   a pre-release), run `cargo check` to refresh `Cargo.lock`, and merge to
+   `main` as `chore(release): v0.1.1`. Until 1.0, fixes and small features ship
+   as `0.1.x`; the minor version moves only for a substantial change.
+2. `git tag v0.1.1 <main sha> && git push origin v0.1.1`.
 3. Optionally rehearse first with **Actions → Release → Run workflow** on any
    branch.
 
@@ -112,7 +142,8 @@ The only requests are anonymous HTTPS `GET`s:
 
 | Request | When |
 | --- | --- |
-| `https://api.github.com/repos/lord007tn/rilldisk/releases?per_page=30` | every check |
+| `https://github.com/lord007tn/rilldisk/releases/latest/download/latest.yml` | every stable check |
+| `https://api.github.com/repos/lord007tn/rilldisk/releases?per_page=100&page=N` | pre-release checks, and stable checks when the feed is unavailable (at most 5 pages) |
 | `https://github.com/lord007tn/rilldisk/releases/download/<tag>/SHA256SUMS` | install only |
 | `https://github.com/lord007tn/rilldisk/releases/download/<tag>/rilldisk-<tag>-<target>.<ext>` | install only |
 
@@ -121,8 +152,8 @@ OS, machine ID, cookie or token. GitHub sees the IP address and time like any
 HTTPS request, and on install it can infer the platform from the archive name.
 Requests must start at `https://api.github.com/` or `https://github.com/`.
 GitHub's HTTPS redirects to its download CDN are followed, at most five times.
-Responses are size-capped: 8 MiB for the API, 1 MiB for checksums, 1 GiB for
-archives.
+Responses are size-capped: 64 KiB for the feed, 8 MiB per API page, 1 MiB for
+checksums, 1 GiB for archives.
 
 ### When it happens
 
@@ -163,7 +194,8 @@ downgrades.
 * HTTPS only, with certificate validation by the OS trust store on Windows and
   macOS and Mozilla's roots on Linux.
 * The archive must match the SHA-256 listed for its exact file name in that
-  release's `SHA256SUMS`. If it does not, nothing on disk changes.
+  release's `latest.yml` (or, when read from the API, its `SHA256SUMS`). If it
+  does not, nothing on disk changes.
 * Binaries are taken from the archive into memory by file name only, so a
   path-traversal entry cannot write anywhere.
 

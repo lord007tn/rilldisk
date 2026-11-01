@@ -6,7 +6,7 @@ Package one target after `cargo build --release --target TARGET`:
         --tag v0.3.0 --commit "$(git rev-parse HEAD)" --out dist
 
 Then, with every target's output in one folder, write SHA256SUMS and the
-release-wide BUILD-MANIFEST.json:
+release-wide BUILD-MANIFEST.json and the latest.yml update feed:
 
     python scripts/package_release.py finalize --tag v0.3.0 --commit SHA --out dist
 
@@ -15,6 +15,7 @@ Archives are named `rilldisk-<tag>-<target>.zip` (Windows, flat) or
 for exactly these names; keep them in sync.
 """
 import argparse
+import datetime
 import gzip
 import hashlib
 import io
@@ -362,7 +363,36 @@ def finalize(args):
         "targets": sorted(targets, key=lambda t: t["target"]),
     }
     (out / "BUILD-MANIFEST.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    write_feed(out, args.tag, version, manifest["targets"])
     print((out / "SHA256SUMS").read_text(encoding="utf-8"), end="")
+
+
+def write_feed(out, tag, version, targets):
+    """latest.yml: the update feed read by `rilldisk update` and the desktop app.
+
+    Plain scalars only, so writing it needs no YAML library; parse_feed in
+    crates/rilldisk-update validates every URL and checksum it reads back.
+    """
+    download = f"{SOURCE}/releases/download/{tag}"
+    date = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    lines = [
+        "# RillDisk update feed: read by `rilldisk update` and the desktop app.",
+        f"version: {version}",
+        f"tag: {tag}",
+        f"prerelease: {'true' if '-' in version else 'false'}",
+        f"releaseDate: '{date}'",
+        f"notes: {SOURCE}/releases/tag/{tag}",
+        "files:",
+    ]
+    for t in targets:
+        lines += [
+            f"  - target: {t['target']}",
+            f"    name: {t['archive']}",
+            f"    url: {download}/{t['archive']}",
+            f"    sha256: {t['archive_sha256']}",
+            f"    size: {t['archive_bytes']}",
+        ]
+    (out / "latest.yml").write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
 
 
 def main():
@@ -371,7 +401,7 @@ def main():
     p = sub.add_parser("package", help="stage and archive one target")
     p.add_argument("--target", required=True)
     p.add_argument("--bin-dir", help="default: target/<target>/release")
-    f = sub.add_parser("finalize", help="write SHA256SUMS and BUILD-MANIFEST.json")
+    f = sub.add_parser("finalize", help="write SHA256SUMS, BUILD-MANIFEST.json and latest.yml")
     for s in (p, f):
         s.add_argument("--tag", required=True)
         s.add_argument("--commit", required=True)

@@ -172,19 +172,24 @@ pub fn install(
     let archive = release
         .asset(&name)
         .with_context(|| format!("release {} has no {name}", release.tag))?;
-    let sums = release.asset(CHECKSUMS_ASSET).with_context(|| {
-        format!(
-            "release {} has no {CHECKSUMS_ASSET}; refusing to install unverified files",
-            release.tag
-        )
-    })?;
-    let sums = net::download(&sums.url, MAX_CHECKSUMS, &mut |_, _| {})?;
-    let sums = parse_sha256sums(&String::from_utf8_lossy(&sums));
-    let expected = sums
-        .get(&name)
-        .with_context(|| format!("{CHECKSUMS_ASSET} does not list {name}"))?;
+    // The update feed carries the checksum; API-listed releases use SHA256SUMS.
+    let expected = match release.checksums.get(&name) {
+        Some(sha) => sha.clone(),
+        None => {
+            let sums = release.asset(CHECKSUMS_ASSET).with_context(|| {
+                format!(
+                    "release {} has no {CHECKSUMS_ASSET}; refusing to install unverified files",
+                    release.tag
+                )
+            })?;
+            let sums = net::download(&sums.url, MAX_CHECKSUMS, &mut |_, _| {})?;
+            parse_sha256sums(&String::from_utf8_lossy(&sums))
+                .remove(&name)
+                .with_context(|| format!("{CHECKSUMS_ASSET} does not list {name}"))?
+        }
+    };
     let bytes = net::download(&archive.url, MAX_ARCHIVE, progress)?;
-    apply_archive(&name, &bytes, expected, plan)?;
+    apply_archive(&name, &bytes, &expected, plan)?;
     Ok(Installed {
         version: release.version.clone(),
         replaced: plan.binaries.clone(),

@@ -60,7 +60,7 @@ several coding agents), so ranges are reported and no samples were dropped.
 
 Changes measured along the way, same workspace unless noted:
 
-* Group barrier of 16 folders (v0.1.0-alpha.1 design), 8 threads: 14.5 s.
+* Group barrier of 16 folders (first prototype design), 8 threads: 14.5 s.
 * Barrier of 4,096 folders, 24 threads, volume identity read once: about 5.5 s,
   but one unresponsive folder under `C:\Users` stalled all progress for minutes
   (422 s total).

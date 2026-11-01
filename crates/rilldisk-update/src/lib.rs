@@ -30,7 +30,7 @@ pub use archive::extract_binaries;
 pub use install::{
     InstallSource, Installed, Plan, apply_archive, cleanup_previous_update, detect_install, install,
 };
-pub use net::{check, fetch_releases};
+pub use net::{check, fetch_feed, fetch_releases};
 pub use state::{CHECK_INTERVAL_SECS, State, state_path};
 
 /// GitHub `owner/name` that publishes RillDisk releases.
@@ -41,6 +41,8 @@ pub const DISABLE_ENV: &str = "RILLDISK_NO_UPDATE_CHECK";
 pub const CHANNEL_ENV: &str = "RILLDISK_UPDATE_CHANNEL";
 /// Release asset listing `sha256  file` for every archive in the release.
 pub const CHECKSUMS_ASSET: &str = "SHA256SUMS";
+/// Release asset describing the release for updaters (see [`parse_feed`]).
+pub const FEED_ASSET: &str = "latest.yml";
 /// Executables shipped in every archive, without the platform suffix.
 pub const BINARIES: [&str; 2] = ["rilldisk", "rilldisk-desktop"];
 
@@ -136,6 +138,9 @@ pub struct Release {
     /// Human-readable release page with the changelog.
     pub notes_url: String,
     pub assets: Vec<Asset>,
+    /// Archive name -> SHA-256 from the release's update feed. Empty when the
+    /// release was read from the API; `SHA256SUMS` is used then.
+    pub checksums: std::collections::BTreeMap<String, String>,
 }
 
 impl Release {
@@ -145,9 +150,88 @@ impl Release {
 
     /// True when this release ships an archive for `target` plus checksums.
     pub fn installable_for(&self, target: &str) -> bool {
-        self.asset(&archive_name(&self.tag, target)).is_some()
-            && self.asset(CHECKSUMS_ASSET).is_some()
+        let name = archive_name(&self.tag, target);
+        self.asset(&name).is_some()
+            && (self.checksums.contains_key(&name) || self.asset(CHECKSUMS_ASSET).is_some())
     }
+}
+
+/// The `latest.yml` update feed published with every release:
+///
+/// ```yaml
+/// version: 0.1.0
+/// tag: v0.1.0
+/// prerelease: false
+/// releaseDate: '2026-11-01T18:00:00Z'
+/// notes: https://github.com/lord007tn/rilldisk/releases/tag/v0.1.0
+/// files:
+///   - target: x86_64-pc-windows-msvc
+///     name: rilldisk-v0.1.0-x86_64-pc-windows-msvc.zip
+///     url: https://github.com/lord007tn/rilldisk/releases/download/v0.1.0/rilldisk-v0.1.0-x86_64-pc-windows-msvc.zip
+///     sha256: <64 hex digits>
+///     size: 8898788
+/// ```
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Feed {
+    version: String,
+    tag: String,
+    #[serde(default)]
+    prerelease: bool,
+    notes: String,
+    files: Vec<FeedFile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FeedFile {
+    name: String,
+    url: String,
+    sha256: String,
+    size: u64,
+}
+
+/// Parse a `latest.yml` feed into a release. Files must be downloads of this
+/// repository's release with the same tag, and every checksum must be 64 hex
+/// digits; anything else is rejected rather than trusted.
+pub fn parse_feed(yaml: &[u8]) -> Result<Release> {
+    let feed: Feed =
+        serde_yaml_ng::from_slice(yaml).context("unreadable latest.yml update feed")?;
+    let version = Version::parse(&feed.version).context("latest.yml has an invalid version")?;
+    if feed.tag != format!("v{version}") {
+        anyhow::bail!(
+            "latest.yml tag {} does not match version {version}",
+            feed.tag
+        );
+    }
+    let base = format!(
+        "https://github.com/{REPOSITORY}/releases/download/{}/",
+        feed.tag
+    );
+    let mut assets = Vec::new();
+    let mut checksums = std::collections::BTreeMap::new();
+    for file in feed.files {
+        let sha = file.sha256.to_ascii_lowercase();
+        if file.url != format!("{base}{}", file.name)
+            || sha.len() != 64
+            || !sha.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            anyhow::bail!("latest.yml lists an unexpected file: {}", file.name);
+        }
+        checksums.insert(file.name.clone(), sha);
+        assets.push(Asset {
+            name: file.name,
+            url: file.url,
+            size: file.size,
+        });
+    }
+    Ok(Release {
+        prerelease: feed.prerelease || !version.pre.is_empty(),
+        tag: feed.tag,
+        version,
+        notes_url: feed.notes,
+        assets,
+        checksums,
+    })
 }
 
 #[derive(Deserialize)]
@@ -185,6 +269,7 @@ pub fn parse_release_page(json: &[u8]) -> Result<(Vec<Release>, usize)> {
                 version,
                 notes_url: r.html_url,
                 assets: r.assets,
+                checksums: Default::default(),
             })
         })
         .collect();

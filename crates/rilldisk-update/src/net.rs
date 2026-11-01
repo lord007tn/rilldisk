@@ -2,8 +2,8 @@
 //! The network edge: anonymous HTTPS GETs to GitHub, nothing else.
 
 use crate::{
-    Channel, Check, DISABLE_ENV, REPOSITORY, Release, current_version, disabled_by_env,
-    parse_release_page, select_update, target,
+    Channel, Check, DISABLE_ENV, FEED_ASSET, REPOSITORY, Release, current_version, disabled_by_env,
+    parse_feed, parse_release_page, select_update, target,
 };
 use anyhow::{Context, Result, bail};
 use std::{io::Read, time::Duration};
@@ -11,6 +11,7 @@ use std::{io::Read, time::Duration};
 /// Generic agent string: no version, platform or machine identifier.
 const USER_AGENT: &str = "rilldisk-update";
 const RELEASES_LIMIT: u64 = 8 << 20;
+const FEED_LIMIT: u64 = 64 << 10;
 /// Hosts a download may start from. GitHub redirects asset downloads to its
 /// CDN over HTTPS; integrity comes from the SHA-256 check either way.
 const ALLOWED_PREFIXES: [&str; 2] = ["https://api.github.com/", "https://github.com/"];
@@ -69,12 +70,29 @@ pub fn fetch_releases() -> Result<Vec<Release>> {
     Ok(releases)
 }
 
+/// The newest stable release, read from its `latest.yml` feed through GitHub's
+/// fixed "latest release" download link: one small request, no API rate limit.
+pub fn fetch_feed() -> Result<Release> {
+    let url = format!("https://github.com/{REPOSITORY}/releases/latest/download/{FEED_ASSET}");
+    let bytes = download(&url, FEED_LIMIT, &mut |_, _| {})?;
+    parse_feed(&bytes)
+}
+
 /// Ask GitHub for the newest release on `channel` newer than this build.
+/// Stable reads the update feed and falls back to the releases API (for example
+/// before any release ships a feed); pre-releases always use the API, because
+/// GitHub's "latest" link never points at a pre-release.
 pub fn check(channel: Channel) -> Result<Check> {
     let Some(target) = target() else {
         bail!("no prebuilt RillDisk release exists for this platform; build from source");
     };
-    let releases = fetch_releases()?;
+    let releases = match channel {
+        Channel::Stable => match fetch_feed() {
+            Ok(release) => vec![release],
+            Err(_) => fetch_releases()?,
+        },
+        Channel::Prerelease => fetch_releases()?,
+    };
     let current = current_version();
     let update = select_update(&releases, &current, channel, target).cloned();
     Ok(Check {

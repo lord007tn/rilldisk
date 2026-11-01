@@ -53,7 +53,9 @@ Squash-merge titles must follow the same format.
 Releases are cut by pushing a `v<semver>` tag; see
 [docs/proposals/updates.md](docs/proposals/updates.md#cutting-a-release). The tag
 must equal `[workspace.package] version` and point at a commit on `main`; a
-`-alpha.N` / `-rc.N` suffix publishes a pre-release. Run the Release workflow
+`-beta.N` / `-rc.N` suffix publishes a pre-release. Until 1.0, releases are
+`0.1.x`. Each release publishes its archives, `SHA256SUMS`,
+`BUILD-MANIFEST.json` and the `latest.yml` update feed together. Run the Release workflow
 manually on a branch for a dry run that builds and packages every target without
 publishing. Network code belongs only in `crates/rilldisk-update`, and MCP must
 not gain update tools.

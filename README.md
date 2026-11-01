@@ -84,8 +84,9 @@ yet, so Windows SmartScreen and macOS Gatekeeper may warn; every release ships
 it; nothing is installed until you click **Install and restart**. From a terminal,
 `rilldisk update --check` reports whether a newer release exists and
 `rilldisk update` downloads it, verifies its SHA-256 and replaces both programs
-after you confirm. Set `RILLDISK_NO_UPDATE_CHECK=1` to turn update checks off
-entirely ([details](docs/proposals/updates.md)).
+after you confirm. Both read the small `latest.yml` feed published with every
+release. Set `RILLDISK_NO_UPDATE_CHECK=1` to turn update checks off entirely
+([details](docs/proposals/updates.md)).
 
 | Shortcut | Action |
 | --- | --- |
@@ -195,12 +196,12 @@ workstation (other agents and WSL running), so ranges are shown.
 
 | Dataset | Entries | Scan time | Peak memory |
 | --- | ---: | ---: | ---: |
-| Synthetic 50,000 files (`scripts/benchmark.py`, 8 threads) | 50,000 | **24 ms** scanner median (v0.1.0-alpha.1: 62 ms) | — |
-| Developer workspace, warm | 3.13M files / 404k folders | **4.6–8.9 s** (v0.1.0-alpha.1: 14.5 s) | **~560 MB** |
+| Synthetic 50,000 files (`scripts/benchmark.py`, 8 threads) | 50,000 | **24 ms** scanner median (first prototype: 62 ms) | — |
+| Developer workspace, warm | 3.13M files / 404k folders | **4.6–8.9 s** (first prototype: 14.5 s) | **~560 MB** |
 | Whole user profile (`C:\Users`) | 18.0M files / 1.9M folders | **92 s** (barrier-based build: 422 s) | — |
 | Entire system drive (`C:\`) | 27.0M files / 2.9M folders | **177 s** | — |
 
-What changed since the first alpha:
+What changed since the first prototype:
 
 * **No barriers.** Workers queue subfolders the moment they read them; a single
   coordinator only assigns IDs. One slow folder no longer stalls a whole group. If

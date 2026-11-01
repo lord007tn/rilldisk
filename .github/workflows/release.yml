@@ -2,7 +2,7 @@
 #
 # * Push a tag `vX.Y.Z` or `vX.Y.Z-alpha.N` that matches [workspace.package]
 #   version and points at a commit on main: builds every target, writes
-#   SHA256SUMS + BUILD-MANIFEST.json, generates notes with changelogithub,
+#   SHA256SUMS + BUILD-MANIFEST.json + latest.yml, generates notes with changelogithub,
 #   attests build provenance and publishes the GitHub release. A tag with a
 #   `-suffix` is published as a pre-release.
 # * Run it manually (workflow_dispatch) on any branch for a dry run: the same
@@ -206,7 +206,7 @@ jobs:
           pattern: dist-*
           merge-multiple: true
           path: dist
-      - name: Write SHA256SUMS and BUILD-MANIFEST.json
+      - name: Write SHA256SUMS, BUILD-MANIFEST.json and latest.yml
         env:
           TAG: ${{ needs.plan.outputs.tag }}
           CI_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -221,6 +221,8 @@ jobs:
             ls -l dist
             echo
             cat dist/SHA256SUMS
+            echo
+            cat dist/latest.yml
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -269,5 +271,6 @@ jobs:
           flags=(--repo "$GITHUB_REPOSITORY" --verify-tag --title "RillDisk $VERSION" --notes-file notes/release-notes.md)
           if [[ "$PRERELEASE" == "true" ]]; then flags+=(--prerelease --latest=false); else flags+=(--latest); fi
           # gh uploads every asset to a draft and publishes only when all are
-          # attached, so updaters never see a release without SHA256SUMS.
-          gh release create "$TAG" "${flags[@]}" dist/rilldisk-* dist/SHA256SUMS dist/BUILD-MANIFEST.json
+          # attached, so updaters never see a release without SHA256SUMS or the
+          # latest.yml feed that releases/latest/download/latest.yml serves.
+          gh release create "$TAG" "${flags[@]}" dist/rilldisk-* dist/SHA256SUMS dist/BUILD-MANIFEST.json dist/latest.yml
