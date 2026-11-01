@@ -24,6 +24,15 @@ fn main() -> eframe::Result {
                 }
             }
             "--help" | "-h" => {
+                // Release builds use the GUI subsystem; borrow the launching
+                // terminal so the usage text is visible.
+                #[cfg(windows)]
+                // SAFETY: plain Win32 call with a documented constant; failure is harmless.
+                unsafe {
+                    windows_sys::Win32::System::Console::AttachConsole(
+                        windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS,
+                    );
+                }
                 println!(
                     "rilldisk-desktop [PATH] [--size WIDTHxHEIGHT] [--capture DIR]\n\nOpens the RillDisk desktop app. PATH starts a scan immediately.\n--capture runs a scripted tour and saves screenshots to DIR (development)."
                 );

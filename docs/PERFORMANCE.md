@@ -63,8 +63,10 @@ Changes measured along the way, same workspace unless noted:
 * Barrier of 4,096 folders, 24 threads, volume identity read once: about 5.5 s,
   but one unresponsive folder under `C:\Users` stalled all progress for minutes
   (422 s total).
-* Worker-driven pipeline (current): 4.6–8.9 s here and 92 s for `C:\Users`, with a
-  60 s per-folder stall guard.
+* Worker-driven pipeline (current): 4.6–8.9 s here and 92 s for `C:\Users`. A
+  whole-scan stall guard stops waiting only after 60 s in which no folder result
+  arrives and the entry budget does not change; outstanding folders are then
+  reported.
 * Peak memory per entry: about 357 bytes with full paths stored (5M entries,
   1.78 GB), about 218 bytes after storing names only (19.9M entries, 4.37 GB),
   about 160–175 bytes on the workspace above.

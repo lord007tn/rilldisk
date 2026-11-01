@@ -18,7 +18,7 @@ pub struct Volume {
     pub removable: bool,
 }
 
-/// Portable builds offer the filesystem root; capacity is not yet qualified there.
+/// Volume listing is Windows-only for now; portable builds report none.
 #[cfg(not(windows))]
 pub fn volumes() -> Vec<Volume> {
     Vec::new()

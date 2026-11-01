@@ -161,7 +161,7 @@ def main():
     spread(game_dev / "Library" / "Artifacts", [f"{i:02x}" for i in range(120)], 2.9 * GiB, 50)
 
     # User caches
-    local = root / "AppData" / "Local"
+    local = root / "Users" / "demo" / "AppData" / "Local"
     spread(local / "Temp", [f"tmp{i:04x}.tmp" for i in range(220)], 1.7 * GiB, 6)
     spread(local / "npm-cache" / "_cacache" / "content-v2", [f"sha512-{i:04x}" for i in range(300)], 1.3 * GiB, 15)
     spread(local / "pip" / "Cache" / "http", [f"wheel-{i:03}" for i in range(80)], 0.7 * GiB, 30)

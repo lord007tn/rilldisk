@@ -23,7 +23,6 @@ pub fn file_types(snapshot: &Snapshot) -> Vec<TypeStat> {
         let extension = std::path::Path::new(&entry.name)
             .extension()
             .map(|e| e.to_string_lossy().to_lowercase())
-            .filter(|e| e.len() <= 16)
             .unwrap_or_default();
         let stat = map.entry(extension).or_insert_with_key(|key| TypeStat {
             extension: key.clone(),

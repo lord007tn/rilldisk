@@ -15,7 +15,7 @@ network server. Stdout contains only protocol messages.
    descending and entry ID ascending. `next_offset: null` ends pagination. Default
    page size is 50, maximum 500.
 5. Call `find_reclaimable` with the ID to list likely reclaimable folders: linked
-   Git worktrees (with the AI agent that created them), orphaned agent worktrees,
+   Git worktrees (naming the AI agent that created them when it is recognized), orphaned agent worktrees,
    build output, dependency folders, package caches, temp folders and the Recycle
    Bin. Filter with `category` (`git_worktree`, `build_output`, `dependencies`,
    `package_cache`, `app_cache`, `temporary`, `recycle_bin`) and `min_bytes`

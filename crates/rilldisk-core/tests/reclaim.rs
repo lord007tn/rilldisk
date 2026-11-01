@@ -31,6 +31,8 @@ fn finds_regenerable_folders_worktrees_and_caches_without_false_positives() {
     fs::create_dir_all(r.join("parent/.git")).unwrap();
     write(&r.join("parent/.gitmodules"), 10);
     write(&r.join("parent/vendor/lib/.git"), 40);
+    // Git keeps the submodule's repository under .git/modules/<path>.
+    write(&r.join("parent/.git/modules/vendor/lib/HEAD"), 41);
     // Python environment and cache.
     write(&r.join("py/.venv/pyvenv.cfg"), 10);
     write(&r.join("py/.venv/Lib/site.py"), 7_000);
@@ -48,7 +50,16 @@ fn finds_regenerable_folders_worktrees_and_caches_without_false_positives() {
         9_000,
     );
     // Well-known cache location.
-    write(&r.join("home/AppData/Local/npm-cache/_cacache/blob"), 8_000);
+    write(
+        &r.join("Users/me/AppData/Local/npm-cache/_cacache/blob"),
+        8_000,
+    );
+    // The same layout somewhere else may be a backup: Review, not Cache.
+    write(&r.join("backup/AppData/Local/Temp/old.tmp"), 8_000);
+    // IDE build folders need their CMake marker.
+    write(&r.join("cpp/CMakeLists.txt"), 10);
+    write(&r.join("cpp/cmake-build-debug/app.obj"), 4_000);
+    write(&r.join("notes/cmake-build-ideas/plan.txt"), 4_000);
 
     let snapshot = scan(r, ScanOptions::default(), Arc::default()).unwrap();
     assert!(snapshot.summary.complete, "{:?}", snapshot.summary.issues);
@@ -65,7 +76,14 @@ fn finds_regenerable_folders_worktrees_and_caches_without_false_positives() {
     assert_eq!(target.safety, Safety::Regenerable);
     assert_eq!(target.logical_bytes, 40_000);
     assert_eq!(target.file_count, 1);
-    assert_eq!(target.suggested_action, "cargo clean");
+    assert!(
+        target
+            .suggested_action
+            .starts_with("cargo clean --manifest-path \""),
+        "{}",
+        target.suggested_action
+    );
+    assert!(target.suggested_action.ends_with("Cargo.toml\""));
 
     let modules = find("web/node_modules");
     assert_eq!(modules.category, Category::Dependencies);
@@ -82,7 +100,12 @@ fn finds_regenerable_folders_worktrees_and_caches_without_false_positives() {
     let worktree = find("wt/feature");
     assert_eq!(worktree.category, Category::GitWorktree);
     assert_eq!(worktree.safety, Safety::Review);
-    assert!(worktree.suggested_action.starts_with("git worktree remove"));
+    assert!(
+        worktree
+            .suggested_action
+            .starts_with("git worktree remove \"")
+    );
+    assert!(worktree.suggested_action.ends_with('"'), "pasteable as-is");
     let inner = find("wt/feature/target");
     assert_eq!(inner.nested_in, Some(worktree.entry_id));
 
@@ -102,9 +125,18 @@ fn finds_regenerable_folders_worktrees_and_caches_without_false_positives() {
     assert_eq!(find("wf_1/node_modules").nested_in, Some(orphan.entry_id));
     assert_eq!(find("py/.venv").category, Category::Dependencies);
     find("pkg/__pycache__");
-    assert_eq!(
-        find("Local/npm-cache").suggested_action,
-        "npm cache clean --force"
+    let npm = find("Local/npm-cache");
+    assert_eq!(npm.suggested_action, "npm cache clean --force");
+    assert_eq!(npm.safety, Safety::Cache);
+    let copy = find("backup/AppData/Local/Temp");
+    assert_eq!(copy.safety, Safety::Review);
+    assert!(copy.reason.contains("copy or backup"));
+    find("cpp/cmake-build-debug");
+    assert!(
+        !report
+            .candidates
+            .iter()
+            .any(|c| c.path.ends_with("cmake-build-ideas"))
     );
     for false_positive in ["docs/target", "docs/node_modules", "data/venv"] {
         assert!(
@@ -254,4 +286,46 @@ fn agent_worktrees_are_found_inside_repositories_with_submodules() {
             .iter()
             .any(|c| c.label == "Git worktree" && c.path.ends_with("worktrees/agent-1"))
     );
+}
+
+#[test]
+fn review_candidates_inside_regenerable_folders_are_kept() {
+    let root = tempfile::tempdir().unwrap();
+    let r = root.path();
+    write(&r.join("web/package.json"), 10);
+    write(&r.join("web/node_modules/dep/index.js"), 1_000);
+    // A worktree someone created inside node_modules still needs a decision.
+    write(&r.join("web/node_modules/scratch/.git"), 40);
+    write(&r.join("web/node_modules/scratch/notes.md"), 500);
+    let snapshot = scan(r, ScanOptions::default(), Arc::default()).unwrap();
+    let report = find_reclaimable(&snapshot, 0);
+    let modules = report
+        .candidates
+        .iter()
+        .find(|c| c.path.ends_with("web/node_modules"))
+        .unwrap();
+    let scratch = report
+        .candidates
+        .iter()
+        .find(|c| c.path.ends_with("node_modules/scratch"))
+        .expect("review candidate kept");
+    assert_eq!(scratch.nested_in, Some(modules.entry_id));
+    // Totals still count the outer folder only.
+    assert_eq!(report.total_logical_bytes, modules.logical_bytes);
+}
+
+#[test]
+fn retain_recomputes_totals() {
+    let root = tempfile::tempdir().unwrap();
+    let r = root.path();
+    write(&r.join("a/Cargo.toml"), 10);
+    write(&r.join("a/target/big.bin"), 50_000);
+    write(&r.join("b/package.json"), 10);
+    write(&r.join("b/node_modules/x.js"), 1_000);
+    let snapshot = scan(r, ScanOptions::default(), Arc::default()).unwrap();
+    let mut report = find_reclaimable(&snapshot, 0);
+    assert_eq!(report.candidate_count, 2);
+    report.retain(|c| c.logical_bytes >= 10_000);
+    assert_eq!(report.candidate_count, 1);
+    assert_eq!(report.total_logical_bytes, 50_000);
 }

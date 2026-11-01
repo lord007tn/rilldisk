@@ -159,6 +159,9 @@ pub fn age(now_ms: u64, modified_ms: Option<u64>) -> String {
     let Some(modified) = modified_ms else {
         return "—".into();
     };
+    if modified > now_ms + 60_000 {
+        return "future".into();
+    }
     let days = now_ms.saturating_sub(modified) / 86_400_000;
     match days {
         0 => "today".into(),

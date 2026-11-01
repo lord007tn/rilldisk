@@ -179,9 +179,9 @@ workstation (other agents and WSL running), so ranges are shown.
 What changed since the first alpha:
 
 * **No barriers.** Workers queue subfolders the moment they read them; a single
-  coordinator only assigns IDs. One slow folder no longer stalls a whole group, and
-  a folder that hangs for 60 s (a stuck network or cloud provider) is reported and
-  skipped instead of freezing the scan.
+  coordinator only assigns IDs. One slow folder no longer stalls a whole group. If
+  the whole scan makes no progress for 60 s (a stuck network or cloud provider),
+  the outstanding folders are reported and the scan finishes with what it found.
 * **Half the memory.** Entries store only their name; paths are rebuilt from the
   parent chain on demand. About 160 bytes per entry, down from about 357.
 * **Less work per folder.** Volume identity is read once per scan, names are

@@ -473,10 +473,30 @@ const LOCATIONS: &[(&[&str], Rule)] = {
     ]
 };
 
+impl ReclaimReport {
+    /// Keep matching candidates and recompute every total from what remains.
+    pub fn retain(&mut self, keep: impl Fn(&Candidate) -> bool) {
+        self.candidates.retain(|c| keep(c));
+        let kept: std::collections::HashSet<usize> =
+            self.candidates.iter().map(|c| c.entry_id).collect();
+        let outer = self
+            .candidates
+            .iter()
+            .filter(|c| c.nested_in.is_none_or(|n| !kept.contains(&n)));
+        self.candidate_count = self.candidates.len();
+        self.total_logical_bytes = outer.clone().map(|c| c.logical_bytes).sum();
+        self.total_unique_logical_bytes = outer.clone().map(|c| c.unique_logical_bytes).sum();
+        self.total_exclusive_bytes = outer.clone().map(|c| c.exclusive_bytes).sum();
+        self.total_allocated_bytes = outer
+            .map(|c| c.allocated_bytes)
+            .try_fold(0_u64, |sum, value| value.map(|v| sum.saturating_add(v)));
+    }
+}
+
 /// Analyze a snapshot. `now_unix_ms` makes idle-day calculations reproducible.
 pub fn find_reclaimable(snapshot: &Snapshot, now_unix_ms: u64) -> ReclaimReport {
     let entries = &snapshot.entries;
-    let mut found: Vec<(usize, &Rule, Option<String>)> = Vec::new();
+    let mut found: Vec<(usize, &Rule, Option<String>, Safety)> = Vec::new();
     let mut worktrees = Vec::new();
     for entry in entries.iter().skip(1) {
         let name = snapshot.name(entry.id);
@@ -487,8 +507,8 @@ pub fn find_reclaimable(snapshot: &Snapshot, now_unix_ms: u64) -> ReclaimReport 
                 }
             }
             EntryKind::Directory => {
-                if let Some((rule, detail)) = directory_rule(snapshot, entry.id, &name) {
-                    found.push((entry.id, rule, detail));
+                if let Some((rule, detail, safety)) = directory_rule(snapshot, entry.id, &name) {
+                    found.push((entry.id, rule, detail, safety));
                 }
             }
             _ => {}
@@ -498,7 +518,7 @@ pub fn find_reclaimable(snapshot: &Snapshot, now_unix_ms: u64) -> ReclaimReport 
         Category::GitWorktree,
         Safety::Review,
         "Git worktree",
-        "Linked Git worktree: '.git' is a pointer file, so history lives in another repository.",
+        "Linked Git worktree: '.git' is a pointer file, so history lives in another repository. Git refuses to remove it while it has uncommitted changes.",
         "",
     );
     for dir in worktrees {
@@ -510,7 +530,12 @@ pub fn find_reclaimable(snapshot: &Snapshot, now_unix_ms: u64) -> ReclaimReport 
         if agent.is_none() && in_submodule_repository(snapshot, dir) {
             continue;
         }
-        found.push((dir, &WORKTREE, agent.map(|a| format!("Created by {a}."))));
+        found.push((
+            dir,
+            &WORKTREE,
+            agent.map(|a| format!("Created by {a}.")),
+            Safety::Review,
+        ));
     }
     // Agent tools keep worktrees under a `worktrees` folder. A child there with no
     // `.git` (directly or one level down) is no longer a checkout Git knows about.
@@ -547,7 +572,12 @@ pub fn find_reclaimable(snapshot: &Snapshot, now_unix_ms: u64) -> ReclaimReport 
                     .any(|&g| has_child(snapshot, g as usize, ".git"));
             if listed && !tracked {
                 let agent = agent_owner(&snapshot.path(child).join("x")).unwrap_or("an AI agent");
-                found.push((child, &ORPHAN, Some(format!("Created by {agent}."))));
+                found.push((
+                    child,
+                    &ORPHAN,
+                    Some(format!("Created by {agent}.")),
+                    Safety::Review,
+                ));
             }
         }
     }
@@ -559,19 +589,21 @@ pub fn find_reclaimable(snapshot: &Snapshot, now_unix_ms: u64) -> ReclaimReport 
         by_id.insert(*id, index);
     }
     let mut candidates = Vec::with_capacity(found.len());
-    for (id, rule, detail) in &found {
+    for (id, rule, detail, safety) in &found {
         // Find the nearest enclosing candidate.
         let mut enclosing = None;
         let mut cursor = entries[*id].parent_id;
         while let Some(parent) = cursor {
             if let Some(&index) = by_id.get(&parent) {
-                enclosing = Some((parent, found[index].1.safety));
+                enclosing = Some((parent, found[index].3));
                 break;
             }
             cursor = entries[parent].parent_id;
         }
-        // A dependency folder inside another regenerable folder adds no new decision.
-        if enclosing.is_some_and(|(_, safety)| safety != Safety::Review) {
+        // A regenerable folder inside another regenerable folder adds no new decision;
+        // anything that needs review is always kept.
+        if *safety != Safety::Review && enclosing.is_some_and(|(_, outer)| outer != Safety::Review)
+        {
             continue;
         }
         let entry = &entries[*id];
@@ -589,10 +621,20 @@ pub fn find_reclaimable(snapshot: &Snapshot, now_unix_ms: u64) -> ReclaimReport 
         let (exclusive_bytes, shared_bytes) = exclusive(snapshot, *id);
         let path = snapshot.path(*id);
         let suggested_action = if rule.category == Category::GitWorktree && rule.action.is_empty() {
-            format!(
-                "git worktree remove \"{}\"  (refuses if there are uncommitted changes)",
-                path.display()
-            )
+            match quoted(&path) {
+                Some(path) => format!("git worktree remove {path}"),
+                None => "git worktree remove <this folder>".to_string(),
+            }
+        } else if std::ptr::eq(*rule, &CARGO) {
+            match path
+                .parent()
+                .map(|p| p.join("Cargo.toml"))
+                .as_deref()
+                .and_then(quoted)
+            {
+                Some(manifest) => format!("cargo clean --manifest-path {manifest}"),
+                None => rule.action.to_string(),
+            }
         } else {
             rule.action.to_string()
         };
@@ -600,7 +642,7 @@ pub fn find_reclaimable(snapshot: &Snapshot, now_unix_ms: u64) -> ReclaimReport 
             entry_id: *id,
             path,
             category: rule.category,
-            safety: rule.safety,
+            safety: *safety,
             label: rule.label,
             reason,
             suggested_action,
@@ -641,11 +683,19 @@ pub fn find_reclaimable(snapshot: &Snapshot, now_unix_ms: u64) -> ReclaimReport 
     }
 }
 
+static CARGO: Rule = rule(
+    Category::BuildOutput,
+    Safety::Regenerable,
+    "Rust build output",
+    "Cargo build artifacts next to Cargo.toml.",
+    "cargo clean",
+);
+
 fn directory_rule(
     snapshot: &Snapshot,
     id: usize,
     name: &str,
-) -> Option<(&'static Rule, Option<String>)> {
+) -> Option<(&'static Rule, Option<String>, Safety)> {
     use Category::*;
     use Safety::*;
     let lower = name.to_ascii_lowercase();
@@ -659,13 +709,7 @@ fn directory_rule(
         "Installed from package.json.",
         "Reinstall when needed: npm install, pnpm install, yarn or bun install",
     );
-    static CARGO: Rule = rule(
-        BuildOutput,
-        Regenerable,
-        "Rust build output",
-        "Cargo build artifacts next to Cargo.toml.",
-        "cargo clean",
-    );
+
     static MAVEN: Rule = rule(
         BuildOutput,
         Regenerable,
@@ -807,13 +851,21 @@ fn directory_rule(
         "intermediate" | "deriveddatacache" if sibling_ext(".uproject") => &UNREAL,
         ".godot" if sibling("project.godot") => &GODOT,
         "$recycle.bin" => &RECYCLE,
-        _ if lower.starts_with("cmake-build-") => &CMAKE,
-        _ => return location_rule(snapshot, id, &lower).map(|r| (r, None)),
+        _ if lower.starts_with("cmake-build-") && sibling("cmakelists.txt") => &CMAKE,
+        _ => return location_rule(snapshot, id, &lower),
     };
-    Some((rule, None))
+    Some((rule, None, rule.safety))
 }
 
-fn location_rule(snapshot: &Snapshot, id: usize, last: &str) -> Option<&'static Rule> {
+/// Known locations match trailing components. Profile (`AppData`) and system
+/// (`Windows`) rules must also sit where Windows puts them (`...\Users\<name>\AppData`,
+/// `<drive>:\Windows`); a look-alike elsewhere may be a copy or backup, so it is
+/// downgraded to Review.
+fn location_rule(
+    snapshot: &Snapshot,
+    id: usize,
+    last: &str,
+) -> Option<(&'static Rule, Option<String>, Safety)> {
     let mut components: Option<Vec<String>> = None;
     for (pattern, rule) in LOCATIONS {
         let tail = pattern[pattern.len() - 1];
@@ -834,7 +886,21 @@ fn location_rule(snapshot: &Snapshot, id: usize, last: &str) -> Option<&'static 
                 .zip(components.iter().rev())
                 .all(|(p, c)| *p == "*" || p == c)
         {
-            return Some(rule);
+            let start = components.len() - pattern.len();
+            let anchored = match pattern[0] {
+                "appdata" => start >= 2 && components[start - 2] == "users",
+                // Prefix (`c:`), root, then `windows`.
+                "windows" => start == 2,
+                _ => true,
+            };
+            if anchored {
+                return Some((rule, None, rule.safety));
+            }
+            return Some((
+                rule,
+                Some("Not in the standard profile or system location, so it may be a copy or backup.".into()),
+                Safety::Review,
+            ));
         }
     }
     None
@@ -899,17 +965,47 @@ fn has_child_with_extension(snapshot: &Snapshot, id: usize, extension: &str) -> 
     })
 }
 
-/// Submodule checkouts also use a `.git` file; skip them when the enclosing
-/// repository declares submodules.
+/// Submodule checkouts also use a `.git` file. Git keeps a submodule's repository
+/// at `<repo>/.git/modules/<path>`, so a matching folder there identifies one
+/// without reading any file contents.
 fn in_submodule_repository(snapshot: &Snapshot, dir: usize) -> bool {
+    let mut relative = vec![dir];
     let mut cursor = snapshot.entries[dir].parent_id;
     while let Some(parent) = cursor {
-        if has_child(snapshot, parent, ".git") {
-            return has_child(snapshot, parent, ".gitmodules");
+        let git = snapshot
+            .children(parent)
+            .iter()
+            .map(|&c| c as usize)
+            .find(|&c| snapshot.name(c).eq_ignore_ascii_case(".git"));
+        if let Some(git) = git {
+            if snapshot.entries[git].kind != EntryKind::Directory {
+                return false;
+            }
+            let mut node = child_named(snapshot, git, "modules");
+            for &component in relative.iter().rev() {
+                node = node.and_then(|n| child_named(snapshot, n, &snapshot.name(component)));
+            }
+            return node.is_some();
         }
+        relative.push(parent);
         cursor = snapshot.entries[parent].parent_id;
     }
     false
+}
+
+fn child_named(snapshot: &Snapshot, id: usize, name: &str) -> Option<usize> {
+    snapshot
+        .children(id)
+        .iter()
+        .map(|&c| c as usize)
+        .find(|&c| snapshot.name(c).eq_ignore_ascii_case(name))
+}
+
+/// Double-quote a path for a copied command when that is safe in both PowerShell
+/// and POSIX shells; otherwise return None so callers omit it.
+fn quoted(path: &std::path::Path) -> Option<String> {
+    let text = path.to_str()?;
+    (!text.contains(['"', '$', '`', '\'', '%', '!', '\n', '\r'])).then(|| format!("\"{text}\""))
 }
 
 fn agent_owner(path: &std::path::Path) -> Option<&'static str> {

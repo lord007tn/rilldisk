@@ -236,7 +236,7 @@ fn parse_record(bytes: &[u8], offset: usize, volume: u64) -> io::Result<(Option<
 /// FILETIME counts 100 ns intervals since 1601-01-01.
 fn filetime_to_unix_ms(filetime: i64) -> Option<u64> {
     const UNIX_EPOCH_FILETIME: i64 = 116_444_736_000_000_000;
-    (filetime > UNIX_EPOCH_FILETIME).then(|| ((filetime - UNIX_EPOCH_FILETIME) / 10_000) as u64)
+    (filetime >= UNIX_EPOCH_FILETIME).then(|| ((filetime - UNIX_EPOCH_FILETIME) / 10_000) as u64)
 }
 
 /// Mounted local and removable drive letters with capacity. Read-only metadata.

@@ -360,13 +360,13 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
         .canonicalize()
         .with_context(|| format!("cannot open {}", root.display()))?;
     let root = simplify(verbatim.clone());
-    if !root.is_dir() {
+    if !verbatim.is_dir() {
         bail!("scan root must be a directory");
     }
     // Reparse points are never traversed, so one scan stays on the root's volume.
     let volume = platform::volume_info(&verbatim)?;
     let start = Instant::now();
-    let root_modified = std::fs::symlink_metadata(&root)
+    let root_modified = std::fs::symlink_metadata(&verbatim)
         .and_then(|m| m.modified())
         .ok()
         .and_then(unix_ms);

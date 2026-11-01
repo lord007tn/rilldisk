@@ -308,6 +308,7 @@ impl RillApp {
                     self.toast = Some((format!("Copied {what}"), ctx.input(|i| i.time)));
                 }
                 Action::Tab(tab) => self.tab = tab,
+                Action::Scan(_) if self.running.is_some() => {}
                 Action::Scan(path) => {
                     self.path = path;
                     self.start_scan(ctx);
@@ -833,7 +834,14 @@ impl RillApp {
                 .corner_radius(8)
                 .inner_margin(Margin::symmetric(12, 8))
                 .show(ui, |ui| {
-                    ui.label(RichText::new(format!("Scan failed: {error}")).color(style::DANGER));
+                    let text = match &self.data {
+                        Some(data) => format!(
+                            "Scan failed: {error}. Still showing the previous scan of {}.",
+                            data.snapshot.summary.root.display()
+                        ),
+                        None => format!("Scan failed: {error}"),
+                    };
+                    ui.label(RichText::new(text).color(style::DANGER));
                 });
             ui.add_space(8.0);
         }
@@ -1407,7 +1415,11 @@ impl RillApp {
             .auto_shrink(false)
             .id_salt("types")
             .show(ui, |ui| {
-                for t in data.types.iter().take(300) {
+                let mut rows: Vec<&rilldisk_core::TypeStat> = data.types.iter().collect();
+                if self.allocated {
+                    rows.sort_by_key(|t| std::cmp::Reverse(t.allocated_bytes.unwrap_or(0)));
+                }
+                for t in rows.into_iter().take(300) {
                     let size = if self.allocated {
                         t.allocated_bytes.unwrap_or(0)
                     } else {

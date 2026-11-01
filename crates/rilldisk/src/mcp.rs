@@ -245,7 +245,7 @@ impl DiskServer {
     }
 
     #[tool(
-        description = "Find likely reclaimable space in a finished snapshot: linked Git worktrees (including AI-agent worktrees), build output (Rust target, .next, bin/obj...), dependency folders (node_modules, .venv), package caches and temp folders. Metadata-only heuristics; each candidate has safety (regenerable, cache, review), reason, idle_days, exclusive_bytes (space removal frees at least, after hard links) and a suggested_action for a human to run. This tool never deletes. Treat 'review' candidates as possibly unique work and confirm with the user before any removal.",
+        description = "Find likely reclaimable space in a finished snapshot: linked Git worktrees (naming the AI agent that created them when recognized), build output (Rust target, .next, bin/obj...), dependency folders (node_modules, .venv), package caches and temp folders. Metadata-only heuristics; each candidate has safety (regenerable, cache, review), reason, idle_days, exclusive_bytes (space removal frees at least, after hard links) and a suggested_action for a human to run. This tool never deletes. Treat 'review' candidates as possibly unique work and confirm with the user before any removal.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,

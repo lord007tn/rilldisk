@@ -86,7 +86,7 @@ def main():
             reclaim = tool("find_reclaimable", {"scan_id": job, "min_bytes": 0})
             kinds = {c["category"]: c for c in reclaim["candidates"]}
             assert set(kinds) == {"build_output", "git_worktree"}, reclaim
-            assert kinds["build_output"]["suggested_action"] == "cargo clean"
+            assert kinds["build_output"]["suggested_action"].startswith("cargo clean --manifest-path ")
             assert kinds["build_output"]["safety"] == "regenerable"
             assert kinds["git_worktree"]["safety"] == "review"
             assert reclaim["scan_complete"] and "never deletes" in reclaim["notice"]

@@ -106,6 +106,9 @@ async fn main() -> Result<ExitCode> {
         }
         Command::Drives { format } => {
             let drives = volumes();
+            if drives.is_empty() && !cfg!(windows) {
+                anyhow::bail!("drive listing is not available on this platform yet");
+            }
             let mut out = io::stdout().lock();
             match format {
                 ReportFormat::Json => writeln!(out, "{}", serde_json::to_string(&drives)?)?,
@@ -145,8 +148,7 @@ async fn main() -> Result<ExitCode> {
         } => {
             run(args, |writer, snapshot| {
                 let mut report = find_reclaimable(snapshot, now_ms());
-                report.candidates.retain(|c| c.logical_bytes >= min_size);
-                report.candidate_count = report.candidates.len();
+                report.retain(|c| c.logical_bytes >= min_size);
                 match format {
                     ReportFormat::Json => {
                         serde_json::to_writer(&mut *writer, &report)?;
@@ -320,11 +322,10 @@ fn write_scan(
             if report.candidate_count > 0 {
                 writeln!(
                     writer,
-                    "\nReclaimable: frees at least {} ({} total size) in {} candidates. Details: rilldisk reclaim \"{}\"",
+                    "\nReclaimable: frees at least {} ({} total size) in {} candidates. Run `rilldisk reclaim` on this path for details.",
                     human(report.total_exclusive_bytes),
                     human(report.total_logical_bytes),
-                    report.candidate_count,
-                    snapshot.summary.root.display()
+                    report.candidate_count
                 )?;
             }
         }
