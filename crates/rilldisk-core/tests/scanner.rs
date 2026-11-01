@@ -227,6 +227,7 @@ fn parallel_directories_share_one_record_budget() {
         ScanOptions {
             threads: 8,
             max_entries: 100,
+            ..Default::default()
         },
         control.clone(),
     )
@@ -287,4 +288,96 @@ fn names_ending_in_a_dot_or_space_are_read_exactly() {
     assert_eq!(snapshot.summary.files, 2);
     assert_eq!(snapshot.summary.logical_bytes, 10_000);
     assert!(!snapshot.summary.root.to_string_lossy().starts_with(r"\\?\"));
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_reports_block_allocation_times_and_unreadable_folders() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().join("data.bin");
+    fs::write(&data, vec![1_u8; 10_000]).unwrap();
+    // A sparse file: a large length with almost nothing allocated.
+    let sparse = root.path().join("sparse.bin");
+    fs::File::create(&sparse).unwrap().set_len(4 << 20).unwrap();
+    let locked = root.path().join("locked");
+    fs::create_dir(&locked).unwrap();
+    fs::write(locked.join("inside.txt"), b"x").unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    // Root (some containers) can still list it; the assertions adapt.
+    let unreadable = fs::read_dir(&locked).is_err();
+    let snapshot = scan(root.path(), ScanOptions::default(), Arc::default());
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    let snapshot = snapshot.unwrap();
+    let blocks = |path: &std::path::Path| fs::metadata(path).unwrap().blocks() * 512;
+    let find = |name: &str| {
+        snapshot
+            .entries
+            .iter()
+            .find(|e| snapshot.name(e.id) == name)
+            .unwrap()
+    };
+    let dense = find("data.bin");
+    assert_eq!(dense.logical_bytes, 10_000);
+    assert_eq!(dense.allocated_bytes, Some(blocks(&data)));
+    let modified = fs::metadata(&data).unwrap().modified().unwrap();
+    let expected = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    assert_eq!(dense.modified_unix_ms, Some(expected));
+    let hole = find("sparse.bin");
+    assert_eq!(hole.logical_bytes, 4 << 20);
+    assert_eq!(hole.allocated_bytes, Some(blocks(&sparse)));
+    assert!(hole.allocated_bytes.unwrap() < hole.logical_bytes);
+    assert_eq!(
+        snapshot.summary.unique_logical_bytes,
+        10_000 + (4 << 20) + u64::from(!unreadable)
+    );
+    let folder = find("locked");
+    if unreadable {
+        assert!(!snapshot.summary.complete);
+        assert_eq!(snapshot.summary.issue_count, 1);
+        assert!(snapshot.summary.issues[0].path.ends_with("locked"));
+        assert!(!folder.fully_listed);
+    } else {
+        assert!(snapshot.summary.complete);
+    }
+    assert_eq!(snapshot.summary.skipped_mounts, 0);
+}
+
+/// Scanning `/` must record, but never enter, virtual filesystems or other disks.
+/// The entry limit keeps this to the top of the tree.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn root_scans_skip_virtual_and_other_filesystems() {
+    let expected: &[&str] = if cfg!(target_os = "linux") {
+        &["proc", "sys", "dev"]
+    } else {
+        &["dev", "Volumes"]
+    };
+    for cross_filesystems in [false, true] {
+        let snapshot = scan(
+            std::path::Path::new("/"),
+            ScanOptions {
+                max_entries: 300,
+                cross_filesystems,
+                ..Default::default()
+            },
+            Arc::default(),
+        )
+        .unwrap();
+        assert!(snapshot.summary.skipped_mounts >= expected.len() as u64);
+        for name in expected {
+            let &id = snapshot
+                .children(0)
+                .iter()
+                .find(|&&c| snapshot.name(c as usize) == *name)
+                .unwrap_or_else(|| panic!("/{name} is listed"));
+            let entry = &snapshot.entries[id as usize];
+            assert_eq!(entry.kind, EntryKind::Directory);
+            assert!(!entry.fully_listed, "/{name} is not entered");
+            assert!(snapshot.children(id as usize).is_empty(), "/{name}");
+        }
+    }
 }

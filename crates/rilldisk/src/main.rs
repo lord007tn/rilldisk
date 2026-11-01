@@ -21,7 +21,7 @@ mod mcp;
 #[derive(Parser)]
 #[command(
     version,
-    about = "Windows-first disk intelligence. Local, read-only, native Rust.",
+    about = "Disk intelligence for Windows, Linux and macOS. Local, read-only, native Rust.",
     after_help = "AGPL-3.0-only. Source: https://github.com/lord007tn/rilldisk"
 )]
 struct Cli {
@@ -39,6 +39,10 @@ struct ScanArgs {
     threads: Option<u8>,
     #[arg(long, default_value_t = rilldisk_core::DEFAULT_MAX_ENTRIES)]
     max_entries: usize,
+    /// Linux/macOS: also enter other mounted filesystems below the path. Virtual
+    /// filesystems such as /proc, /sys, /dev and /run are skipped either way.
+    #[arg(long)]
+    cross_filesystems: bool,
 }
 
 #[derive(Subcommand)]
@@ -77,6 +81,9 @@ enum Command {
         threads: Option<u8>,
         #[arg(long, default_value_t = rilldisk_core::DEFAULT_MAX_ENTRIES)]
         max_entries: usize,
+        /// Linux/macOS: let scans enter other mounted filesystems below a root.
+        #[arg(long)]
+        cross_filesystems: bool,
     },
 }
 
@@ -100,30 +107,35 @@ async fn main() -> Result<ExitCode> {
             root,
             threads,
             max_entries,
+            cross_filesystems,
         } => {
-            mcp::serve(root, options(threads, max_entries)).await?;
+            mcp::serve(root, options(threads, max_entries, cross_filesystems)).await?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Drives { format } => {
             let drives = volumes();
-            if drives.is_empty() && !cfg!(windows) {
-                anyhow::bail!("drive listing is not available on this platform yet");
-            }
             let mut out = io::stdout().lock();
             match format {
                 ReportFormat::Json => writeln!(out, "{}", serde_json::to_string(&drives)?)?,
                 ReportFormat::Table => {
+                    // Unix mount points are longer than drive letters.
+                    let width = drives
+                        .iter()
+                        .map(|d| d.root.display().to_string().chars().count())
+                        .max()
+                        .unwrap_or(0)
+                        .max(6);
                     writeln!(
                         out,
-                        "{:<6} {:>11} {:>11} {:>6}  {:<6} LABEL",
+                        "{:<width$} {:>11} {:>11} {:>6}  {:<6} LABEL",
                         "DRIVE", "USED", "TOTAL", "USED%", "FS"
                     )?;
                     for d in &drives {
                         let used = d.total_bytes.saturating_sub(d.free_bytes);
                         writeln!(
                             out,
-                            "{:<6} {:>11} {:>11} {:>5.1}%  {:<6} {}",
-                            d.root.display(),
+                            "{:<width$} {:>11} {:>11} {:>5.1}%  {:<6} {}",
+                            d.root.display().to_string(),
                             human(used),
                             human(d.total_bytes),
                             used as f64 * 100.0 / d.total_bytes.max(1) as f64,
@@ -198,10 +210,10 @@ async fn run(
         output,
         threads,
         max_entries,
+        cross_filesystems,
     } = args;
-    let snapshot =
-        tokio::task::spawn_blocking(move || scan(&path, options(threads, max_entries), control))
-            .await;
+    let options = options(threads, max_entries, cross_filesystems);
+    let snapshot = tokio::task::spawn_blocking(move || scan(&path, options, control)).await;
     progress.abort();
     let snapshot = snapshot??;
     exporting.store(true, Ordering::Relaxed);
@@ -266,6 +278,13 @@ fn write_summary(writer: &mut dyn Write, snapshot: &Snapshot) -> Result<()> {
             .map(human)
             .unwrap_or("unknown".into())
     )?;
+    if summary.skipped_mounts > 0 {
+        writeln!(
+            writer,
+            "Not entered: {} mount points of other or virtual filesystems (sizes excluded; see --cross-filesystems)",
+            summary.skipped_mounts
+        )?;
+    }
     if !summary.complete {
         writeln!(
             writer,
@@ -384,10 +403,11 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-fn options(threads: Option<u8>, max_entries: usize) -> ScanOptions {
+fn options(threads: Option<u8>, max_entries: usize, cross_filesystems: bool) -> ScanOptions {
     ScanOptions {
         threads: threads.map_or_else(|| ScanOptions::default().threads, usize::from),
         max_entries,
+        cross_filesystems,
     }
 }
 
