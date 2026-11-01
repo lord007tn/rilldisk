@@ -1,6 +1,7 @@
 # Architecture
 
-Status: phase one plus the first desktop release, November 1, 2026.
+Status: phase one plus the first desktop release and the Linux/macOS backend,
+November 1, 2026.
 
 ```text
                     ┌─ rilldisk (CLI): table / JSON / JSONL, reclaim, drives
@@ -9,7 +10,7 @@ rilldisk-core ──────┼─ rilldisk mcp: stdio, background job, pagi
   stats · volumes
        │
        ├─ Windows: batched Win32 directory metadata
-       └─ portable walk: development / test fallback
+       └─ Linux, macOS: readdir + one no-follow stat, mount-aware
 ```
 
 ## Phase-one contracts
@@ -53,6 +54,58 @@ records. Reaching the bound (default 30 million entries) produces one issue and 
 partial result. Progress counters update during enumeration. Paths, frontier copies,
 the hard-link set and query sorting add memory. Five million entries can require substantial RAM. A
 compact name arena and indexed queries should follow profiling, not precede it.
+
+## Unix backend (Linux, macOS)
+
+`unix-readdir` plugs into the same parallel walk, so scheduling, the shared entry
+budget, cancellation and stall reporting are identical to Windows. Each directory
+is listed with `std::fs::read_dir` (`getdents64` on Linux, `readdir` on macOS).
+The listing's type (`d_type`) is enough for symlinks, sockets, FIFOs and devices,
+which therefore cost no further call. Regular files and directories get one
+no-follow metadata call each: `statx`/`fstatat` relative to the open directory
+handle on Linux, `lstat` on macOS. Symlinks are listed as links and never followed.
+
+* **Allocation** is `st_blocks * 512` (512-byte units on both kernels), so sparse
+  files report what they occupy. Directory blocks are excluded, as on Windows.
+* **Hard links** use `(st_dev, st_ino)`. Only files with `st_nlink > 1` enter the
+  identity table; a single-link file cannot be a duplicate, so the table stays
+  small. First-encounter attribution, `unique_logical_bytes`,
+  `hard_link_duplicate` and `multiple_links` behave exactly as on Windows.
+* **Times** come from `st_mtime` with nanoseconds, truncated to milliseconds.
+* **Unreadable folders** (`EACCES`) and entries that vanish between listing and
+  `stat` become issues, and the result is partial.
+
+A scan stays on the root's filesystem by default, like `du -x`. At scan start the
+backend records the root's device and, on Linux, every mount point below the root
+from `/proc/self/mountinfo` (macOS: `getfsstat`). A directory on another device, or
+listed as a mount point (which also catches same-device bind mounts), is recorded
+as a directory but not entered: `fully_listed` stays false, its sizes are not
+included, and `summary.skipped_mounts` counts it. `ScanOptions::cross_filesystems`
+(`--cross-filesystems`) enters real filesystems, but virtual ones are always
+skipped: `/proc`, `/sys`, `/dev` and `/run` at the top of the tree, and any mount of
+type proc, sysfs, devtmpfs, tmpfs, cgroup, overlay, squashfs (snaps), autofs and
+similar. On macOS `/dev`, `/Volumes` and `/System/Volumes` are always skipped when
+reached from `/`. `/System/Volumes/Data` holds the same files that firmlinks such as
+`/Users` and `/Applications` show, so the Data volume's device counts as part of a
+root on the system volume and its own mount point is never entered twice.
+
+Known gaps: bind mounts are entered with `--cross-filesystems` and can then repeat
+content; APFS clones and btrfs/XFS reflinks share blocks that `st_blocks` reports
+once per file, so allocation over-counts them; btrfs subvolumes have their own
+device numbers and are skipped without the option (as with `du -x`).
+
+`volumes()` lists disk-backed filesystems. Linux reads `/proc/self/mountinfo`,
+keeps ext*, XFS, btrfs, ZFS, FAT/exFAT/NTFS and similar plus WSL `drvfs` drives,
+drops pseudo, overlay, snap, network and `/boot` mounts, shows one row per
+`major:minor` (the shortest mount point), and reads capacity with `statvfs`. Labels
+come from `/dev/disk/by-label`; removable media from sysfs or `/media`. macOS lists
+`/` and browsable local volumes under `/Volumes` with `getfsstat`. `free_bytes` is
+`f_bfree`, matching the Windows total-free figure.
+
+Measured so far (Linux under WSL2 only; macOS is verified by CI tests, not timed):
+file and folder counts of `/usr` and `/` match `find -xdev`, unique bytes match
+`du --apparent-size` apart from symlink lengths, and allocated bytes match `du -B1`
+apart from directory blocks. See [PERFORMANCE.md](PERFORMANCE.md#linux-wsl2-observation).
 
 ## MCP state
 

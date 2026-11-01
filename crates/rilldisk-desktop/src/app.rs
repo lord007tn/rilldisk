@@ -226,24 +226,58 @@ impl RillApp {
         let dark = dark.unwrap_or(cc.egui_ctx.system_theme() != Some(egui::Theme::Light));
         style::apply(&cc.egui_ctx, identity, dark);
         let home = home_dir();
-        let places = [
-            ("Home", Icon::Home, String::new()),
-            ("Desktop", Icon::Desktop, "Desktop".into()),
-            ("Documents", Icon::Document, "Documents".into()),
-            ("Downloads", Icon::Download, "Downloads".into()),
-            ("App data", Icon::Code, "AppData".into()),
-        ]
-        .into_iter()
-        .map(|(name, icon, sub)| {
-            let path = if sub.is_empty() {
-                home.clone()
+        // The platform's standard folders. Linux reads the XDG user-dirs file, so
+        // localized or relocated folders are found; missing ones are left out.
+        let places = {
+            let base = PathBuf::from(&home);
+            let mut list = vec![("Home", Icon::Home, base.clone())];
+            if cfg!(windows) || cfg!(target_os = "macos") {
+                list.push(("Desktop", Icon::Desktop, base.join("Desktop")));
+                list.push(("Documents", Icon::Document, base.join("Documents")));
+                list.push(("Downloads", Icon::Download, base.join("Downloads")));
+                list.push(if cfg!(windows) {
+                    ("App data", Icon::Code, base.join("AppData"))
+                } else {
+                    ("Library", Icon::Code, base.join("Library"))
+                });
             } else {
-                PathBuf::from(&home).join(sub).display().to_string()
-            };
-            (name, icon, path)
-        })
-        .filter(|(_, _, p)| std::path::Path::new(p).is_dir())
-        .collect();
+                let env_dir = |key: &str| std::env::var_os(key).map(PathBuf::from);
+                let config = env_dir("XDG_CONFIG_HOME").unwrap_or_else(|| base.join(".config"));
+                let user_dirs =
+                    std::fs::read_to_string(config.join("user-dirs.dirs")).unwrap_or_default();
+                // Lines look like `XDG_DESKTOP_DIR="$HOME/Desktop"`.
+                let xdg = |key: &str, default: &str| {
+                    user_dirs
+                        .lines()
+                        .filter_map(|line| line.trim().strip_prefix(key)?.strip_prefix('='))
+                        .map(|value| value.trim().trim_matches('"'))
+                        .find_map(|value| match value.strip_prefix("$HOME") {
+                            Some(rest) => Some(base.join(rest.trim_start_matches('/'))),
+                            None => value.starts_with('/').then(|| PathBuf::from(value)),
+                        })
+                        .unwrap_or_else(|| base.join(default))
+                };
+                list.push(("Desktop", Icon::Desktop, xdg("XDG_DESKTOP_DIR", "Desktop")));
+                list.push((
+                    "Documents",
+                    Icon::Document,
+                    xdg("XDG_DOCUMENTS_DIR", "Documents"),
+                ));
+                list.push((
+                    "Downloads",
+                    Icon::Download,
+                    xdg("XDG_DOWNLOAD_DIR", "Downloads"),
+                ));
+                let cache = env_dir("XDG_CACHE_HOME").unwrap_or_else(|| base.join(".cache"));
+                list.push(("Cache", Icon::Code, cache));
+            }
+            let mut seen = HashSet::new();
+            list.into_iter()
+                // A user-dirs entry set to `$HOME/` disables that folder.
+                .filter(|(_, _, path)| path.is_dir() && seen.insert(path.clone()))
+                .map(|(name, icon, path)| (name, icon, path.display().to_string()))
+                .collect()
+        };
         let mut app = Self {
             path: path.clone().unwrap_or_else(home_dir),
             volumes: volumes(),

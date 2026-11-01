@@ -5,11 +5,11 @@
 # RillDisk
 
 **See where your disk went — and what you can safely get back.**
-A native, GPU-rendered disk analyzer for Windows, with a CLI and an MCP server so
-your AI assistant sees exactly what you see.
+A native, GPU-rendered disk analyzer for Windows, Linux and macOS, with a CLI and an
+MCP server so your AI assistant sees exactly what you see.
 
 [![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-38bdf8)](LICENSE)
-![Platform: Windows](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0b0e13)
+![Platforms: Windows, Linux, macOS](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-0b0e13)
 ![Pure Rust](https://img.shields.io/badge/100%25-Rust-f74c00)
 ![MCP](https://img.shields.io/badge/MCP-stdio%20server-34d399)
 [![CI](https://github.com/lord007tn/rilldisk/actions/workflows/ci.yml/badge.svg)](https://github.com/lord007tn/rilldisk/actions/workflows/ci.yml)
@@ -30,7 +30,7 @@ your AI assistant sees exactly what you see.
 
 |  |  |
 | --- | --- |
-| **Fast and lean** | Batched Win32 metadata enumeration on a barrier-free, work-stealing pipeline. A 3.1-million-file developer workspace scans in **5–9 s** using ~560 MB; a whole 30-million-entry system drive in about 3 minutes ([numbers](#performance)). |
+| **Fast and lean** | Batched Win32 metadata enumeration on Windows, `readdir` plus one no-follow `stat` per entry on Linux and macOS, all on one barrier-free, work-stealing pipeline. A 3.1-million-file developer workspace scans in **5–9 s** using ~560 MB; a whole 30-million-entry system drive in about 3 minutes ([numbers](#performance)). |
 | **A map, not a list** | Squarified, cushion-shaded treemap rendered on the GPU (wgpu). Hover, click, zoom, breadcrumb back out. Folder chains like `SteamLibrary › … › common` fold into one header. |
 | **Reclaim, explained** | Finds Git worktrees (including forgotten **AI-agent worktrees**), `node_modules`, `target`, `.next`, `.venv`, Unity `Library`, package caches and temp folders — each with a safety level, reason, idle time, the exact command to run, and how much space it **really** frees once hard links are accounted for. |
 | **Built for agents too** | The same engine powers a CLI with JSON output and a local **MCP server**. Claude Code, Codex, Cursor or any MCP client can scan, query and explain your disk. |
@@ -67,6 +67,10 @@ and extract it anywhere. It contains two programs:
 No installer, no admin rights, no account. Protected system folders appear under
 **Issues** and the result is clearly marked partial.
 
+On **Linux and macOS**, [build from source](#build-from-source) for now. The desktop,
+CLI and MCP server work the same way; drives are your mounted disks (`/`, `/home`,
+`/Volumes/...`) and the sidebar uses your standard folders.
+
 | Shortcut | Action |
 | --- | --- |
 | `F5` / `Esc` | Rescan / stop and keep partial results |
@@ -87,9 +91,9 @@ files (`target` next to `Cargo.toml`, `.git` *file* in a folder, `pyvenv.cfg` in
 
 | Safety | Meaning | Examples |
 | --- | --- | --- |
-| 🟢 Regenerable | Rebuilt or reinstalled from source by project tooling | `node_modules`, Rust/Maven `target`, `.next`, `bin`/`obj`, `__pycache__`, `.venv`, Unity `Library`, `.terraform` |
-| 🔵 Cache | Re-downloaded or recreated on demand | npm/pnpm/Yarn/pip/uv/Cargo/NuGet/Gradle caches, Windows temp, shader caches, browser caches |
-| 🟡 Review first | May hold unique work | Linked Git worktrees, orphaned agent worktrees, Recycle Bin, model downloads |
+| 🟢 Regenerable | Rebuilt or reinstalled from source by project tooling | `node_modules`, Rust/Maven `target`, `.next`, `bin`/`obj`, `__pycache__`, `.venv`, Unity `Library`, `.terraform`, Xcode `DerivedData` |
+| 🔵 Cache | Re-downloaded or recreated on demand | npm/pnpm/Yarn/pip/uv/Go/Cargo/NuGet/Gradle/Homebrew caches, Windows temp, shader caches, browser caches |
+| 🟡 Review first | May hold unique work | Linked Git worktrees, orphaned agent worktrees, Recycle Bin and Trash, model downloads, `~/.cache` and `~/Library/Caches` as a whole |
 
 ```text
 > rilldisk reclaim "C:\RillDisk Demo" --min-size 1GB
@@ -190,6 +194,12 @@ What changed since the first alpha:
 * **Less work per folder.** Volume identity is read once per scan, names are
   allocated on worker threads, and hard-link tracking uses a cheap hash.
 
+**Linux** (WSL2 Ubuntu on the same machine, ext4, warm cache, release build): the
+50,000-file synthetic benchmark has a **12 ms** scanner median with 8 threads, and
+`/usr` (36,589 files, 4,510 folders) scans in **~24 ms** with counts identical to
+`find -xdev`. macOS is built and tested in CI but not yet measured. Details:
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md#linux-wsl2-observation).
+
 RillDisk is **not yet** an MFT reader, so it does not claim WizTree-level
 whole-volume speed; a qualified NTFS fast path is [on the roadmap](ROADMAP.md).
 Method and earlier comparisons: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
@@ -203,7 +213,10 @@ Method and earlier comparisons: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
   the entry limit (30 million by default, `--max-entries`) mark the result partial
   everywhere: status bar, CLI exit code, JSON and MCP.
 * **No surprises.** Junctions, symlinks and cloud placeholders are listed but not
-  followed or hydrated.
+  followed or hydrated. On Linux and macOS a scan stays on one filesystem: other
+  mounts are listed, not entered, and counted as `skipped_mounts`
+  (`--cross-filesystems` includes real disks; `/proc`, `/sys`, `/dev` and `/run`
+  never are).
 
 Allocated totals are file allocations, not total volume usage: filesystem metadata,
 alternate streams and directory overhead are excluded. Scans are live, not atomic
@@ -218,6 +231,18 @@ the Windows SDK:
 cargo build --release --locked
 .\target\release\rilldisk-desktop.exe
 .\target\release\rilldisk.exe reclaim $HOME
+```
+
+Linux and macOS with Rust stable and a C toolchain (Xcode Command Line Tools on
+macOS). The desktop needs no extra libraries on macOS; on Linux, CI installs
+`pkg-config libxkbcommon-dev libwayland-dev libx11-dev` (the X11 session also loads
+`libxkbcommon-x11` at runtime):
+
+```sh
+cargo build --release --locked
+./target/release/rilldisk drives
+./target/release/rilldisk reclaim ~
+./target/release/rilldisk-desktop
 ```
 
 The workspace has three crates: `rilldisk-core` (scanner, accounting, reclaim

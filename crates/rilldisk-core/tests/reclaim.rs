@@ -331,3 +331,159 @@ fn retain_recomputes_totals() {
     assert_eq!(report.candidate_count, 1);
     assert_eq!(report.total_logical_bytes, 50_000);
 }
+
+#[test]
+fn finds_unix_home_caches_trash_and_agent_worktrees() {
+    let root = tempfile::tempdir().unwrap();
+    let r = root.path();
+    // A Linux home.
+    write(&r.join("home/me/.cache/pip/http/wheel"), 5_000);
+    write(&r.join("home/me/.cache/go-build/00/obj"), 4_000);
+    write(&r.join("home/me/.cache/huggingface/hub/model"), 9_000);
+    write(&r.join("home/me/.cache/fontconfig/cache-4"), 100);
+    write(&r.join("home/me/.npm/_cacache/content-v2/blob"), 4_000);
+    write(&r.join("home/me/.pnpm-store/v3/files/00/blob"), 3_000);
+    write(&r.join("home/me/.local/share/Trash/files/old.txt"), 2_000);
+    write(
+        &r.join("home/me/.cargo/registry/cache/index/x.crate"),
+        6_000,
+    );
+    write(&r.join("home/me/.gradle/caches/modules-2/x.jar"), 1_000);
+    write(&r.join("home/me/.claude-work/worktrees/agent-7/.git"), 40);
+    write(&r.join("home/me/.t3/worktrees/repo/t3-1/.git"), 40);
+    write(&r.join("home/me/.cursor/worktrees/gone/notes.md"), 700);
+    // A macOS home.
+    write(
+        &r.join("Users/me/Library/Caches/Homebrew/downloads/x.tar.gz"),
+        7_000,
+    );
+    write(&r.join("Users/me/Library/Caches/com.example.app/blob"), 500);
+    write(
+        &r.join("Users/me/Library/Developer/Xcode/DerivedData/App-abc/Build/app"),
+        8_000,
+    );
+    write(
+        &r.join("Users/me/Library/Developer/CoreSimulator/Caches/dyld/cache"),
+        3_000,
+    );
+    write(&r.join("Users/me/Library/pnpm/store/v3/blob"), 2_000);
+    write(&r.join("Users/me/.Trash/old.dmg"), 1_000);
+    // Per-volume trash folders.
+    write(&r.join("media/usb/.Trash-1000/files/x"), 300);
+    write(&r.join("media/disk/.Trashes/501/x"), 300);
+    // Look-alikes outside a home folder, or with the wrong shape.
+    write(&r.join("proj/.cache/x"), 100);
+    write(&r.join("proj/Library/Caches/x"), 100);
+    write(&r.join("home/me/src/.Trash-old/x"), 100);
+    write(&r.join("home/me/notes/.trash/x"), 100);
+    write(&r.join("srv/me/.cache/pip/x"), 100);
+
+    let snapshot = scan(r, ScanOptions::default(), Arc::default()).unwrap();
+    assert!(snapshot.summary.complete, "{:?}", snapshot.summary.issues);
+    let report = find_reclaimable(&snapshot, 0);
+    let find = |suffix: &str| {
+        let suffix = Path::new(suffix);
+        report
+            .candidates
+            .iter()
+            .find(|c| c.path.ends_with(suffix))
+            .unwrap_or_else(|| panic!("missing {}: {:#?}", suffix.display(), report.candidates))
+    };
+    let cache = find("home/me/.cache");
+    assert_eq!(cache.safety, Safety::Review);
+    assert_eq!(cache.nested_in, None);
+    let pip = find("home/me/.cache/pip");
+    assert_eq!(pip.safety, Safety::Cache);
+    assert_eq!(pip.suggested_action, "pip cache purge");
+    assert_eq!(
+        pip.nested_in,
+        Some(cache.entry_id),
+        "known caches stay visible"
+    );
+    assert_eq!(find(".cache/go-build").suggested_action, "go clean -cache");
+    assert_eq!(find(".cache/huggingface").safety, Safety::Review);
+    assert_eq!(
+        find(".npm/_cacache").suggested_action,
+        "npm cache clean --force"
+    );
+    assert_eq!(find("me/.pnpm-store").suggested_action, "pnpm store prune");
+    let trash = find(".local/share/Trash");
+    assert_eq!(trash.category, Category::RecycleBin);
+    assert_eq!(trash.safety, Safety::Review);
+    assert_eq!(find(".cargo/registry").category, Category::PackageCache);
+    find(".gradle/caches");
+    let agent = find(".claude-work/worktrees/agent-7");
+    assert_eq!(agent.agent, Some("Claude Code"));
+    assert_eq!(agent.category, Category::GitWorktree);
+    assert_eq!(find(".t3/worktrees/repo/t3-1").agent, Some("T3 Code"));
+    let orphan = find(".cursor/worktrees/gone");
+    assert_eq!(orphan.label, "Orphaned agent worktree");
+    assert_eq!(orphan.agent, Some("Cursor"));
+
+    let library = find("Users/me/Library/Caches");
+    assert_eq!(library.safety, Safety::Review);
+    let brew = find("Library/Caches/Homebrew");
+    assert_eq!(brew.suggested_action, "brew cleanup --prune=all");
+    assert_eq!(brew.nested_in, Some(library.entry_id));
+    let derived = find("Xcode/DerivedData");
+    assert_eq!(derived.safety, Safety::Regenerable);
+    assert_eq!(derived.logical_bytes, 8_000);
+    assert_eq!(find("CoreSimulator/Caches").safety, Safety::Review);
+    assert_eq!(
+        find("Library/pnpm/store").suggested_action,
+        "pnpm store prune"
+    );
+    assert_eq!(find("Users/me/.Trash").category, Category::RecycleBin);
+    assert_eq!(find("usb/.Trash-1000").category, Category::RecycleBin);
+    assert_eq!(find("disk/.Trashes").category, Category::RecycleBin);
+
+    for false_positive in [
+        "proj/.cache",
+        "proj/Library/Caches",
+        "src/.Trash-old",
+        "notes/.trash",
+        "srv/me/.cache/pip",
+    ] {
+        assert!(
+            !report
+                .candidates
+                .iter()
+                .any(|c| c.path.ends_with(Path::new(false_positive))),
+            "{false_positive} must not be flagged"
+        );
+    }
+    // Totals count only outermost candidates.
+    let outer: u64 = report
+        .candidates
+        .iter()
+        .filter(|c| c.nested_in.is_none())
+        .map(|c| c.logical_bytes)
+        .sum();
+    assert_eq!(report.total_logical_bytes, outer);
+}
+
+/// A copied command never carries a path a POSIX shell could reinterpret.
+#[cfg(unix)]
+#[test]
+fn unix_suggested_commands_omit_unsafe_paths() {
+    let root = tempfile::tempdir().unwrap();
+    let r = root.path();
+    write(&r.join("plain/.git"), 40);
+    write(&r.join(r"back\slash/.git"), 40);
+    write(&r.join("cost$HOME/.git"), 40);
+    let snapshot = scan(r, ScanOptions::default(), Arc::default()).unwrap();
+    let report = find_reclaimable(&snapshot, 0);
+    let action = |name: &str| {
+        report
+            .candidates
+            .iter()
+            .find(|c| c.path.ends_with(name))
+            .map(|c| c.suggested_action.clone())
+            .unwrap()
+    };
+    let plain = action("plain");
+    assert!(plain.starts_with("git worktree remove \"/"), "{plain}");
+    assert!(plain.ends_with("/plain\""), "{plain}");
+    assert_eq!(action(r"back\slash"), "git worktree remove <this folder>");
+    assert_eq!(action("cost$HOME"), "git worktree remove <this folder>");
+}
