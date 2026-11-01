@@ -137,3 +137,43 @@ fn enumerates_multiple_native_buffers_and_paginates_in_size_order() {
     assert_eq!(page[0].logical_bytes, 1000);
     assert_eq!(page[1].logical_bytes, 999);
 }
+
+#[cfg(windows)]
+#[test]
+fn resident_ntfs_data_has_no_separate_allocated_clusters() {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::{
+        Foundation::ERROR_HANDLE_EOF,
+        System::{IO::DeviceIoControl, Ioctl::FSCTL_GET_RETRIEVAL_POINTERS},
+    };
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("resident.txt");
+    fs::write(&path, [1_u8; 17]).unwrap();
+    let file = fs::File::open(&path).unwrap();
+    let start_vcn = 0_i64;
+    let mut output = [0_u64; 128];
+    let mut returned = 0;
+    // SAFETY: all buffers and the handle live through this synchronous metadata query.
+    let success = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle(),
+            FSCTL_GET_RETRIEVAL_POINTERS,
+            (&start_vcn as *const i64).cast(),
+            8,
+            output.as_mut_ptr().cast(),
+            1024,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    // Independent NTFS extent query: ERROR_HANDLE_EOF means this resident file has no extents.
+    assert_eq!(success, 0);
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(ERROR_HANDLE_EOF as i32)
+    );
+    let snapshot = scan(root.path(), ScanOptions::default(), Arc::default()).unwrap();
+    assert!(snapshot.summary.complete);
+    assert_eq!(snapshot.summary.logical_bytes, 17);
+    assert_eq!(snapshot.summary.allocated_bytes, Some(0));
+}

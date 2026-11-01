@@ -129,6 +129,7 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
     if !root.is_dir() {
         bail!("scan root must be a directory");
     }
+    let allocation_unit = platform::allocation_unit(&root)?;
     let start = Instant::now();
     let mut summary = Summary {
         schema_version: 1,
@@ -174,7 +175,14 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
             let batches: Vec<_> = pool.install(|| {
                 chunk
                     .par_iter()
-                    .map(|(_, path)| platform::read_directory(path, &control, options.max_entries))
+                    .map(|(_, path)| {
+                        platform::read_directory(
+                            path,
+                            &control,
+                            options.max_entries,
+                            allocation_unit,
+                        )
+                    })
                     .collect()
             });
             for ((parent, _), batch) in chunk.iter().zip(batches) {

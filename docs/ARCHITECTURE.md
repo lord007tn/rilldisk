@@ -34,6 +34,12 @@ propagates as `null` rather than becoming zero. Hard-link ownership is attribute
 to first encounter. The user-visible allocation figure excludes directory and
 volume overhead and unenumerated alternate streams.
 
+The allocation unit is queried once per scan. NTFS directory records can report
+an implementation-rounded byte length for resident data inside the MFT. Values
+below a cluster are normalized to zero separately allocated data clusters. A
+Windows regression test independently confirms absence of extents with
+`FSCTL_GET_RETRIEVAL_POINTERS`; logical bytes remain unchanged.
+
 Cancellation is cooperative between directory batches and records. A blocking
 filesystem operation can delay it. The entry limit and capped error details bound
 retained records, but paths, temporary directory batches, the hard-link set and

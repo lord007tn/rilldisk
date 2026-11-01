@@ -2,16 +2,22 @@
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub(crate) use windows::{BACKEND, read_directory};
+pub(crate) use windows::{BACKEND, allocation_unit, read_directory};
 
 #[cfg(not(windows))]
 pub(crate) const BACKEND: &str = "portable-walk";
+
+#[cfg(not(windows))]
+pub(crate) fn allocation_unit(_root: &std::path::Path) -> std::io::Result<Option<u64>> {
+    Ok(None)
+}
 
 #[cfg(not(windows))]
 pub(crate) fn read_directory(
     path: &std::path::Path,
     control: &crate::ScanControl,
     limit: usize,
+    _allocation_unit: Option<u64>,
 ) -> crate::Batch {
     use crate::{Batch, EntryKind, RawEntry, ScanIssue};
     let mut batch = Batch {

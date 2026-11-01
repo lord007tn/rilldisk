@@ -73,7 +73,8 @@ scanner and query logic, and the desktop app will reuse it.
 * `logical_bytes` counts every discovered filename; `unique_logical_bytes` and
   `allocated_bytes` count a hard-linked file once, using volume and file identity.
   The first encountered link gets the unique bytes; directory attribution may
-  differ between scans. Allocation is the filesystem's reported file allocation.
+  differ between scans. Sub-cluster resident allocation is reported as zero
+  separately allocated data clusters, excluding its MFT storage.
 * Errors, cancellation and entry limits produce explicitly partial results. The
   first 100 error details are retained; `issue_count` counts all errors.
 * `--threads` accepts 1–64; the default is up to 8. `--max-entries` defaults to
