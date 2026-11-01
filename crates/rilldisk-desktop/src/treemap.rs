@@ -47,6 +47,8 @@ pub type Key = (
 
 #[derive(Default)]
 pub struct Layout {
+    /// Tile count at which the folder being placed stops (see `build`).
+    limit: usize,
     pub key: Option<Key>,
     pub tiles: Vec<Tile>,
     pub mesh: Arc<Mesh>,
@@ -165,7 +167,20 @@ pub fn build(snapshot: &Snapshot, params: &Params) -> Layout {
         offsets.insert(*id, ((cumulative + size / 2.0) / total.max(1.0)) as f32);
         cumulative += size;
     }
+    // Share the tile budget out by size, carrying unused budget forward, so a
+    // huge first folder cannot leave the others without tiles.
+    let sizes: std::collections::HashMap<u32, f64> = items.iter().copied().collect();
+    let mut remaining_size = total;
     for (child, rect) in placed {
+        if layout.tiles.len() >= MAX_TILES {
+            layout.truncated = true;
+            break;
+        }
+        let size = sizes.get(&child).copied().unwrap_or(0.0);
+        let budget = MAX_TILES - layout.tiles.len();
+        let share = (budget as f64 * size / remaining_size.max(1.0)) as usize;
+        remaining_size -= size;
+        layout.limit = layout.tiles.len() + share.clamp(64.min(budget), budget);
         let base = match params.color_by {
             ColorBy::Folder => style::chart(offsets[&child], 0),
             ColorBy::Kind => Color32::TRANSPARENT,
@@ -180,9 +195,6 @@ pub fn build(snapshot: &Snapshot, params: &Params) -> Layout {
             &mut layout,
             &mut shapes,
         );
-        if layout.truncated {
-            break;
-        }
     }
     let mut mesh = Mesh::default();
     let mut tessellator = Tessellator::new(
@@ -218,7 +230,7 @@ fn place(
     layout: &mut Layout,
     shapes: &mut Vec<Paint>,
 ) {
-    if layout.tiles.len() >= MAX_TILES {
+    if layout.tiles.len() >= layout.limit {
         layout.truncated = true;
         return;
     }
@@ -328,8 +340,8 @@ pub fn paint_labels(
     allocated: bool,
     compact: bool,
 ) {
-    let th = t();
     for tile in &layout.tiles {
+        let (ink, ink_dim) = ink_on(tile.color);
         let r = tile.rect;
         let header = if tile.is_dir {
             header_height(r, tile.depth, compact)
@@ -352,24 +364,39 @@ pub fn paint_labels(
         let top = r.min + vec2(pad, if tile.depth == 0 { 7.0 } else { 4.0 });
         let name_font = style::semibold(if tile.depth == 0 { 12.5 } else { 11.0 });
         if two_lines {
-            let galley = fit(painter, name, name_font, th.ink, width);
-            painter.galley(top, galley, th.ink);
-            let galley = fit(painter, size, style::regular(11.0), th.ink_dim, width);
-            painter.galley(top + vec2(0.0, 16.0), galley, th.ink_dim);
+            let galley = fit(painter, name, name_font, ink, width);
+            painter.galley(top, galley, ink);
+            let galley = fit(painter, size, style::regular(11.0), ink_dim, width);
+            painter.galley(top + vec2(0.0, 16.0), galley, ink_dim);
         } else {
-            let galley = fit(painter, name, name_font, th.ink, width - 50.0);
+            let galley = fit(painter, name, name_font, ink, width - 50.0);
             let name_w = galley.size().x;
-            painter.galley(top, galley, th.ink);
+            painter.galley(top, galley, ink);
             if width - name_w > 46.0 {
                 painter.text(
                     top + vec2(name_w + 6.0, 1.0),
                     Align2::LEFT_TOP,
                     size,
                     style::regular(10.5),
-                    th.ink_dim,
+                    ink_dim,
                 );
             }
         }
+    }
+}
+
+/// Label colors readable on `fill`: dark ink on light tiles, white on dark ones.
+pub fn ink_on(fill: Color32) -> (Color32, Color32) {
+    let luminance =
+        (0.2126 * fill.r() as f32 + 0.7152 * fill.g() as f32 + 0.0722 * fill.b() as f32) / 255.0;
+    if luminance > 0.6 {
+        let ink = Color32::from_rgb(22, 26, 32);
+        (ink, Color32::from_rgba_unmultiplied(22, 26, 32, 165))
+    } else {
+        (
+            Color32::WHITE,
+            Color32::from_rgba_unmultiplied(255, 255, 255, 190),
+        )
     }
 }
 

@@ -88,8 +88,8 @@ pub fn check(channel: Channel) -> Result<Check> {
     };
     let releases = match channel {
         Channel::Stable => match fetch_feed() {
-            Ok(release) => vec![release],
-            Err(_) => fetch_releases()?,
+            Ok(release) if release.installable_for(target) => vec![release],
+            _ => fetch_releases()?,
         },
         Channel::Prerelease => fetch_releases()?,
     };

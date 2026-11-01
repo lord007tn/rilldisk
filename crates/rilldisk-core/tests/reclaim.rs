@@ -374,7 +374,8 @@ fn finds_unix_home_caches_trash_and_agent_worktrees() {
     );
     write(&r.join("Users/me/Library/pnpm/store/v3/blob"), 2_000);
     write(&r.join("Users/me/.Trash/old.dmg"), 1_000);
-    // Per-volume trash folders sit at the top of the scanned volume.
+    // Per-volume trash folder names directly inside a scanned folder that is not
+    // a volume root are ordinary folders (volume roots: unit test in reclaim.rs).
     write(&r.join(".Trash-1000/files/x"), 300);
     write(&r.join(".Trashes/501/x"), 300);
     // The same names deeper down are ordinary folders.
@@ -451,16 +452,14 @@ fn finds_unix_home_caches_trash_and_agent_worktrees() {
         "pnpm store prune"
     );
     assert_eq!(find("Users/me/.Trash").category, Category::RecycleBin);
-    let root_trash = |name: &str| {
-        report
-            .candidates
-            .iter()
-            // The scan reports the resolved root (macOS temp is behind /var -> /private/var).
-            .find(|c| c.path == snapshot.summary.root.join(name))
-            .unwrap_or_else(|| panic!("missing {name}"))
-    };
-    assert_eq!(root_trash(".Trash-1000").category, Category::RecycleBin);
-    assert_eq!(root_trash(".Trashes").category, Category::RecycleBin);
+    for name in [".Trash-1000", ".Trashes"] {
+        // The scan reports the resolved root (macOS temp is behind /var -> /private/var).
+        let path = snapshot.summary.root.join(name);
+        assert!(
+            !report.candidates.iter().any(|c| c.path == path),
+            "{name} outside a volume root must not be flagged"
+        );
+    }
 
     for false_positive in [
         "proj/.cache",

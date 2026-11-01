@@ -264,7 +264,7 @@ fn read_mount_table() -> io::Result<Vec<Mount>> {
     fs::read("/proc/self/mountinfo").map(|bytes| parse_mountinfo(&bytes))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
 fn read_mount_table() -> io::Result<Vec<Mount>> {
     Ok(mount_table())
 }
@@ -330,13 +330,21 @@ fn unescape(field: &[u8]) -> Vec<u8> {
 
 #[cfg(target_os = "macos")]
 fn mount_table() -> Vec<Mount> {
+    read_mount_table().unwrap_or_default()
+}
+
+#[cfg(target_os = "macos")]
+fn read_mount_table() -> io::Result<Vec<Mount>> {
     use std::ffi::CStr;
     // getfsstat fills a caller-owned buffer, unlike getmntinfo's shared static one,
     // so concurrent scans and drive listings cannot race.
     // SAFETY: a null buffer only asks for the number of mounted filesystems.
     let count = unsafe { libc::getfsstat(std::ptr::null_mut(), 0, libc::MNT_NOWAIT) };
-    if count <= 0 {
-        return Vec::new();
+    if count < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if count == 0 {
+        return Ok(Vec::new());
     }
     let capacity = count as usize + 8;
     // SAFETY: statfs is plain old data; zeroed values are valid.
@@ -344,8 +352,8 @@ fn mount_table() -> Vec<Mount> {
     let bytes = (capacity * std::mem::size_of::<libc::statfs>()) as libc::c_int;
     // SAFETY: the buffer is writable for `bytes` bytes for this synchronous call.
     let filled = unsafe { libc::getfsstat(buffer.as_mut_ptr(), bytes, libc::MNT_NOWAIT) };
-    if filled <= 0 {
-        return Vec::new();
+    if filled < 0 {
+        return Err(io::Error::last_os_error());
     }
     buffer.truncate(filled as usize);
     let text = |chars: &[libc::c_char]| {
@@ -355,7 +363,7 @@ fn mount_table() -> Vec<Mount> {
             .map(|c| c.to_bytes().to_vec())
             .unwrap_or_default()
     };
-    buffer
+    Ok(buffer
         .iter()
         .map(|s| {
             let unit = u64::from(s.f_bsize);
@@ -372,7 +380,7 @@ fn mount_table() -> Vec<Mount> {
                 )),
             }
         })
-        .collect()
+        .collect())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]

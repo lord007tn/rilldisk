@@ -134,11 +134,22 @@ impl Plan {
                 exe.display()
             );
         }
-        let binaries = BINARIES
+        let binaries: Vec<PathBuf> = BINARIES
             .iter()
             .map(|b| dir.join(exe_name(b)))
             .filter(|p| p == exe || p.is_file())
             .collect();
+        // Replacing a link would leave the file it points to on the old version.
+        for binary in &binaries {
+            if binary != exe
+                && std::fs::symlink_metadata(binary).is_ok_and(|m| m.file_type().is_symlink())
+            {
+                bail!(
+                    "{} is a symbolic link; update the file it points to, or download the release from https://github.com/{REPOSITORY}/releases",
+                    binary.display()
+                );
+            }
+        }
         Ok(Self { dir, binaries })
     }
 }
@@ -206,6 +217,9 @@ pub fn apply_archive(
     plan: &Plan,
 ) -> Result<()> {
     verify_sha256(bytes, expected_sha256)?;
+    if plan.binaries.is_empty() {
+        bail!("nothing to update: the plan lists no RillDisk binaries");
+    }
     let names: Vec<String> = plan
         .binaries
         .iter()

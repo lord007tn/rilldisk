@@ -871,7 +871,7 @@ impl RillApp {
                     ("Stopped early · partial".to_string(), th.warn)
                 } else {
                     (
-                        format!("Partial · {} unread", style::count(s.issue_count)),
+                        format!("Partial · {} issues", style::count(s.issue_count)),
                         th.warn,
                     )
                 };
@@ -893,7 +893,7 @@ impl RillApp {
                     style::bytes(s.logical_bytes),
                     style::bytes(s.unique_logical_bytes),
                     s.allocated_bytes.map(style::bytes).unwrap_or("unknown".into()),
-                    if s.complete { "" } else { "\nSome folders could not be read; totals exclude them." }
+                    if s.complete { "" } else { "\nSome folders could not be read (left out of the totals) or something could not be verified. See Issues." }
                 ));
                 if chip.clicked() && !s.complete {
                     actions.push(Action::Tab(Tab::Issues));
@@ -925,7 +925,7 @@ impl RillApp {
         if issues > 0 {
             tabs.push((
                 Tab::Issues,
-                "Unread".to_string(),
+                "Issues".to_string(),
                 Some((style::short_count(issues), th.warn)),
             ));
         }
@@ -1469,6 +1469,9 @@ impl RillApp {
             let painter = ui.painter_at(map_rect);
             painter.add(Shape::mesh(self.mini.mesh.clone()));
             treemap::paint_labels(&painter, &self.mini, snapshot, self.allocated, false);
+            if self.mini.truncated {
+                detail_note(&painter, inner);
+            }
             let response = ui.interact(inner, ui.scope_id().with("mini-map"), Sense::click());
             if let Some(pos) = response.hover_pos()
                 && let Some(tile) = self.mini.hit(pos).copied()
@@ -1636,6 +1639,9 @@ impl RillApp {
                     {
                         treemap::outline(&painter, tile, color, width);
                     }
+                }
+                if self.map.truncated {
+                    detail_note(&painter, inner);
                 }
                 if self.map.tiles.is_empty() {
                     painter.text(
@@ -2637,7 +2643,7 @@ impl RillApp {
         let summary = &data.snapshot.summary;
         ui.label(
             RichText::new(format!(
-                "{} folders or entries could not be read, so totals leave them out. {} are listed. Protected system folders are expected without administrator rights.",
+                "{} issues: folders that could not be read (left out of the totals) or checks that could not be made (each message says which). {} are listed. Protected system folders are expected without administrator rights.",
                 style::count(summary.issue_count),
                 if summary.issues.len() as u64 == summary.issue_count { "All".to_string() } else { format!("The first {}", summary.issues.len()) }
             ))
@@ -3159,6 +3165,20 @@ fn class_bar(
 }
 
 /// The mark: a rounded tile holding a stream of treemap blocks in theme colors.
+/// Small notice when a map hit its tile limit, so blank space is not mistaken
+/// for unused disk space.
+fn detail_note(painter: &egui::Painter, area: Rect) {
+    let th = t();
+    let text = "Largest items only · open a folder for more detail";
+    let galley = painter.layout_no_wrap(text.into(), style::regular(11.5), th.text);
+    let rect = Rect::from_min_size(
+        pos2(area.left() + 10.0, area.bottom() - galley.size().y - 18.0),
+        galley.size() + vec2(18.0, 10.0),
+    );
+    painter.rect_filled(rect, 9, style::alpha(th.popup, 235));
+    painter.galley(rect.min + vec2(9.0, 5.0), galley, th.text);
+}
+
 fn logo(p: &egui::Painter, rect: Rect) {
     let th = t();
     let s = rect.width();

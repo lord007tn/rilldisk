@@ -1129,8 +1129,9 @@ fn directory_rule(
         "$recycle.bin" => &RECYCLE,
         // macOS `.Trashes` and freedesktop `.Trash-<uid>` folders live at a volume
         // root. Scans stay on one filesystem, so that is the top of the scan.
-        ".trashes" if parent == 0 => &VOLUME_TRASH,
+        ".trashes" if parent == 0 && is_volume_root(snapshot) => &VOLUME_TRASH,
         _ if parent == 0
+            && is_volume_root(snapshot)
             && lower
                 .strip_prefix(".trash-")
                 .is_some_and(|uid| !uid.is_empty() && uid.bytes().all(|b| b.is_ascii_digit())) =>
@@ -1206,6 +1207,28 @@ fn is_home(components: &[String], at: usize, scan_root: usize) -> bool {
     };
     (at >= 1 && matches!(components[at - 1].as_str(), "home" | "users") && top(at - 1))
         || (at == 1 && components[1] == "root" && components[0] == "/")
+}
+
+/// Whether the scanned folder is the top of a volume: `/`, a drive root, or a
+/// standard mount location (`/Volumes/<disk>`, `/mnt/<disk>`, `/media/<disk>`,
+/// `/media/<user>/<disk>`, `/run/media/<user>/<disk>`).
+fn is_volume_root(snapshot: &Snapshot) -> bool {
+    volume_root_path(&snapshot.summary.root)
+}
+
+fn volume_root_path(root: &std::path::Path) -> bool {
+    let parts: Vec<String> = root
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+        .collect();
+    let names: Vec<&str> = parts.iter().map(String::as_str).collect();
+    match names.as_slice() {
+        ["/"] => true,
+        [drive, "\\"] if drive.ends_with(':') => true,
+        ["/", "volumes" | "mnt" | "media", _] => true,
+        ["/", "media", _, _] | ["/", "run", "media", _, _] => true,
+        _ => false,
+    }
 }
 
 /// Number of path components of the scanned folder.
@@ -1343,4 +1366,35 @@ fn agent_owner(path: &std::path::Path) -> Option<&'static str> {
             _ => None,
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::volume_root_path;
+    use std::path::Path;
+
+    #[cfg(unix)]
+    #[test]
+    fn recognizes_unix_volume_roots_only() {
+        for root in [
+            "/",
+            "/Volumes/USB",
+            "/mnt/data",
+            "/media/disk",
+            "/media/me/USB",
+            "/run/media/me/USB",
+        ] {
+            assert!(volume_root_path(Path::new(root)), "{root}");
+        }
+        for root in ["/home/me/project", "/Volumes/USB/backup", "/mnt"] {
+            assert!(!volume_root_path(Path::new(root)), "{root}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recognizes_drive_roots_only() {
+        assert!(volume_root_path(Path::new(r"D:\")));
+        assert!(!volume_root_path(Path::new(r"D:\Projects")));
+    }
 }

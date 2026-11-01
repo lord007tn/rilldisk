@@ -37,7 +37,6 @@ pub struct Theme {
     pub danger: Color32,
     /// Ink for labels drawn on chart tiles.
     pub ink: Color32,
-    pub ink_dim: Color32,
     pub shadow: Color32,
     stops: [Color32; 6],
     classes: [Color32; 9],
@@ -62,7 +61,6 @@ static TIDE_DARK: Theme = Theme {
     warn: Color32::from_rgb(251, 191, 36),
     danger: Color32::from_rgb(248, 113, 113),
     ink: Color32::from_rgb(255, 255, 255),
-    ink_dim: Color32::from_rgba_premultiplied(190, 190, 190, 190),
     shadow: Color32::from_rgba_premultiplied(0, 0, 0, 110),
     stops: [
         Color32::from_rgb(32, 201, 170),
@@ -104,7 +102,6 @@ static TIDE_LIGHT: Theme = Theme {
     warn: Color32::from_rgb(190, 128, 6),
     danger: Color32::from_rgb(214, 45, 45),
     ink: Color32::from_rgb(16, 34, 44),
-    ink_dim: Color32::from_rgba_premultiplied(10, 21, 27, 160),
     shadow: Color32::from_rgba_premultiplied(1, 2, 3, 30),
     stops: [
         Color32::from_rgb(153, 230, 210),
@@ -146,7 +143,6 @@ static MOSS_DARK: Theme = Theme {
     warn: Color32::from_rgb(250, 204, 21),
     danger: Color32::from_rgb(252, 129, 129),
     ink: Color32::from_rgb(255, 255, 255),
-    ink_dim: Color32::from_rgba_premultiplied(190, 190, 190, 190),
     shadow: Color32::from_rgba_premultiplied(0, 0, 0, 110),
     stops: [
         Color32::from_rgb(160, 220, 80),
@@ -188,7 +184,6 @@ static MOSS_LIGHT: Theme = Theme {
     warn: Color32::from_rgb(190, 128, 6),
     danger: Color32::from_rgb(214, 45, 45),
     ink: Color32::from_rgb(30, 36, 22),
-    ink_dim: Color32::from_rgba_premultiplied(18, 22, 13, 160),
     shadow: Color32::from_rgba_premultiplied(2, 2, 1, 30),
     stops: [
         Color32::from_rgb(210, 238, 160),
@@ -230,7 +225,6 @@ static AURORA_DARK: Theme = Theme {
     warn: Color32::from_rgb(251, 191, 36),
     danger: Color32::from_rgb(248, 113, 113),
     ink: Color32::from_rgb(255, 255, 255),
-    ink_dim: Color32::from_rgba_premultiplied(190, 190, 190, 190),
     shadow: Color32::from_rgba_premultiplied(0, 0, 0, 110),
     stops: [
         Color32::from_rgb(52, 211, 153),
@@ -272,7 +266,6 @@ static AURORA_LIGHT: Theme = Theme {
     warn: Color32::from_rgb(190, 128, 6),
     danger: Color32::from_rgb(214, 45, 45),
     ink: Color32::from_rgb(24, 24, 40),
-    ink_dim: Color32::from_rgba_premultiplied(15, 15, 25, 160),
     shadow: Color32::from_rgba_premultiplied(1, 1, 3, 30),
     stops: [
         Color32::from_rgb(167, 236, 206),

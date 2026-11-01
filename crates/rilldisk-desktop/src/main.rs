@@ -25,7 +25,7 @@ fn main() -> eframe::Result {
     // An option's value, unless the next token is another option.
     let value = |args: &mut std::iter::Peekable<_>| -> Option<String> {
         let next: Option<&String> = args.peek();
-        next.filter(|v| !v.starts_with("--"))?;
+        next.filter(|v| !v.starts_with('-'))?;
         args.next()
     };
     while let Some(arg) = args.next() {

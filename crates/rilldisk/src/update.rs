@@ -100,10 +100,15 @@ fn run_blocking(args: Args) -> Result<ExitCode> {
     };
 
     if args.check {
-        let managed_update = managed.is_some() && check.update.is_some();
-        report(&check, managed, args.json)?;
-        // Same codes as `rilldisk update`: a managed copy cannot update itself.
-        return Ok(ExitCode::from(if managed_update {
+        // A renamed or linked copy cannot replace itself: point at the download.
+        let manual = match (&plan, managed) {
+            (Err(error), None) => Some(format!("{error:#}")),
+            _ => None,
+        };
+        let blocked = (managed.is_some() || manual.is_some()) && check.update.is_some();
+        report(&check, managed, manual.as_deref(), args.json)?;
+        // Same codes as `rilldisk update`: a copy that cannot update itself gets 11.
+        return Ok(ExitCode::from(if blocked {
             UNAVAILABLE
         } else if check.update.is_some() {
             UPDATE_AVAILABLE
@@ -165,8 +170,18 @@ fn run_blocking(args: Args) -> Result<ExitCode> {
     Ok(ExitCode::from(UP_TO_DATE))
 }
 
-fn report(check: &Check, managed: Option<(&str, &str)>, json: bool) -> Result<()> {
+fn report(
+    check: &Check,
+    managed: Option<(&str, &str)>,
+    manual: Option<&str>,
+    json: bool,
+) -> Result<()> {
     let latest = check.update.as_ref();
+    let command = if manual.is_some() {
+        None
+    } else {
+        Some(managed.map_or("rilldisk update", |(_, c)| c))
+    };
     if json {
         println!(
             "{}",
@@ -178,7 +193,8 @@ fn report(check: &Check, managed: Option<(&str, &str)>, json: bool) -> Result<()
                 "tag": latest.map(|r| r.tag.clone()),
                 "notes_url": latest.map(|r| r.notes_url.clone()),
                 "managed_by": managed.map(|(m, _)| m),
-                "update_command": latest.map(|_| managed.map_or("rilldisk update", |(_, c)| c)),
+                "update_command": latest.and(command),
+                "cannot_self_update": manual,
             })
         );
         return Ok(());
@@ -189,8 +205,14 @@ fn report(check: &Check, managed: Option<(&str, &str)>, json: bool) -> Result<()
         Some(release) => {
             println!("Latest:  {}", release.version);
             println!("Notes:   {}", release.notes_url);
-            let command = managed.map_or("rilldisk update", |(_, c)| c);
-            println!("Update with: {command}");
+            match (command, manual) {
+                (Some(command), _) => println!("Update with: {command}"),
+                (None, Some(reason)) => {
+                    println!("This copy cannot update itself: {reason}");
+                    println!("Download:    {}", release.notes_url);
+                }
+                (None, None) => {}
+            }
         }
     }
     Ok(())

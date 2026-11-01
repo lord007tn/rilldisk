@@ -334,3 +334,30 @@ fn a_feed_pointing_elsewhere_or_with_bad_checksums_is_rejected() {
         assert!(rilldisk_update::parse_feed(bad.as_bytes()).is_err(), "{to}");
     }
 }
+
+#[test]
+fn an_empty_plan_is_refused_instead_of_reporting_success() {
+    let plan = Plan {
+        dir: std::path::PathBuf::from("unused"),
+        binaries: Vec::new(),
+    };
+    let bytes = b"anything";
+    let error = apply_archive("x.zip", bytes, &sha256_hex(bytes), &plan).unwrap_err();
+    assert!(
+        error.to_string().contains("no RillDisk binaries"),
+        "{error}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_sibling_binary_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let cli = dir.path().join("rilldisk");
+    fs::write(&cli, b"cli").unwrap();
+    let real = dir.path().join("elsewhere");
+    fs::write(&real, b"desktop").unwrap();
+    std::os::unix::fs::symlink(&real, dir.path().join("rilldisk-desktop")).unwrap();
+    let error = Plan::for_exe(&cli).unwrap_err();
+    assert!(error.to_string().contains("symbolic link"), "{error}");
+}
