@@ -286,5 +286,5 @@ fn names_ending_in_a_dot_or_space_are_read_exactly() {
     assert!(snapshot.summary.complete, "{:?}", snapshot.summary.issues);
     assert_eq!(snapshot.summary.files, 2);
     assert_eq!(snapshot.summary.logical_bytes, 10_000);
-    assert!(!snapshot.summary.root.to_string_lossy().starts_with(r"\?\"));
+    assert!(!snapshot.summary.root.to_string_lossy().starts_with(r"\\?\"));
 }
