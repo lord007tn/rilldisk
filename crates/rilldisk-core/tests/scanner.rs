@@ -31,7 +31,7 @@ fn accounts_for_nested_files_hard_links_and_unicode() {
     let nested = snapshot
         .entries
         .iter()
-        .find(|e| e.path.ends_with("nested"))
+        .find(|e| snapshot.path(e.id).ends_with("nested"))
         .unwrap();
     assert_eq!(nested.kind, EntryKind::Directory);
     assert_eq!(nested.logical_bytes, 8192);
@@ -54,7 +54,13 @@ fn entry_limit_and_cancellation_are_explicitly_partial() {
     )
     .unwrap();
     assert!(!snapshot.summary.complete);
-    assert!(snapshot.summary.issue_count > 0);
+    // The memory bound is reported once, not once per truncated directory.
+    assert_eq!(snapshot.summary.issue_count, 1);
+    assert!(
+        snapshot.summary.issues[0]
+            .message
+            .contains("entry limit of 5")
+    );
     assert_eq!(snapshot.entries.len(), 5);
     let control = Arc::new(ScanControl::default());
     control.cancel();
@@ -230,4 +236,55 @@ fn parallel_directories_share_one_record_budget() {
     assert_eq!(snapshot.summary.directories, 33);
     assert_eq!(snapshot.summary.files, 67);
     assert_eq!(control.files.load(std::sync::atomic::Ordering::Relaxed), 67);
+}
+
+#[test]
+fn repeated_small_scans_finish_promptly() {
+    // Guards the completion handshake between workers and the coordinator: a lost
+    // wake-up would make a tiny scan wait for the stall timeout.
+    let root = tempfile::tempdir().unwrap();
+    for d in 0..8 {
+        fs::create_dir_all(root.path().join(format!("d{d}/e"))).unwrap();
+        fs::write(root.path().join(format!("d{d}/e/f.txt")), b"x").unwrap();
+    }
+    for _ in 0..200 {
+        let start = std::time::Instant::now();
+        let snapshot = scan(root.path(), ScanOptions::default(), Arc::default()).unwrap();
+        assert_eq!(snapshot.summary.files, 8);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    }
+}
+
+#[test]
+fn an_exactly_spent_entry_budget_is_still_complete() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("empty")).unwrap();
+    let snapshot = scan(
+        root.path(),
+        ScanOptions {
+            max_entries: 2,
+            ..Default::default()
+        },
+        Arc::default(),
+    )
+    .unwrap();
+    assert!(snapshot.summary.complete, "{:?}", snapshot.summary.issues);
+    assert_eq!(snapshot.entries.len(), 2);
+}
+
+#[cfg(windows)]
+#[test]
+fn names_ending_in_a_dot_or_space_are_read_exactly() {
+    let root = tempfile::tempdir().unwrap();
+    let verbatim = root.path().canonicalize().unwrap();
+    for name in ["trail.", "space "] {
+        let dir = verbatim.join(name);
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("inside.bin"), [1_u8; 5000]).unwrap();
+    }
+    let snapshot = scan(root.path(), ScanOptions::default(), Arc::default()).unwrap();
+    assert!(snapshot.summary.complete, "{:?}", snapshot.summary.issues);
+    assert_eq!(snapshot.summary.files, 2);
+    assert_eq!(snapshot.summary.logical_bytes, 10_000);
+    assert!(!snapshot.summary.root.to_string_lossy().starts_with(r"\\?\"));
 }

@@ -8,14 +8,20 @@
 * Local stdio MCP server with scoped roots and paginated snapshot queries.
 * Windows correctness tests, black-box MCP acceptance, repeatable benchmarks and CI.
 
-## Phase 2 — native GPU desktop
+## Phase 2 — native GPU desktop and reclaim (first release done)
 
-* Separate Rust desktop crate; initial renderer candidate is egui + wgpu.
-* Drive/directory selection, live scan progress, cancellation and error review.
-* Virtualized directory tree, largest-file view, search and GPU treemap navigation.
-* Reuse core snapshots and queries; no renderer dependencies in CLI/MCP builds.
-* Keyboard/accessibility checks, DPI scaling, Unicode/RTL path display and Windows
-  frame-time/memory profiling. Record real screenshots and interaction video.
+* Done: separate `rilldisk-desktop` crate on egui + wgpu; drive picker, live
+  progress, cancellation, issues view.
+* Done: virtualized tree, GPU squarified treemap with zoom and breadcrumbs,
+  largest files, file types, search, keyboard navigation, copy path/command.
+* Done: shared reclaim engine (worktrees, orphaned agent worktrees, build output,
+  dependencies, caches) in core, CLI (`rilldisk reclaim`) and MCP
+  (`find_reclaimable`, `file_types`).
+* Done: name-only entry storage and a compact child index (about half the memory).
+* Next: accessibility audit (screen-reader labels for custom-painted views), DPI
+  and RTL path rendering checks, frame-time and memory profiling at 20M+ entries,
+  saved scans and scan-to-scan diff, optional Explorer reveal behind a scoped
+  proposal.
 
 ## Phase 3 — qualify the fast NTFS path
 
