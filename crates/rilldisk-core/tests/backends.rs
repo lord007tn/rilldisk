@@ -114,6 +114,35 @@ fn directory_and_legacy_walks_agree() {
     );
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn sparse_file_accounting_matches_legacy() {
+    let root = tempfile::tempdir().unwrap();
+    let sparse = root.path().join("sparse-ملف");
+    let file = fs::File::create(&sparse).unwrap();
+    file.set_len(32 * 1024 * 1024).unwrap();
+    drop(file);
+    let new = scan_with(root.path(), Backend::Directory);
+    let old = scan_with(root.path(), Backend::Legacy);
+    assert!(new.summary.complete, "{:?}", new.summary.issues);
+    assert!(old.summary.complete, "{:?}", old.summary.issues);
+    assert_eq!(totals(&new), totals(&old));
+    let entry = |snapshot: &Snapshot| {
+        let entry = snapshot
+            .entries
+            .iter()
+            .find(|e| snapshot.path(e.id) == sparse)
+            .unwrap();
+        (
+            entry.kind,
+            entry.logical_bytes,
+            entry.allocated_bytes,
+            entry.modified_unix_ms,
+        )
+    };
+    assert_eq!(entry(&new), entry(&old));
+}
+
 #[test]
 fn directory_walk_reports_partial_scans_like_legacy() {
     let root = tree();
