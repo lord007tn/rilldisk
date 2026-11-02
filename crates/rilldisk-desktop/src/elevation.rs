@@ -164,7 +164,11 @@ impl Elevate {
                     ui.painter().rect_filled(tile, 11, style::alpha(tint, 48));
                     icons::paint(ui.painter(), tile.shrink(10.0), Icon::Shield, tint);
                     ui.add_space(8.0);
+                    // Leave room for the action button on the right.
+                    let button = if *offer == Offer::None { 0.0 } else { 270.0 };
+                    let text_width = (ui.available_width() - button).max(200.0);
                     ui.vertical(|ui| {
+                        ui.set_max_width(text_width);
                         let count = summary.access_denied_count;
                         let (title, body) = callout_text(offer, count, self.elevated());
                         ui.label(RichText::new(title).font(style::semibold(15.0)));
