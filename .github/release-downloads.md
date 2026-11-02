@@ -11,5 +11,16 @@
 | **Any Linux desktop** (Arch, Manjaro, Gentoo...) | AppImage [x86_64](https://github.com/lord007tn/rilldisk/releases/download/{tag}/RillDisk-{version}-x86_64.AppImage) · [aarch64](https://github.com/lord007tn/rilldisk/releases/download/{tag}/RillDisk-{version}-aarch64.AppImage) | [.tar.gz x86_64](https://github.com/lord007tn/rilldisk/releases/download/{tag}/rilldisk-{tag}-x86_64-unknown-linux-gnu.tar.gz) · [aarch64](https://github.com/lord007tn/rilldisk/releases/download/{tag}/rilldisk-{tag}-aarch64-unknown-linux-gnu.tar.gz) |
 | **Servers, containers, Alpine** (CLI + MCP only) | static musl [x86_64](https://github.com/lord007tn/rilldisk/releases/download/{tag}/rilldisk-{tag}-x86_64-unknown-linux-musl.tar.gz) · [aarch64](https://github.com/lord007tn/rilldisk/releases/download/{tag}/rilldisk-{tag}-aarch64-unknown-linux-musl.tar.gz) | |
 
-Linux builds need glibc 2.28 or newer (Debian 10+, Ubuntu 20.04+, RHEL 8+). Builds are not code-signed or notarized yet; see [installing RillDisk](https://github.com/lord007tn/rilldisk/blob/main/docs/INSTALL.md) for first-launch steps, checksums (`SHA256SUMS`) and provenance (`gh attestation verify <file> --repo lord007tn/rilldisk`).
+<details>
+<summary><b>First launch, verifying downloads, updating</b></summary>
 
+- **Windows:** the builds are not code-signed yet. If SmartScreen appears, choose *More info*, then *Run anyway*.
+- **macOS:** the app is not notarized yet. Open *System Settings > Privacy & Security* and choose *Open Anyway*, or run `xattr -dr com.apple.quarantine /Applications/RillDisk.app`.
+- **Linux:** builds need glibc 2.28 or newer (Debian 10+, Ubuntu 20.04+, RHEL 8+). The static musl build runs anywhere.
+- **Verify:** `sha256sum --check --ignore-missing SHA256SUMS`, and `gh attestation verify <file> --repo lord007tn/rilldisk` for the signed build provenance.
+- **Update:** the app offers new versions (with your consent). From a terminal, run `rilldisk update`. Copies installed with the MSI, `.deb`, `.rpm`, AppImage or `.dmg` are pointed at the matching new package instead.
+
+Full guide: [docs/INSTALL.md](https://github.com/lord007tn/rilldisk/blob/main/docs/INSTALL.md)
+</details>
+
+## What's changed

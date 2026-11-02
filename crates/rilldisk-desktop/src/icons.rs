@@ -28,6 +28,7 @@ pub enum Icon {
     Stop,
     Eye,
     Terminal,
+    Gear,
 }
 
 fn arc(center: Pos2, radius: f32, from: f32, to: f32) -> Vec<Pos2> {
@@ -156,6 +157,19 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
             points.append(&mut inner);
             points.push(points[0]);
             p.add(Shape::line(points, line));
+        }
+        Icon::Gear => {
+            let c = at(8.0, 8.0);
+            p.circle_stroke(c, 2.2 * s, line);
+            // Eight rounded teeth around a ring.
+            let mut ring = Vec::new();
+            for i in 0..=64 {
+                let a = i as f32 * TAU / 64.0;
+                let tooth = ((a * 8.0).cos() * 0.5 + 0.5).powf(3.0);
+                let rad = 4.9 + 1.5 * tooth;
+                ring.push(c + vec2(a.cos(), a.sin()) * rad * s);
+            }
+            p.add(Shape::line(ring, line));
         }
         Icon::Sparkle => {
             let c = at(7.0, 8.5);

@@ -40,7 +40,19 @@ pub enum Step {
     Theme(bool),
     /// Tick the largest candidates of a category in Clean up.
     Pick(Category, usize),
+    Settings(bool),
     Quit,
+}
+
+/// Which scripted tour to run.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TourKind {
+    /// No scan: the welcome page and Settings.
+    Welcome,
+    /// The full product tour of a scanned folder (made for the demo fixture).
+    Full,
+    /// Frames of the live dashboard while a (large) scan runs, then Settings.
+    Live,
 }
 
 pub struct Tour {
@@ -57,10 +69,10 @@ pub struct Tour {
 }
 
 impl Tour {
-    pub fn new(dir: PathBuf, welcome_only: bool) -> Self {
+    pub fn new(dir: PathBuf, kind: TourKind) -> Self {
         use Step::*;
         use Target::*;
-        let steps = if welcome_only {
+        let steps = if kind == TourKind::Welcome {
             vec![
                 Theme(false),
                 Wait(30),
@@ -68,6 +80,27 @@ impl Tour {
                 Theme(true),
                 Wait(20),
                 Shot("home-dark"),
+                Settings(true),
+                Wait(20),
+                Shot("settings-dark"),
+                Theme(false),
+                Wait(20),
+                Shot("settings"),
+                Quit,
+            ]
+        } else if kind == TourKind::Live {
+            vec![
+                Wait(90),
+                Shot("live-1"),
+                Wait(240),
+                Shot("live-2"),
+                Theme(false),
+                Wait(240),
+                Shot("live-3"),
+                Theme(true),
+                Settings(true),
+                Wait(20),
+                Shot("live-settings"),
                 Quit,
             ]
         } else {
@@ -136,6 +169,9 @@ impl Tour {
                 Tab(View::Cleanup),
                 Wait(16),
                 Shot("cleanup-dark"),
+                Settings(true),
+                Wait(20),
+                Shot("settings-dark"),
                 Wait(6),
                 Quit,
             ]
@@ -289,6 +325,7 @@ pub fn advance(app: &mut RillApp, ctx: &egui::Context) {
             app.selected = None;
         }
         Step::Theme(dark) => app.dark = dark,
+        Step::Settings(open) => app.settings_open = open,
         Step::Pick(category, n) => {
             if let Some(data) = &app.data {
                 let picks: Vec<usize> = data
