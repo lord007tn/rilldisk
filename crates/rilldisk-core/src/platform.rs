@@ -8,7 +8,8 @@ mod windows;
 pub use windows::volumes;
 #[cfg(windows)]
 pub(crate) use windows::{
-    BACKEND, VolumeInfo, elevation, enable_backup_privilege, read_directory, volume_info,
+    BACKEND, VolumeInfo, elevation, enable_backup_privilege, executable_on_path, is_elevated,
+    read_directory, volume_info,
 };
 
 #[cfg(unix)]
@@ -17,7 +18,8 @@ mod unix;
 pub use unix::volumes;
 #[cfg(unix)]
 pub(crate) use unix::{
-    BACKEND, VolumeInfo, elevation, enable_backup_privilege, read_directory, volume_info,
+    BACKEND, VolumeInfo, elevation, enable_backup_privilege, executable_on_path, is_elevated,
+    read_directory, volume_info,
 };
 
 #[cfg(not(any(windows, unix)))]

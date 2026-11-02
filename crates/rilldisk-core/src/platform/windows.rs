@@ -390,13 +390,28 @@ fn backup_luid() -> Option<LUID> {
         .then_some(luid)
 }
 
+impl Token {
+    fn is_elevated(&self) -> bool {
+        self.query::<TOKEN_ELEVATION>(TokenElevation)
+            .is_ok_and(|e| e.TokenIsElevated != 0)
+    }
+}
+
+pub(crate) fn is_elevated() -> bool {
+    Token::open(TOKEN_QUERY).is_ok_and(|token| token.is_elevated())
+}
+
+/// Windows offers elevation through UAC; this only serves the shared API.
+pub(crate) fn executable_on_path(program: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
+}
+
 pub(crate) fn elevation() -> crate::Elevation {
     let Ok(token) = Token::open(TOKEN_QUERY) else {
         return crate::Elevation::default();
     };
-    let is_elevated = token
-        .query::<TOKEN_ELEVATION>(TokenElevation)
-        .is_ok_and(|e| e.TokenIsElevated != 0);
+    let is_elevated = token.is_elevated();
     crate::Elevation {
         is_elevated,
         // UAC offers consent (administrators) or a credentials prompt (standard
@@ -410,16 +425,14 @@ pub(crate) fn elevation() -> crate::Elevation {
 /// tokens hold it disabled; unelevated tokens do not hold it at all, so this never
 /// asks for anything new. Only the enabled flag of an existing privilege changes.
 pub(crate) fn enable_backup_privilege() -> bool {
-    let Ok(token) = Token::open(TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES) else {
-        return false;
-    };
-    let elevated = token
-        .query::<TOKEN_ELEVATION>(TokenElevation)
-        .is_ok_and(|e| e.TokenIsElevated != 0);
     let Some(luid) = backup_luid() else {
         return false;
     };
-    if !elevated {
+    let Ok(token) = Token::open(TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES) else {
+        // Adjusting is not allowed; report the privilege as it already is.
+        return Token::open(TOKEN_QUERY).is_ok_and(|t| t.backup_privilege_enabled(luid));
+    };
+    if !token.is_elevated() {
         return token.backup_privilege_enabled(luid);
     }
     let state = TOKEN_PRIVILEGES {

@@ -80,7 +80,7 @@ fn deny_ace_is_access_denied_and_backup_privilege_reads_it() {
     fs::write(locked.join("inside.bin"), [7_u8; 4096]).unwrap();
     let user = match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
         (Ok(domain), Ok(name)) => format!("{domain}\\{name}"),
-        _ => return eprintln!("skipped: no USERNAME"),
+        _ => panic!("USERDOMAIN and USERNAME must be set"),
     };
     let icacls = |args: &[&str]| {
         Command::new("icacls")
@@ -90,24 +90,25 @@ fn deny_ace_is_access_denied_and_backup_privilege_reads_it() {
             .is_ok_and(|o| o.status.success())
     };
     // RD: list folder / read data.
-    if !icacls(&["/deny", &format!("{user}:(RD)")]) {
-        return eprintln!("skipped: could not add a deny ACE");
-    }
+    // A setup that cannot deny access fails loudly instead of passing unchecked.
+    assert!(
+        icacls(&["/deny", &format!("{user}:(RD)")]),
+        "could not add a deny ACE"
+    );
     if fs::read_dir(&locked).is_ok() {
         icacls(&["/remove:d", &user]);
-        return eprintln!("skipped: the deny ACE did not take effect");
+        panic!("the deny ACE did not take effect");
     }
     let first = scan(root.path(), ScanOptions::default(), Arc::default());
     let state = elevation();
-    let second = state
-        .is_elevated
-        .then(|| {
-            assert!(rilldisk_core::enable_backup_privilege());
-            assert!(elevation().backup_privilege_enabled);
-            scan(root.path(), ScanOptions::default(), Arc::default())
-        })
-        .transpose();
-    // Restore before asserting, so the temporary folder can always be removed.
+    // Elevated (CI runners): collect the privileged outcomes without asserting.
+    let second = state.is_elevated.then(|| {
+        let enabled = rilldisk_core::enable_backup_privilege();
+        let privileged = elevation().backup_privilege_enabled;
+        let scanned = scan(root.path(), ScanOptions::default(), Arc::default());
+        (enabled, privileged, scanned)
+    });
+    // Restore before any assertion, so the temporary folder can always be removed.
     assert!(icacls(&["/remove:d", &user]));
     let first = first.unwrap();
     assert!(!first.summary.complete);
@@ -118,7 +119,10 @@ fn deny_ace_is_access_denied_and_backup_privilege_reads_it() {
     assert_eq!(issue.kind, IssueKind::AccessDenied);
     assert_eq!(issue.os_error, Some(5));
     assert_eq!(first.summary.elevated, state.is_elevated);
-    if let Some(second) = second.unwrap() {
+    if let Some((enabled, privileged, second)) = second {
+        assert!(enabled, "enable_backup_privilege failed while elevated");
+        assert!(privileged);
+        let second = second.unwrap();
         assert!(second.summary.complete, "{:?}", second.summary.issues);
         assert_eq!(second.summary.access_denied_count, 0);
         assert_eq!(second.summary.logical_bytes, 4096);

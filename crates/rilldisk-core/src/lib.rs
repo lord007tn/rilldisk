@@ -177,9 +177,22 @@ pub struct Elevation {
     pub backup_privilege_enabled: bool,
 }
 
-/// Current privilege state of this process.
+/// Current privilege state of this process. On Unix this looks for `sudo` and
+/// `pkexec` on `PATH`; [`is_elevated`] alone touches no file.
 pub fn elevation() -> Elevation {
     platform::elevation()
+}
+
+/// Whether this process is elevated (administrator token, or effective UID 0).
+/// Cheap and file-free, so a scan can record it before it starts.
+pub fn is_elevated() -> bool {
+    platform::is_elevated()
+}
+
+/// Whether `program` is an executable file in a `PATH` directory that this user
+/// may run (Unix `access(X_OK)`), for offering `sudo` or `pkexec`.
+pub fn executable_on_path(program: &str) -> bool {
+    platform::executable_on_path(program)
 }
 
 /// When the process is elevated on Windows, enable `SeBackupPrivilege` on its token
@@ -215,8 +228,13 @@ pub struct Summary {
     pub allocated_bytes: Option<u64>,
     pub issue_count: u64,
     /// Issues of kind `access_denied`, counted over all issues (not only the
-    /// listed ones). Rerunning elevated usually reads these folders.
+    /// listed ones). Each is a folder that could not be listed or whose entries
+    /// could not be examined. Rerunning elevated usually reads these folders.
     pub access_denied_count: u64,
+    /// macOS only: the part of `access_denied_count` refused with `EPERM`, which
+    /// privacy protection returns even to root (Full Disk Access lifts it).
+    /// Counted over all issues; always 0 on other platforms.
+    pub privacy_denied_count: u64,
     pub issues: Vec<ScanIssue>,
     pub cancelled: bool,
     pub complete: bool,
@@ -534,10 +552,11 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
         allocated_bytes: Some(0),
         issue_count: 0,
         access_denied_count: 0,
+        privacy_denied_count: 0,
         issues: Vec::new(),
         cancelled: false,
         complete: true,
-        elevated: elevation().is_elevated,
+        elevated: is_elevated(),
     };
     let mut entries = vec![Entry {
         id: 0,
@@ -823,7 +842,11 @@ pub(crate) fn unix_ms(time: SystemTime) -> Option<u64> {
 fn add_issue(summary: &mut Summary, mut issue: ScanIssue) {
     issue.path = simplify(issue.path);
     summary.issue_count += 1;
-    summary.access_denied_count += u64::from(issue.kind == IssueKind::AccessDenied);
+    let denied = issue.kind == IssueKind::AccessDenied;
+    summary.access_denied_count += u64::from(denied);
+    // Recorded before the cap below, so it holds even when the issue is not listed.
+    summary.privacy_denied_count +=
+        u64::from(cfg!(target_os = "macos") && denied && issue.os_error == Some(1));
     if summary.issues.len() < 100 {
         summary.issues.push(issue);
     }
