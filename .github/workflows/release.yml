@@ -302,7 +302,7 @@ jobs:
           managed=$(rilldisk update --check --format json | python -c 'import json,sys; print(json.load(sys.stdin)["managed_by"])')
           test "$managed" = "the RillDisk .deb package"
           sudo apt-get remove -y rilldisk
-          if command -v rilldisk; then echo "::error::rilldisk left after removal"; exit 1; fi
+          if [[ -e /usr/bin/rilldisk || -e /usr/bin/rilldisk-desktop ]]; then echo "::error::files left after removal"; exit 1; fi
           rpm=$(ls dist/rilldisk-*.rpm)
           rpm -qpi "$rpm"
           rpm -qpR "$rpm"

@@ -225,7 +225,7 @@ def deb(stage, out, version, target, args, glibc, libraries):
         changelog = (f"rilldisk ({deb_version}) stable; urgency=medium\n\n"
                      f"  * Release {version}: {SOURCE}/releases/tag/{args.tag}\n\n"
                      f" -- {MAINTAINER}  {build_date().strftime('%a, %d %b %Y %H:%M:%S +0000')}\n")
-        with gzip.GzipFile(docs / "changelog.Debian.gz", "wb", compresslevel=9, mtime=0) as gz:
+        with gzip.GzipFile(docs / "changelog.gz", "wb", compresslevel=9, mtime=0) as gz:
             gz.write(changelog.encode())
         normalize_modes(root)
         size_kb = sum(p.stat().st_size for p in root.rglob("*") if p.is_file()) // 1024
