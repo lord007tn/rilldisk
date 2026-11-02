@@ -117,6 +117,12 @@ pub struct Candidate {
 #[derive(Debug, Clone, Serialize)]
 pub struct ReclaimReport {
     pub scan_complete: bool,
+    /// Copied from the scan summary so a report alone shows what was left out.
+    pub issue_count: u64,
+    /// Folders the OS refused to list; their contents are not considered.
+    pub access_denied_count: u64,
+    /// The scanning process was elevated (administrator or root).
+    pub elevated: bool,
     pub candidate_count: usize,
     /// Outermost candidates only, so nested folders are not double counted.
     pub total_logical_bytes: u64,
@@ -939,6 +945,9 @@ pub fn find_reclaimable(snapshot: &Snapshot, now_unix_ms: u64) -> ReclaimReport 
         .try_fold(0_u64, |sum, value| value.map(|v| sum.saturating_add(v)));
     ReclaimReport {
         scan_complete: snapshot.summary.complete,
+        issue_count: snapshot.summary.issue_count,
+        access_denied_count: snapshot.summary.access_denied_count,
+        elevated: snapshot.summary.elevated,
         candidate_count: candidates.len(),
         total_logical_bytes: outer.clone().map(|c| c.logical_bytes).sum(),
         total_unique_logical_bytes: outer.map(|c| c.unique_logical_bytes).sum(),

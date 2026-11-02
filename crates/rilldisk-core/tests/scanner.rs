@@ -346,6 +346,11 @@ fn unix_reports_block_allocation_times_and_unreadable_folders() {
         assert!(!snapshot.summary.complete);
         assert_eq!(snapshot.summary.issue_count, 1);
         assert!(snapshot.summary.issues[0].path.ends_with("locked"));
+        assert_eq!(
+            snapshot.summary.issues[0].kind,
+            rilldisk_core::IssueKind::AccessDenied
+        );
+        assert_eq!(snapshot.summary.access_denied_count, 1);
         assert!(!folder.fully_listed);
     } else {
         assert!(snapshot.summary.complete);
