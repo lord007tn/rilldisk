@@ -321,15 +321,43 @@ pub fn header_height(rect: Rect, depth: u16, compact: bool) -> f32 {
     }
 }
 
-fn label_for(snapshot: &Snapshot, tile: &Tile) -> String {
+/// Label variants for a tile, longest first. A folded chain shortens toward
+/// its deepest folder, the one the tile actually shows, so a narrow tile
+/// reads "Lossless" or "… › Lossless" rather than "Music › …".
+fn label_variants(snapshot: &Snapshot, tile: &Tile) -> Vec<String> {
     let (top, end) = (tile.id as usize, tile.chain as usize);
+    let (top_name, end_name) = (snapshot.name(top), snapshot.name(end));
     if top == end {
-        snapshot.name(top).into_owned()
-    } else if snapshot.entries[end].parent_id == Some(top) {
-        format!("{} › {}", snapshot.name(top), snapshot.name(end))
-    } else {
-        format!("{} › … › {}", snapshot.name(top), snapshot.name(end))
+        return vec![top_name.into_owned()];
     }
+    let full = if snapshot.entries[end].parent_id == Some(top) {
+        format!("{top_name} › {end_name}")
+    } else {
+        format!("{top_name} › … › {end_name}")
+    };
+    vec![full, format!("… › {end_name}"), end_name.into_owned()]
+}
+
+/// The longest variant that fits in `width`, or the last one shortened.
+fn fitting_label(
+    painter: &Painter,
+    variants: Vec<String>,
+    font: eframe::egui::FontId,
+    color: Color32,
+    width: f32,
+) -> Arc<eframe::egui::Galley> {
+    let last = variants.len() - 1;
+    for (i, text) in variants.into_iter().enumerate() {
+        let galley = painter.layout_no_wrap(text.clone(), font.clone(), color);
+        if galley.size().x <= width || i == last {
+            return if galley.size().x <= width {
+                galley
+            } else {
+                fit(painter, text, font, color, width)
+            };
+        }
+    }
+    unreachable!("label_variants is never empty")
 }
 
 /// Names and sizes on tiles that have room for them.
@@ -359,17 +387,17 @@ pub fn paint_labels(
         }
         let pad = if tile.depth == 0 { 9.0 } else { 6.0 };
         let width = r.width() - pad * 2.0;
-        let name = label_for(snapshot, tile);
+        let name = label_variants(snapshot, tile);
         let size = style::bytes(size_of(snapshot, tile.id as usize, allocated));
         let top = r.min + vec2(pad, if tile.depth == 0 { 7.0 } else { 4.0 });
         let name_font = style::semibold(if tile.depth == 0 { 12.5 } else { 11.0 });
         if two_lines {
-            let galley = fit(painter, name, name_font, ink, width);
+            let galley = fitting_label(painter, name, name_font, ink, width);
             painter.galley(top, galley, ink);
             let galley = fit(painter, size, style::regular(11.0), ink_dim, width);
             painter.galley(top + vec2(0.0, 16.0), galley, ink_dim);
         } else {
-            let galley = fit(painter, name, name_font, ink, width - 50.0);
+            let galley = fitting_label(painter, name, name_font, ink, width - 50.0);
             let name_w = galley.size().x;
             painter.galley(top, galley, ink);
             if width - name_w > 46.0 {

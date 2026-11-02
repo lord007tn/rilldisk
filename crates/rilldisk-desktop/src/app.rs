@@ -915,13 +915,15 @@ impl RillApp {
         ui.horizontal(|ui| {
             ui.set_height(34.0);
             ui.spacing_mut().item_spacing.x = 2.0;
-            ui.add_enabled_ui(self.zoom != 0, |ui| {
+            // Only Explore is scoped to a folder; elsewhere the root is shown.
+            let zoom = if self.tab == Tab::Explore { self.zoom } else { 0 };
+            ui.add_enabled_ui(zoom != 0, |ui| {
                 if w::icon_button(ui, Icon::Back, "Up one level (Backspace)").clicked() {
                     actions.push(Action::Up);
                 }
             });
             ui.add_space(4.0);
-            let chain = ancestors(snapshot, self.zoom);
+            let chain = ancestors(snapshot, zoom);
             let n = chain.len();
             for (i, &id) in chain.iter().enumerate() {
                 if n > 5 && i > 0 && i < n - 3 {
@@ -2816,7 +2818,7 @@ impl RillApp {
                     );
                     p.rect_filled(badge, 8, class.color());
                     let label = if t.extension.is_empty() {
-                        "NONE".into()
+                        "—".into()
                     } else {
                         t.extension.to_uppercase()
                     };
@@ -2920,8 +2922,11 @@ impl RillApp {
         };
         ui.label(
             RichText::new(format!(
-                "{} matches for “{}”{}",
-                style::count(hits.len() as u64),
+                "{} for “{}”{}",
+                match hits.len() {
+                    1 => "1 match".to_string(),
+                    n => format!("{} matches", style::count(n as u64)),
+                },
                 query,
                 if hits.len() >= 1000 {
                     ", the 1,000 largest shown"
