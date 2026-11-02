@@ -27,12 +27,89 @@ const MAX_CHECKSUMS: u64 = 1 << 20;
 pub enum InstallSource {
     /// Unpacked from a release archive: RillDisk may replace its own files.
     Standalone,
-    /// Owned by a package manager or a source build: never modified; the user
-    /// is told which command updates it instead.
+    /// Owned by a package manager, an installer or a source build: never
+    /// modified; the user is told which command updates it instead.
     Managed {
         manager: &'static str,
         command: &'static str,
+        /// Set when one of RillDisk's own release packages installed it, so
+        /// the matching new package can be offered as a download.
+        package: Option<Package>,
     },
+}
+
+/// File the MSI, .deb, .rpm and AppImage packages install to record how
+/// RillDisk was installed. It holds one word: `msi`, `deb`, `rpm` or
+/// `appimage`. Looked for next to the executable (MSI) and in
+/// `../share/rilldisk/` (Linux packages, whose binaries live in `usr/bin`).
+pub const INSTALL_MARKER: &str = "installed-by";
+
+/// A RillDisk release package that installed the running copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Package {
+    /// Windows Installer package, `RillDisk-<version>-<arch>.msi`.
+    Msi,
+    /// Debian and Ubuntu package, `rilldisk_<version>_<arch>.deb`.
+    Deb,
+    /// Fedora, RHEL and openSUSE package, `rilldisk-<version>-1.<arch>.rpm`.
+    Rpm,
+    /// Portable Linux desktop app, `RillDisk-<version>-<arch>.AppImage`.
+    AppImage,
+    /// `RillDisk.app` from `RillDisk-<version>-<arch>.dmg`.
+    MacApp,
+}
+
+impl Package {
+    /// `kind` of the matching files in the `latest.yml` feed.
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::Msi => "msi",
+            Self::Deb => "deb",
+            Self::Rpm => "rpm",
+            Self::AppImage => "appimage",
+            Self::MacApp => "dmg",
+        }
+    }
+
+    fn from_marker(text: &str) -> Option<Self> {
+        match text.trim() {
+            "msi" => Some(Self::Msi),
+            "deb" => Some(Self::Deb),
+            "rpm" => Some(Self::Rpm),
+            "appimage" => Some(Self::AppImage),
+            _ => None,
+        }
+    }
+
+    fn source(self) -> InstallSource {
+        let (manager, command) = match self {
+            Self::Msi => (
+                "the RillDisk installer (MSI)",
+                "download and run the new RillDisk .msi; it upgrades this installation in place",
+            ),
+            Self::Deb => (
+                "the RillDisk .deb package",
+                "download the new .deb, then: sudo apt install ./rilldisk_*.deb",
+            ),
+            Self::Rpm => (
+                "the RillDisk .rpm package",
+                "download the new .rpm, then: sudo dnf install ./rilldisk-*.rpm (zypper install on openSUSE)",
+            ),
+            Self::AppImage => (
+                "the RillDisk AppImage",
+                "download the new AppImage and replace this one",
+            ),
+            Self::MacApp => (
+                "the RillDisk app bundle",
+                "download the new .dmg and drag RillDisk to Applications",
+            ),
+        };
+        InstallSource::Managed {
+            manager,
+            command,
+            package: Some(self),
+        }
+    }
 }
 
 /// Classify the installation from the executable path. Packagers can also set
@@ -44,9 +121,33 @@ pub fn detect_install(exe: &Path) -> InstallSource {
             manager,
             command: option_env!("RILLDISK_UPDATE_COMMAND")
                 .unwrap_or("update RillDisk with the package manager that installed it"),
+            package: None,
         };
     }
+    if let Some(package) = package_marker(exe) {
+        return package.source();
+    }
     detect_from_path(exe)
+}
+
+/// The release package recorded by an [`INSTALL_MARKER`] near `exe`.
+fn package_marker(exe: &Path) -> Option<Package> {
+    let dir = exe.parent()?;
+    [
+        dir.join(INSTALL_MARKER),
+        dir.join("../share/rilldisk").join(INSTALL_MARKER),
+    ]
+    .iter()
+    .find_map(|marker| {
+        // A marker is one word; never read more than a few bytes of anything.
+        let mut text = String::new();
+        std::io::Read::read_to_string(
+            &mut std::io::Read::take(fs::File::open(marker).ok()?, 64),
+            &mut text,
+        )
+        .ok()?;
+        Package::from_marker(&text)
+    })
 }
 
 fn detect_from_path(exe: &Path) -> InstallSource {
@@ -54,8 +155,14 @@ fn detect_from_path(exe: &Path) -> InstallSource {
         .to_string_lossy()
         .replace('\\', "/")
         .to_ascii_lowercase();
-    let managed = |manager, command| InstallSource::Managed { manager, command };
-    if path.contains("/scoop/apps/") {
+    let managed = |manager, command| InstallSource::Managed {
+        manager,
+        command,
+        package: None,
+    };
+    if path.contains(".app/contents/macos/") {
+        Package::MacApp.source()
+    } else if path.contains("/scoop/apps/") {
         managed("Scoop", "scoop update rilldisk")
     } else if path.contains("/winget/packages/") || path.contains("/windowsapps/") {
         managed("winget", "winget upgrade rilldisk")
@@ -171,7 +278,10 @@ pub fn install(
 ) -> Result<Installed> {
     // Package-managed files are never modified, whoever calls this.
     for binary in &plan.binaries {
-        if let InstallSource::Managed { manager, command } = detect_install(binary) {
+        if let InstallSource::Managed {
+            manager, command, ..
+        } = detect_install(binary)
+        {
             anyhow::bail!(
                 "{} is managed by {manager}; update it with: {command}",
                 binary.display()
@@ -374,6 +484,10 @@ mod tests {
             (r"C:\Tools\RillDisk\rilldisk.exe", None),
             ("/home/me/apps/rilldisk-v0.3.0/rilldisk", None),
             ("/usr/local/bin/rilldisk", None),
+            (
+                "/Applications/RillDisk.app/Contents/MacOS/rilldisk-desktop",
+                Some("the RillDisk app bundle"),
+            ),
         ];
         for (path, expected) in cases {
             let got = match detect_from_path(Path::new(path)) {
@@ -382,6 +496,38 @@ mod tests {
             };
             assert_eq!(got, expected, "{path}");
         }
+    }
+
+    #[test]
+    fn package_markers() {
+        let root = tempfile::tempdir().unwrap();
+        // MSI layout: the marker sits next to the executables.
+        let msi = root.path().join("Program Files/RillDisk");
+        fs::create_dir_all(&msi).unwrap();
+        fs::write(msi.join(INSTALL_MARKER), "msi\r\n").unwrap();
+        // .deb / .rpm / AppImage layout: usr/bin + usr/share/rilldisk.
+        let usr = root.path().join("AppDir/usr");
+        fs::create_dir_all(usr.join("bin")).unwrap();
+        fs::create_dir_all(usr.join("share/rilldisk")).unwrap();
+        fs::write(
+            usr.join("share/rilldisk").join(INSTALL_MARKER),
+            "appimage\n",
+        )
+        .unwrap();
+        let unknown = root.path().join("odd");
+        fs::create_dir_all(&unknown).unwrap();
+        fs::write(unknown.join(INSTALL_MARKER), "something else").unwrap();
+        let package = |exe: PathBuf| match detect_install(&exe) {
+            InstallSource::Managed { package, .. } => package,
+            InstallSource::Standalone => None,
+        };
+        assert_eq!(package(msi.join(exe_name("rilldisk"))), Some(Package::Msi));
+        assert_eq!(
+            package(usr.join("bin").join(exe_name("rilldisk-desktop"))),
+            Some(Package::AppImage)
+        );
+        assert_eq!(package(unknown.join(exe_name("rilldisk"))), None);
+        assert_eq!(Package::MacApp.kind(), "dmg");
     }
 
     #[test]

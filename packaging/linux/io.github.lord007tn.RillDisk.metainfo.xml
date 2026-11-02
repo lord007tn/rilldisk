@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata: software centers (GNOME Software, Discover) read this. -->
+<component type="desktop-application">
+  <id>io.github.lord007tn.RillDisk</id>
+  <name>RillDisk</name>
+  <summary>See what fills your disks and what you can safely free</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>AGPL-3.0-only</project_license>
+  <developer id="io.github.lord007tn">
+    <name>RillDisk contributors</name>
+  </developer>
+  <description>
+    <p>
+      RillDisk is a fast, read-only disk usage analyzer. It scans a drive or folder,
+      shows where the space went as a treemap or rings chart, and points out build
+      output, caches, old worktrees and other things you can safely remove, each
+      with an explanation and a command you can run yourself.
+    </p>
+    <p>
+      It never deletes, moves or uploads anything. Partial scans and unreadable
+      folders stay visible, and logical, unique and allocated sizes are kept apart.
+      The same scanner powers the rilldisk command line and a local MCP server for
+      AI assistants.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.lord007tn.RillDisk.desktop</launchable>
+  <url type="homepage">https://github.com/lord007tn/rilldisk</url>
+  <url type="bugtracker">https://github.com/lord007tn/rilldisk/issues</url>
+  <url type="vcs-browser">https://github.com/lord007tn/rilldisk</url>
+  <screenshots>
+    <screenshot type="default">
+      <caption>Overview of a scanned drive</caption>
+      <image>https://raw.githubusercontent.com/lord007tn/rilldisk/main/docs/media/overview.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Cleanup suggestions with the reason and command for each</caption>
+      <image>https://raw.githubusercontent.com/lord007tn/rilldisk/main/docs/media/cleanup.png</image>
+    </screenshot>
+  </screenshots>
+  <provides>
+    <binary>rilldisk</binary>
+    <binary>rilldisk-desktop</binary>
+  </provides>
+  <categories>
+    <category>System</category>
+    <category>Utility</category>
+  </categories>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="@VERSION@" date="@DATE@">
+      <url type="details">https://github.com/lord007tn/rilldisk/releases/tag/v@VERSION@</url>
+    </release>
+  </releases>
+</component>

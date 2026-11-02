@@ -5,14 +5,17 @@ Package one target after `cargo build --release --target TARGET`:
     python scripts/package_release.py package --target x86_64-pc-windows-msvc \
         --tag v0.3.0 --commit "$(git rev-parse HEAD)" --out dist
 
-Then, with every target's output in one folder, write SHA256SUMS and the
-release-wide BUILD-MANIFEST.json and the latest.yml update feed:
+Installers (MSI, .deb, .rpm, AppImage, .dmg) are built from that archive by
+scripts/package_installers.py. Then, with every target's output in one
+folder, write SHA256SUMS, the release-wide BUILD-MANIFEST.json and the
+latest.yml update feed:
 
     python scripts/package_release.py finalize --tag v0.3.0 --commit SHA --out dist
 
 Archives are named `rilldisk-<tag>-<target>.zip` (Windows, flat) or
 `.tar.gz` (macOS/Linux, one top-level folder). `crates/rilldisk-update` looks
-for exactly these names; keep them in sync.
+for exactly these names; keep them in sync. musl targets are static and ship
+the CLI only (no desktop app).
 """
 import argparse
 import datetime
@@ -75,7 +78,12 @@ def exe(name, target):
     return name + (".exe" if "windows" in target else "")
 
 
-def dependency_closure(target):
+def programs(target):
+    """Programs shipped for `target`: static musl builds are CLI-only."""
+    return ("rilldisk",) if target.endswith("-musl") else BINARIES
+
+
+def dependency_closure(target, shipped):
     """Non-dev dependencies of the shipped binaries for `target`."""
     meta = json.loads(subprocess.check_output(
         ["cargo", "metadata", "--format-version", "1", "--locked", "--filter-platform", target],
@@ -83,7 +91,7 @@ def dependency_closure(target):
     packages = {p["id"]: p for p in meta["packages"]}
     nodes = {n["id"]: n for n in meta["resolve"]["nodes"]}
     workspace = set(meta["workspace_members"])
-    stack = [i for i in workspace if packages[i]["name"] in BINARIES]
+    stack = [i for i in workspace if packages[i]["name"] in shipped]
     seen = set()
     while stack:
         current = stack.pop()
@@ -194,9 +202,12 @@ AGPL-3.0-only. Complete source: {SOURCE}/tree/{commit}
 Dependency notices are included under THIRD-PARTY-LICENSES.
 """
     if "windows" in target:
+        arch = "ARM64" if target.startswith("aarch64") else "x64"
         return f"""{title}
 
-Windows x64. Two programs, no installer, no admin rights:
+Windows {arch}. Two programs, no installer, no admin rights. (Prefer an
+installer? RillDisk-{version}-{arch.lower()}.msi on the release page adds a
+Start menu entry and puts `rilldisk` on PATH.)
 
 * `rilldisk-desktop.exe` - the desktop app. Double-click it, then pick a drive or
   press Browse. Press F5 to rescan and Esc to stop.
@@ -211,11 +222,14 @@ From PowerShell in this directory:
 .\\rilldisk.exe mcp --root 'C:\\Users\\YourName'
 ```
 
-Windows SmartScreen may warn because these builds are not code-signed yet.
+Windows SmartScreen may warn because these builds are not code-signed yet:
+choose "More info", then "Run anyway".
 {common_tail}"""
     if "apple" in target:
         arch = "Apple silicon (arm64)" if target.startswith("aarch64") else "Intel (x86_64)"
-        platform_notes = f"""macOS, {arch}. Two programs, no installer:
+        dmg = f"RillDisk-{version}-{'arm64' if target.startswith('aarch64') else 'x64'}.dmg"
+        platform_notes = f"""macOS, {arch}. Two programs, no installer. (Prefer the app? {dmg}
+on the release page holds RillDisk.app.)
 
 * `rilldisk-desktop` - the desktop app.
 * `rilldisk` - the CLI and local MCP server.
@@ -226,12 +240,24 @@ quarantine once from this folder:
 ```sh
 xattr -dr com.apple.quarantine .
 ```"""
+    elif target.endswith("-musl"):
+        arch = target.split("-")[0]
+        platform_notes = f"""Linux {arch}, static (musl). The CLI and local MCP server only, with
+no runtime dependencies at all: Alpine, containers, NAS boxes, old or
+minimal distributions. For the desktop app use the glibc build, the .deb,
+the .rpm or the AppImage.
+
+* `rilldisk` - the CLI and local MCP server."""
     else:
-        platform_notes = """Linux x86_64 (glibc). Two programs, no installer:
+        arch = target.split("-")[0]
+        platform_notes = f"""Linux {arch} (glibc 2.28 or newer: Debian 10+, Ubuntu 20.04+, Fedora,
+RHEL/Rocky/Alma 8+, openSUSE, Arch...). Two programs, no installer (the
+release also has a .deb, an .rpm and an AppImage):
 
 * `rilldisk-desktop` - the desktop app; needs a Wayland or X11 session with
-  OpenGL and libxkbcommon (installed on any desktop distribution).
-* `rilldisk` - the CLI and local MCP server; no runtime dependencies beyond glibc."""
+  OpenGL or Vulkan and libxkbcommon (installed on any desktop distribution).
+* `rilldisk` - the CLI and local MCP server; needs nothing beyond glibc."""
+    desktop_line = "" if target.endswith("-musl") else "\n./rilldisk-desktop"
     return f"""{title}
 
 {platform_notes}
@@ -241,8 +267,7 @@ From a terminal in this directory:
 ```sh
 ./rilldisk reclaim "$HOME"            # worktrees, build output, caches you can free
 ./rilldisk scan /data --format json --output report.json
-./rilldisk mcp --root "$HOME"
-./rilldisk-desktop
+./rilldisk mcp --root "$HOME"{desktop_line}
 ```
 
 `rilldisk drives` lists mounted disks with their capacity; scans stay on one
@@ -292,8 +317,8 @@ def package(args):
     (stage / "THIRD-PARTY-LICENSES").mkdir(parents=True)
 
     docs = rust_docs()
-    inventory, generated = copy_notices(stage, dependency_closure(target), docs)
-    executables = [exe(b, target) for b in BINARIES]
+    inventory, generated = copy_notices(stage, dependency_closure(target, programs(target)), docs)
+    executables = [exe(b, target) for b in programs(target)]
     for name in executables:
         src = bin_dir / name
         if not src.is_file():
@@ -340,7 +365,17 @@ def finalize(args):
     fragments = sorted(out.glob("*.build.json"))
     if not fragments:
         sys.exit(f"no *.build.json in {out}; run `package` for each target first")
-    targets, sums = [], []
+    targets, sums, packages = [], [], []
+    for fragment in sorted(out.glob("*.package.json")):
+        item = json.loads(fragment.read_text(encoding="utf-8"))
+        if item["release_tag"] != args.tag or item["release_commit"] != args.commit:
+            sys.exit(f"{fragment.name} was built for {item['release_tag']} @ {item['release_commit']}")
+        path = out / item["name"]
+        if sha(path) != item["sha256"]:
+            sys.exit(f"{path.name} changed after packaging")
+        sums.append(f"{item['sha256']}  {path.name}")
+        packages.append({k: item[k] for k in ("kind", "target", "name", "sha256", "bytes")})
+        fragment.unlink()
     for fragment in fragments:
         item = json.loads(fragment.read_text(encoding="utf-8"))
         if item["release_tag"] != args.tag or item["release_commit"] != args.commit:
@@ -361,13 +396,14 @@ def finalize(args):
         "source_url": f"{SOURCE}/tree/{args.commit}", "validation_ci": args.ci_url,
         "profile": "release; thin LTO; stripped debug info",
         "targets": sorted(targets, key=lambda t: t["target"]),
+        "packages": sorted(packages, key=lambda p: p["name"]),
     }
     (out / "BUILD-MANIFEST.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    write_feed(out, args.tag, version, manifest["targets"])
+    write_feed(out, args.tag, version, manifest["targets"], manifest["packages"])
     print((out / "SHA256SUMS").read_text(encoding="utf-8"), end="")
 
 
-def write_feed(out, tag, version, targets):
+def write_feed(out, tag, version, targets, packages):
     """latest.yml: the update feed read by `rilldisk update` and the desktop app.
 
     Plain scalars only, so writing it needs no YAML library; parse_feed in
@@ -384,13 +420,19 @@ def write_feed(out, tag, version, targets):
         f"notes: {SOURCE}/releases/tag/{tag}",
         "files:",
     ]
-    for t in targets:
+    files = [(t["target"], "archive", t["archive"], t["archive_sha256"], t["archive_bytes"]) for t in targets]
+    # Installers are offered to copies a package installed; zsync files are
+    # AppImage delta-update metadata, not downloads.
+    files += [(p["target"], p["kind"], p["name"], p["sha256"], p["bytes"])
+              for p in packages if p["kind"] != "zsync"]
+    for target, kind, name, digest, size in files:
         lines += [
-            f"  - target: {t['target']}",
-            f"    name: {t['archive']}",
-            f"    url: {download}/{t['archive']}",
-            f"    sha256: {t['archive_sha256']}",
-            f"    size: {t['archive_bytes']}",
+            f"  - target: {target}",
+            f"    kind: {kind}",
+            f"    name: {name}",
+            f"    url: {download}/{name}",
+            f"    sha256: {digest}",
+            f"    size: {size}",
         ]
     (out / "latest.yml").write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
 

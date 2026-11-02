@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128" role="img" aria-label="RillDisk">
+  <rect width="128" height="128" rx="33" fill="#131B26"/>
+  <rect x="23" y="23" width="47" height="82" rx="9" fill="#30DEC4"/>
+  <rect x="77" y="23" width="28" height="36" rx="8" fill="#3B8DF7"/>
+  <rect x="77" y="65" width="28" height="19" rx="7" fill="#6366F1"/>
+  <rect x="77" y="91" width="28" height="14" rx="6" fill="#C084FC"/>
+</svg>

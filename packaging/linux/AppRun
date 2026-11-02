@@ -1,0 +1,4 @@
+#!/bin/sh
+# AppImage entry point: start the desktop app from inside the image.
+HERE="$(dirname "$(readlink -f "$0")")"
+exec "$HERE/usr/bin/rilldisk-desktop" "$@"

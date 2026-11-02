@@ -157,7 +157,7 @@ progress counters and swaps in a finished `Arc<Snapshot>`.
   one pixel) and hit-tested in polar coordinates.
 * **Views**: Overview, Explore (map or rings plus a virtualized folder list),
   Clean up (virtualized, grouped by category, with a plan that is only ever copied
-  to the clipboard), Largest files, File types, Unread and Search.
+  to the clipboard), Largest files, File types, Issues and Search.
 
 `--capture DIR` runs a scripted tour that injects real pointer events and saves PNG
 frames for documentation, with invented drives in place of the real ones.
@@ -171,8 +171,14 @@ GitHub releases list, picks the newest release on the channel that ships an
 archive for this target, verifies that archive against the release's
 `SHA256SUMS`, and swaps the executables by rename with rollback.
 `.github/workflows/release.yml` and `scripts/package_release.py` produce those
-archives. Scope, privacy and threat model are in
-[proposals/updates.md](proposals/updates.md).
+archives for eight targets (Windows x64/ARM64, macOS Apple silicon/Intel, Linux
+x86_64/aarch64 against glibc 2.28, and static musl CLI builds), and
+`scripts/package_installers.py` turns them into an MSI, `.deb`, `.rpm`,
+AppImage and `.dmg` from `packaging/`. Copies installed by one of those packages
+carry an `installed-by` marker (or live in `RillDisk.app`); the updater leaves
+them alone and links the matching new package from `latest.yml` instead. Scope,
+privacy and threat model are in [proposals/updates.md](proposals/updates.md);
+installation per system is in [INSTALL.md](INSTALL.md).
 
 ## Direct NTFS backend
 

@@ -1,16 +1,24 @@
 # Builds, packages and publishes RillDisk releases.
 #
-# * Push a tag `vX.Y.Z` or `vX.Y.Z-alpha.N` that matches [workspace.package]
-#   version and points at a commit on main: builds every target, writes
-#   SHA256SUMS + BUILD-MANIFEST.json + latest.yml, generates notes with changelogithub,
-#   attests build provenance and publishes the GitHub release. A tag with a
-#   `-suffix` is published as a pre-release.
+# * Push a tag `vX.Y.Z` or `vX.Y.Z-beta.N` that matches [workspace.package]
+#   version and points at a commit on main: builds every target, packages the
+#   archives and installers, tests each installer by installing it, writes
+#   SHA256SUMS + BUILD-MANIFEST.json + latest.yml, generates notes with
+#   changelogithub, attests build provenance and publishes the GitHub release.
+#   A tag with a `-suffix` is published as a pre-release.
 # * Run it manually (workflow_dispatch) on any branch for a dry run: the same
-#   builds, packages and notes are produced as workflow artifacts, nothing is
-#   published.
+#   builds, packages, install tests and notes are produced as workflow
+#   artifacts, nothing is published.
+#
+# What a release contains (see docs/INSTALL.md):
+#   Windows x64, ARM64      .msi installer, portable .zip
+#   macOS Apple silicon, Intel  .dmg with RillDisk.app, .tar.gz
+#   Linux x86_64, aarch64   .deb, .rpm, .AppImage (+ .zsync), .tar.gz (glibc 2.28+)
+#   Linux x86_64, aarch64   static musl .tar.gz with the CLI only
 #
 # No caches are restored here so a release build cannot pick up state written
-# by pull-request runs. No Docker images are built.
+# by pull-request runs. No Docker images are built. Downloaded tools are
+# pinned by version and SHA-256.
 name: Release
 
 on:
@@ -27,6 +35,14 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  WIX_VERSION: 5.0.2
+  ZIG_VERSION: 0.17.0
+  CARGO_ZIGBUILD_VERSION: 0.24.0
+  # Linux builds link against this glibc so one binary runs on Debian 10+,
+  # Ubuntu 20.04+, RHEL/Rocky/Alma 8+, Fedora, openSUSE and Arch.
+  GLIBC_FLOOR: '2.28'
+  APPIMAGETOOL_VERSION: 1.9.1
+  APPIMAGE_RUNTIME_VERSION: '20251108'
 
 jobs:
   plan:
@@ -91,25 +107,53 @@ jobs:
     name: Build ${{ matrix.target }}
     needs: plan
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 75
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-pc-windows-msvc
             os: windows-2025
-            native: true
-          # 22.04 keeps the glibc requirement low (2.35).
+            installers: msi
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+            installers: msi
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-22.04
-            native: true
+            os: ubuntu-24.04
+            zig: true
+            installers: linux
+            appimage_arch: x86_64
+            appimagetool_sha256: ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0
+            runtime_sha256: 2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            zig: true
+            installers: linux
+            appimage_arch: aarch64
+            appimagetool_sha256: f0837e7448a0c1e4e650a93bb3e85802546e60654ef287576f46c71c126a9158
+            runtime_sha256: 00cbdfcf917cc6c0ff6d3347d59e0ca1f7f45a6df1a428a0d6d8a78664d87444
+          # Static, CLI-only: Alpine, containers, NAS boxes, old distributions.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            zig: true
+            cli_only: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            zig: true
+            cli_only: true
           - target: aarch64-apple-darwin
             os: macos-15
-            native: true
-          # Cross-compiled on Apple silicon; the SDK covers both architectures.
+            installers: macos
+            macos_min: '11.0'
           - target: x86_64-apple-darwin
-            os: macos-15
-            native: false
+            os: macos-15-intel
+            installers: macos
+            macos_min: '10.15'
+    env:
+      TARGET: ${{ matrix.target }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_min }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -121,36 +165,180 @@ jobs:
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
-      - if: runner.os == 'Linux'
-        name: Install desktop build dependencies
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libxkbcommon-dev libwayland-dev libx11-dev
-      - name: Build
+      - if: matrix.zig
+        name: Install zig and cargo-zigbuild
         shell: bash
-        run: cargo build --release --locked --target "${{ matrix.target }}" -p rilldisk -p rilldisk-desktop
-      - if: matrix.native
-        name: Smoke test
+        run: python -m pip install "ziglang==$ZIG_VERSION" "cargo-zigbuild==$CARGO_ZIGBUILD_VERSION"
+      - name: Build
         shell: bash
         run: |
           set -euo pipefail
-          bin="target/${{ matrix.target }}/release/rilldisk"
-          if [[ "$RUNNER_OS" == "Windows" ]]; then bin="$bin.exe"; fi
-          "$bin" --version
+          packages=(-p rilldisk)
+          if [[ "${{ matrix.cli_only }}" != "true" ]]; then packages+=(-p rilldisk-desktop); fi
+          if [[ "${{ matrix.zig }}" == "true" ]]; then
+            # gnu targets take a glibc suffix; output still lands in target/$TARGET.
+            zig_target="$TARGET"
+            if [[ "$TARGET" == *-gnu ]]; then zig_target="$TARGET.$GLIBC_FLOOR"; fi
+            cargo zigbuild --release --locked --target "$zig_target" "${packages[@]}"
+          else
+            cargo build --release --locked --target "$TARGET" "${packages[@]}"
+          fi
+      - if: runner.os == 'Linux'
+        name: Check linked libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          for bin in target/$TARGET/release/rilldisk target/$TARGET/release/rilldisk-desktop; do
+            [[ -f "$bin" ]] || continue
+            echo "== $bin"
+            file "$bin"
+            readelf -d "$bin" | grep NEEDED || echo "(static)"
+            newest=$(objdump -T "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1 || true)
+            echo "newest glibc symbol: ${newest:-none}"
+            if [[ -n "$newest" ]] && [[ "$(printf '%s\n' "GLIBC_$GLIBC_FLOOR" "$newest" | sort -V | tail -1)" != "GLIBC_$GLIBC_FLOOR" ]]; then
+              echo "::error::$bin needs $newest, newer than the GLIBC_$GLIBC_FLOOR floor"
+              exit 1
+            fi
+          done
+      - name: Smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="target/$TARGET/release"
+          ext=""; if [[ "$RUNNER_OS" == "Windows" ]]; then ext=".exe"; fi
+          "$dir/rilldisk$ext" --version
+          if [[ "${{ matrix.cli_only }}" != "true" ]]; then "$dir/rilldisk-desktop$ext" --version; fi
           # The opt-out must stop every update request.
           set +e
-          RILLDISK_NO_UPDATE_CHECK=1 "$bin" update --check
+          RILLDISK_NO_UPDATE_CHECK=1 "$dir/rilldisk$ext" update --check
           code=$?
           set -e
           test "$code" -eq 11
-          python scripts/test_mcp.py "$bin"
-      - name: Package
+          python scripts/test_mcp.py "$dir/rilldisk$ext"
+      - name: Package archive
         shell: bash
         env:
-          TAG: ${{ needs.plan.outputs.tag }}
           CI_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
-          python scripts/package_release.py package --target "${{ matrix.target }}" \
+          python scripts/package_release.py package --target "$TARGET" \
             --tag "$TAG" --commit "$GITHUB_SHA" --out dist --ci-url "$CI_URL"
+
+      # ---- Windows: MSI, then install it, use it and uninstall it.
+      - if: matrix.installers == 'msi'
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '8.0.x'
+      - if: matrix.installers == 'msi'
+        name: Build MSI
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet tool install --global wix --version "$WIX_VERSION"
+          export PATH="$HOME/.dotnet/tools:$PATH"
+          wix extension add -g "WixToolset.UI.wixext/$WIX_VERSION" "WixToolset.Util.wixext/$WIX_VERSION"
+          python scripts/package_installers.py msi --target "$TARGET" --tag "$TAG" --commit "$GITHUB_SHA" --out dist
+      - if: matrix.installers == 'msi'
+        name: Test the MSI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = (Get-ChildItem dist\RillDisk-*.msi).FullName
+          $p = Start-Process msiexec -ArgumentList "/i `"$msi`" /qn /norestart /l*v install.log" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content install.log -Tail 60; throw "install failed: $($p.ExitCode)" }
+          $dir = "$env:ProgramFiles\RillDisk"
+          & "$dir\rilldisk.exe" --version
+          & "$dir\rilldisk-desktop.exe" --version
+          if (-not (Test-Path "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\RillDisk.lnk")) { throw 'no Start menu shortcut' }
+          $path = [Environment]::GetEnvironmentVariable('PATH', 'Machine')
+          if (-not ($path -split ';' | Where-Object { $_.TrimEnd('\') -eq $dir })) { throw "PATH lacks $dir" }
+          $check = & "$dir\rilldisk.exe" update --check --format json | ConvertFrom-Json
+          if ($check.managed_by -ne 'the RillDisk installer (MSI)') { throw "managed_by = $($check.managed_by)" }
+          $p = Start-Process msiexec -ArgumentList "/x `"$msi`" /qn /norestart" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "uninstall failed: $($p.ExitCode)" }
+          if (Test-Path "$dir\rilldisk.exe") { throw 'files left after uninstall' }
+          $path = [Environment]::GetEnvironmentVariable('PATH', 'Machine')
+          if ($path -split ';' | Where-Object { $_.TrimEnd('\') -eq $dir }) { throw 'PATH entry left after uninstall' }
+          'MSI install, PATH, shortcut, update detection and uninstall: OK'
+
+      # ---- Linux: .deb, .rpm and AppImage, then install and inspect them.
+      - if: matrix.installers == 'linux'
+        name: Build .deb, .rpm and AppImage
+        shell: bash
+        env:
+          ARCH: ${{ matrix.appimage_arch }}
+          APPIMAGETOOL_SHA256: ${{ matrix.appimagetool_sha256 }}
+          RUNTIME_SHA256: ${{ matrix.runtime_sha256 }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y rpm zsync lintian desktop-file-utils appstream
+          mkdir -p "$RUNNER_TEMP/appimage"
+          tool="$RUNNER_TEMP/appimage/appimagetool"
+          runtime="$RUNNER_TEMP/appimage/runtime"
+          curl -fsSLo "$tool" "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-$ARCH.AppImage"
+          curl -fsSLo "$runtime" "https://github.com/AppImage/type2-runtime/releases/download/$APPIMAGE_RUNTIME_VERSION/runtime-$ARCH"
+          echo "$APPIMAGETOOL_SHA256  $tool" | sha256sum --check --strict
+          echo "$RUNTIME_SHA256  $runtime" | sha256sum --check --strict
+          chmod +x "$tool"
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          python scripts/package_installers.py linux --target "$TARGET" --tag "$TAG" --commit "$GITHUB_SHA" \
+            --out dist --appimagetool "$tool" --appimage-runtime "$runtime"
+      - if: matrix.installers == 'linux'
+        name: Test the .deb, .rpm and AppImage
+        shell: bash
+        run: |
+          set -euo pipefail
+          deb=$(ls dist/rilldisk_*.deb)
+          echo "::group::lintian"
+          lintian --info --no-tag-display-limit "$deb" || true
+          echo "::endgroup::"
+          sudo apt-get install -y "./$deb"
+          rilldisk --version
+          rilldisk-desktop --version
+          desktop-file-validate /usr/share/applications/io.github.lord007tn.RillDisk.desktop
+          appstreamcli validate --no-net /usr/share/metainfo/io.github.lord007tn.RillDisk.metainfo.xml
+          test -f /usr/share/icons/hicolor/256x256/apps/io.github.lord007tn.RillDisk.png
+          managed=$(rilldisk update --check --format json | python -c 'import json,sys; print(json.load(sys.stdin)["managed_by"])')
+          test "$managed" = "the RillDisk .deb package"
+          sudo apt-get remove -y rilldisk
+          if [[ -e /usr/bin/rilldisk || -e /usr/bin/rilldisk-desktop ]]; then echo "::error::files left after removal"; exit 1; fi
+          rpm=$(ls dist/rilldisk-*.rpm)
+          rpm -qpi "$rpm"
+          rpm -qpR "$rpm"
+          rpm -qpl "$rpm" | grep -v THIRD-PARTY
+          rpm -qp --queryformat '%{VERSION}-%{RELEASE}.%{ARCH}\n' "$rpm"
+          appimage=$(ls dist/RillDisk-*.AppImage)
+          APPIMAGE_EXTRACT_AND_RUN=1 "$appimage" --version
+          test -s "$appimage.zsync"
+          echo "deb install/remove, rpm metadata and AppImage launch: OK"
+
+      # ---- macOS: RillDisk.app in a .dmg, then mount it and run from it.
+      - if: matrix.installers == 'macos'
+        name: Build the .dmg
+        shell: bash
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          python scripts/package_installers.py macos --target "$TARGET" --tag "$TAG" --commit "$GITHUB_SHA" --out dist
+      - if: matrix.installers == 'macos'
+        name: Test the .dmg
+        shell: bash
+        run: |
+          set -euo pipefail
+          dmg=$(ls dist/RillDisk-*.dmg)
+          mount=$(hdiutil attach -nobrowse -readonly "$dmg" | tail -1 | cut -f3-)
+          app="$mount/RillDisk.app"
+          plutil -p "$app/Contents/Info.plist" | grep -E 'CFBundleIdentifier|CFBundleShortVersionString|LSMinimumSystemVersion'
+          codesign --verify --deep --strict --verbose=2 "$app"
+          "$app/Contents/MacOS/rilldisk" --version
+          "$app/Contents/MacOS/rilldisk-desktop" --version
+          lipo -archs "$app/Contents/MacOS/rilldisk"
+          managed=$("$app/Contents/MacOS/rilldisk" update --check --format json | python -c 'import json,sys; print(json.load(sys.stdin)["managed_by"])')
+          test "$managed" = "the RillDisk app bundle"
+          test -L "$mount/Applications"
+          hdiutil detach "$mount"
+          echo "dmg mount, signature, app launch and update detection: OK"
+
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-${{ matrix.target }}
@@ -177,13 +365,17 @@ jobs:
           # Read-only token: changelogithub resolves commit authors' GitHub logins.
           GITHUB_TOKEN: ${{ github.token }}
           TAG: ${{ needs.plan.outputs.tag }}
+          VERSION: ${{ needs.plan.outputs.version }}
           PUBLISH: ${{ needs.plan.outputs.publish }}
         run: |
           set -euo pipefail
           to="$TAG"
           if [[ "$PUBLISH" != "true" ]]; then to="$GITHUB_SHA"; fi
           # --output writes the markdown and skips changelogithub's own release creation.
-          npx --yes changelogithub@15.0.5 --to "$to" --output release-notes.md
+          npx --yes changelogithub@15.0.5 --to "$to" --output changes.md
+          # Downloads table first, then the generated changelog.
+          sed "s/{version}/$VERSION/g; s/{tag}/$TAG/g" .github/release-downloads.md > release-notes.md
+          cat changes.md >> release-notes.md
           cat release-notes.md >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -214,7 +406,13 @@ jobs:
           set -euo pipefail
           python3 scripts/package_release.py finalize --tag "$TAG" --commit "$GITHUB_SHA" --out dist --ci-url "$CI_URL"
           (cd dist && sha256sum --check --strict SHA256SUMS)
-          test "$(ls dist/rilldisk-* | wc -l)" -eq 4
+          # 8 archives; 2 each of .msi, .deb, .rpm, .AppImage, .AppImage.zsync, .dmg.
+          count() { ls dist/$1 2>/dev/null | wc -l; }
+          for pattern in 'rilldisk-v*.zip:2' 'rilldisk-v*.tar.gz:6' 'RillDisk-*.msi:2' 'rilldisk_*.deb:2' \
+                         'rilldisk-*.rpm:2' 'RillDisk-*.AppImage:2' 'RillDisk-*.AppImage.zsync:2' 'RillDisk-*.dmg:2'; do
+            n=$(count "${pattern%%:*}")
+            if [[ "$n" -ne "${pattern##*:}" ]]; then echo "::error::expected ${pattern##*:} of ${pattern%%:*}, found $n"; exit 1; fi
+          done
           {
             echo "### Release assets"
             echo '```'
@@ -255,10 +453,12 @@ jobs:
           path: notes
       - name: Verify checksums
         run: cd dist && sha256sum --check --strict SHA256SUMS
-      # Verify with: gh attestation verify <archive> --repo lord007tn/rilldisk
+      # Verify with: gh attestation verify <file> --repo lord007tn/rilldisk
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: dist/rilldisk-*
+          subject-path: |
+            dist/rilldisk*
+            dist/RillDisk*
       - name: Create release
         shell: bash
         env:
@@ -273,4 +473,4 @@ jobs:
           # gh uploads every asset to a draft and publishes only when all are
           # attached, so updaters never see a release without SHA256SUMS or the
           # latest.yml feed that releases/latest/download/latest.yml serves.
-          gh release create "$TAG" "${flags[@]}" dist/rilldisk-* dist/SHA256SUMS dist/BUILD-MANIFEST.json dist/latest.yml
+          gh release create "$TAG" "${flags[@]}" dist/*

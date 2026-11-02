@@ -43,6 +43,11 @@ pub struct Release {
     /// Set when a package manager owns this install: show this command
     /// instead of an install button. `install_and_restart` refuses then.
     pub update_command: Option<String>,
+    /// Who owns this install, e.g. "the RillDisk installer (MSI)".
+    pub managed_by: Option<String>,
+    /// Direct download of the matching new package (MSI, .deb, .rpm,
+    /// AppImage or .dmg) when one of RillDisk's own packages installed this.
+    pub download_url: Option<String>,
     /// Set when this copy cannot replace itself (for example a renamed program):
     /// show this instead of an install button.
     pub blocked: Option<String>,
@@ -142,8 +147,18 @@ fn check_now(trigger: Trigger) -> Result<Option<Release>, String> {
         let _ = state.save();
     }
     let mut blocked = None;
+    let mut managed_by = None;
+    let mut package = None;
     let update_command = match install_source() {
-        InstallSource::Managed { command, .. } => Some(command.to_owned()),
+        InstallSource::Managed {
+            manager,
+            command,
+            package: kind,
+        } => {
+            managed_by = Some(manager.to_owned());
+            package = kind;
+            Some(command.to_owned())
+        }
         InstallSource::Standalone => {
             match Plan::for_current_exe() {
                 Ok(plan) => up::cleanup_previous_update(&plan.dir),
@@ -162,7 +177,12 @@ fn check_now(trigger: Trigger) -> Result<Option<Release>, String> {
     Ok(check.update.map(|inner| Release {
         version: inner.version.to_string(),
         notes_url: inner.notes_url.clone(),
+        download_url: package
+            .zip(up::target())
+            .and_then(|(package, target)| inner.package_asset(package.kind(), target))
+            .map(|asset| asset.url.clone()),
         update_command,
+        managed_by,
         blocked,
         inner,
     }))

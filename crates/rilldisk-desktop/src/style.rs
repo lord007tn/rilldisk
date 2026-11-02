@@ -808,44 +808,16 @@ pub fn plural(n: u64, word: &str) -> String {
     format!("{} {word}{}", count(n), if n == 1 { "" } else { "s" })
 }
 
-/// Procedural app icon: a rounded tile with four soft treemap blocks.
-pub fn icon(size: u32) -> egui::IconData {
-    let mut rgba = vec![0_u8; (size * size * 4) as usize];
-    let s = size as f32;
-    let blocks: [(f32, f32, f32, f32, Color32); 4] = [
-        (0.17, 0.17, 0.56, 0.83, Color32::from_rgb(48, 222, 196)),
-        (0.60, 0.17, 0.83, 0.47, Color32::from_rgb(59, 141, 247)),
-        (0.60, 0.51, 0.83, 0.68, Color32::from_rgb(139, 92, 246)),
-        (0.60, 0.72, 0.83, 0.83, Color32::from_rgb(192, 132, 252)),
-    ];
-    let rounded = |fx: f32, fy: f32, x0: f32, y0: f32, x1: f32, y1: f32, r: f32| {
-        let cx = fx.clamp(x0 + r, x1 - r);
-        let cy = fy.clamp(y0 + r, y1 - r);
-        ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt() <= r
-            && fx >= x0
-            && fx <= x1
-            && fy >= y0
-            && fy <= y1
-    };
-    for y in 0..size {
-        for x in 0..size {
-            let (fx, fy) = ((x as f32 + 0.5) / s, (y as f32 + 0.5) / s);
-            if !rounded(fx, fy, 0.0, 0.0, 1.0, 1.0, 0.22) {
-                continue;
-            }
-            let mut color = Color32::from_rgb(11, 16, 24);
-            for (x0, y0, x1, y1, c) in blocks {
-                if rounded(fx, fy, x0, y0, x1, y1, 0.05) {
-                    color = c;
-                }
-            }
-            let i = ((y * size + x) * 4) as usize;
-            rgba[i..i + 4].copy_from_slice(&[color.r(), color.g(), color.b(), 255]);
-        }
-    }
+/// The app icon (packaging/icons, rendered by scripts/make_icons.py), shown in
+/// the title bar and taskbar.
+pub fn icon() -> egui::IconData {
+    let png = include_bytes!("../../../packaging/icons/rilldisk-256.png");
+    let image = image::load_from_memory_with_format(png, image::ImageFormat::Png)
+        .expect("bundled icon is a valid PNG")
+        .into_rgba8();
     egui::IconData {
-        rgba,
-        width: size,
-        height: size,
+        width: image.width(),
+        height: image.height(),
+        rgba: image.into_raw(),
     }
 }

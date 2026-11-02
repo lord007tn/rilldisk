@@ -2,7 +2,7 @@
 //! Offline tests: synthetic GitHub responses and archives built in-process.
 
 use rilldisk_update::{
-    Channel, Plan, Release, apply_archive, archive_name, parse_releases, parse_sha256sums,
+    Channel, Package, Plan, Release, apply_archive, archive_name, parse_releases, parse_sha256sums,
     select_update, sha256_hex, verify_sha256,
 };
 use semver::Version;
@@ -316,6 +316,39 @@ fn the_yaml_feed_describes_an_installable_release_with_checksums() {
         WINDOWS,
     );
     assert_eq!(newer.map(|r| r.tag.as_str()), Some("v0.1.0"));
+}
+
+#[test]
+fn the_feed_lists_installers_for_copies_a_package_installed() {
+    let release =
+        rilldisk_update::parse_feed(include_bytes!("fixtures/latest-packages.yml")).unwrap();
+    // Archives stay self-updatable; installers are offered as downloads.
+    assert!(release.installable_for(WINDOWS));
+    let msi = release.package_asset("msi", WINDOWS).unwrap();
+    assert_eq!(msi.name, "RillDisk-0.1.1-x64.msi");
+    assert_eq!(
+        release.checksums["RillDisk-0.1.1-x64.msi"],
+        "2f343b0931126a20f133d67c2b018a3b5c3a3ca7ff2b4f2e0f8a3e1b8e2c1d3a"
+    );
+    let deb = release
+        .package_asset(Package::Deb.kind(), "aarch64-unknown-linux-gnu")
+        .unwrap();
+    assert!(deb.url.ends_with("/v0.1.1/rilldisk_0.1.1_arm64.deb"));
+    // No package of another kind or for another target is made up.
+    assert!(release.package_asset("deb", LINUX).is_none());
+    assert!(release.package_asset("rpm", WINDOWS).is_none());
+
+    // A package entry must say which target it was built for.
+    let feed = String::from_utf8(include_bytes!("fixtures/latest-packages.yml").to_vec())
+        .unwrap()
+        .replace("\r\n", "\n");
+    let untargeted = feed.replacen(
+        "  - target: aarch64-unknown-linux-gnu\n    kind: deb",
+        "  - kind: deb",
+        1,
+    );
+    assert_ne!(untargeted, feed);
+    assert!(rilldisk_update::parse_feed(untargeted.as_bytes()).is_err());
 }
 
 #[test]
