@@ -31,8 +31,9 @@ The screenshots/recording below are cropped to the bottom control.
 
 The separate native helper probe uses the published, checksum-verified 0.1.1 MSI
 for a same-version repair. The first probe exposed a renamed-MSI repair failure (1603); staging now keeps
-the original filename. The follow-up probe is awaiting Windows consent at PR
-preparation. A forward upgrade to 0.1.2 and the original window's
+the original filename. Windows consent was declined in the follow-up probe; the helper returned an
+explicit failure receipt without installing. Successful repair/upgrade acceptance
+remains unverified. A forward upgrade to 0.1.2 and the original window's
 close/relaunch cycle require the published 0.1.2 artifact and remain release
 acceptance steps. A staged installer retains its original release filename,
 which Windows Installer needs for repair/source registration.
