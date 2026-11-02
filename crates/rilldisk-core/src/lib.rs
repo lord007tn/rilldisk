@@ -75,8 +75,9 @@ pub struct Entry {
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum IssueKind {
-    /// The OS refused access (Windows `ERROR_ACCESS_DENIED`, Unix `EACCES`/`EPERM`).
-    /// Administrator rights or, on macOS, Full Disk Access usually help.
+    /// The OS refused access (Windows `ERROR_ACCESS_DENIED`,
+    /// `ERROR_NETWORK_ACCESS_DENIED`; Unix `EACCES`/`EPERM`). Administrator rights
+    /// usually help; on macOS, `EPERM` may need Full Disk Access instead.
     AccessDenied,
     /// The path disappeared between listing and reading.
     NotFound,
@@ -109,8 +110,9 @@ impl IssueKind {
     pub fn from_raw_os_error(code: i32) -> Option<Self> {
         if cfg!(windows) {
             match code {
-                // ERROR_ACCESS_DENIED, ERROR_PRIVILEGE_NOT_HELD
-                5 | 1314 => Some(Self::AccessDenied),
+                // ERROR_ACCESS_DENIED, ERROR_NETWORK_ACCESS_DENIED,
+                // ERROR_PRIVILEGE_NOT_HELD
+                5 | 65 | 1314 => Some(Self::AccessDenied),
                 // ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND
                 2 | 3 => Some(Self::NotFound),
                 // ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
@@ -138,7 +140,8 @@ pub struct ScanIssue {
     pub kind: IssueKind,
     pub message: String,
     /// The raw OS error code, when the issue came from the OS. On macOS, `1`
-    /// (`EPERM`) on a folder usually means privacy protection (Full Disk Access).
+    /// (`EPERM`) on a folder usually means privacy protection (Full Disk Access may
+    /// lift it), or the sandbox of the app that started this process.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub os_error: Option<i32>,
 }
@@ -191,7 +194,8 @@ pub fn is_elevated() -> bool {
 }
 
 /// Whether `program` is an executable file in a `PATH` directory that this user
-/// may run (Unix `access(X_OK)`), for offering `sudo` or `pkexec`.
+/// may run (Unix `access(X_OK)`; Windows: a file with a `PATHEXT` extension), for
+/// offering `sudo` or `pkexec`.
 pub fn executable_on_path(program: &str) -> bool {
     platform::executable_on_path(program)
 }
@@ -233,8 +237,9 @@ pub struct Summary {
     /// could not be examined. Rerunning elevated usually reads these folders.
     pub access_denied_count: u64,
     /// macOS only: the part of `access_denied_count` refused with `EPERM`, which
-    /// privacy protection returns even to root (Full Disk Access lifts it).
-    /// Counted over all issues; always 0 on other platforms.
+    /// privacy protection returns even to root. Full Disk Access usually lifts it;
+    /// it does not lift the sandbox of a sandboxed parent app, which also returns
+    /// `EPERM`. Counted over all issues; always 0 on other platforms.
     pub privacy_denied_count: u64,
     pub issues: Vec<ScanIssue>,
     pub cancelled: bool,
@@ -802,9 +807,12 @@ fn prepare(root: &Path, options: &ScanOptions) -> Result<(PathBuf, PathBuf)> {
     if options.max_entries == 0 {
         bail!("max_entries must be greater than zero");
     }
-    let verbatim = root
-        .canonicalize()
-        .with_context(|| format!("cannot open {}", root.display()))?;
+    // Walk with the canonical (verbatim `\\?\`) path so names ending in a dot or a
+    // space and reserved device names open exactly; report the familiar form.
+    let verbatim = root.canonicalize().map_err(|error| {
+        let hint = root_denied_hint(&error);
+        anyhow::Error::new(error).context(format!("cannot open {}{hint}", root.display()))
+    })?;
     let root = simplify(verbatim.clone());
     if !verbatim.is_dir() {
         bail!("scan root must be a directory");
@@ -1219,14 +1227,32 @@ pub(crate) fn unix_ms(time: SystemTime) -> Option<u64> {
         .map(|d| d.as_millis() as u64)
 }
 
+/// Guidance for a scan root that could not be opened at all, so there is no
+/// summary to count the denial in: the same routes the issue guidance names.
+fn root_denied_hint(error: &io::Error) -> &'static str {
+    if IssueKind::of(error) != IssueKind::AccessDenied {
+        ""
+    } else if cfg!(target_os = "macos") && error.raw_os_error() == Some(1) {
+        " (access denied: macOS privacy protection, which Full Disk Access may lift, or the sandbox of the app that started RillDisk)"
+    } else {
+        " (access denied: this folder or a parent cannot be opened by this user; rerunning with administrator rights may read it)"
+    }
+}
+
+/// `(issues, access denied, privacy denied)` that `issue` adds to the counts.
+fn issue_counts(issue: &ScanIssue) -> (u64, u64, u64) {
+    let denied = issue.kind == IssueKind::AccessDenied;
+    let privacy = cfg!(target_os = "macos") && denied && issue.os_error == Some(1);
+    (1, u64::from(denied), u64::from(privacy))
+}
+
 fn add_issue(summary: &mut Summary, mut issue: ScanIssue) {
     issue.path = simplify(issue.path);
-    summary.issue_count += 1;
-    let denied = issue.kind == IssueKind::AccessDenied;
-    summary.access_denied_count += u64::from(denied);
-    // Recorded before the cap below, so it holds even when the issue is not listed.
-    summary.privacy_denied_count +=
-        u64::from(cfg!(target_os = "macos") && denied && issue.os_error == Some(1));
+    // Counted before the cap below, so they hold even when the issue is not listed.
+    let (issues, denied, privacy) = issue_counts(&issue);
+    summary.issue_count += issues;
+    summary.access_denied_count += denied;
+    summary.privacy_denied_count += privacy;
     if summary.issues.len() < 100 {
         summary.issues.push(issue);
     }
@@ -1239,6 +1265,12 @@ impl Snapshot {
     /// (ID 0) is never removed. Hard-link flags of remaining entries are kept, so
     /// a file whose other name was removed still counts as shared until the next
     /// scan: figures err on the side of reporting less space.
+    ///
+    /// Listed issues inside a removed subtree are dropped and taken out of
+    /// `issue_count`, `access_denied_count` and `privacy_denied_count`, so the
+    /// denial guidance does not outlive the folders. Issues past the listing cap
+    /// carry no path here and stay counted until the next scan: the counts err on
+    /// the side of offering a rerun.
     pub fn without(&self, removed: &[usize]) -> Snapshot {
         let count = self.entries.len();
         let mut gone = vec![false; count];
@@ -1277,6 +1309,21 @@ impl Snapshot {
             }
         }
         let mut summary = self.summary.clone();
+        let removed_paths: Vec<PathBuf> = tops.iter().map(|&top| self.path(top)).collect();
+        let listed = std::mem::take(&mut summary.issues);
+        for issue in listed {
+            if removed_paths
+                .iter()
+                .any(|path| issue.path.starts_with(path))
+            {
+                let (issues, denied, privacy) = issue_counts(&issue);
+                summary.issue_count = summary.issue_count.saturating_sub(issues);
+                summary.access_denied_count = summary.access_denied_count.saturating_sub(denied);
+                summary.privacy_denied_count = summary.privacy_denied_count.saturating_sub(privacy);
+            } else {
+                summary.issues.push(issue);
+            }
+        }
         let mut new_id = vec![usize::MAX; count];
         let mut kept = Vec::with_capacity(count);
         for (id, mut entry) in entries.into_iter().enumerate() {

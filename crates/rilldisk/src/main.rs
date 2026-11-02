@@ -601,11 +601,11 @@ fn elevation_hint(
         .iter()
         .map(|arg| arg.to_str())
         .collect::<Option<Vec<_>>>()
-        .and_then(|args| rerun_command(&args));
+        .and_then(|args| rerun_command(&args, std::env::current_exe().ok().as_deref()));
     Some(hint_text(count, privacy, command.as_deref(), output))
 }
 
-const FULL_DISK_ACCESS: &str = "macOS privacy protection needs Full Disk Access for your terminal instead (System Settings > Privacy & Security > Full Disk Access), then a new terminal.";
+const FULL_DISK_ACCESS: &str = "macOS privacy protection usually needs Full Disk Access for your terminal instead (System Settings > Privacy & Security > Full Disk Access), then a new terminal. If the terminal or the app that started rilldisk is sandboxed, its sandbox can also refuse these folders, and Full Disk Access does not lift that.";
 
 fn folders(count: u64) -> String {
     if count == 1 {
@@ -643,11 +643,19 @@ fn hint_text(count: u64, privacy: u64, command: Option<&str>, output: Option<&Pa
 }
 
 /// The command line as run, quoted for a POSIX shell. The program is the path it
-/// was started with, so `./rilldisk` stays runnable under `sudo`.
-fn rerun_command(argv: &[&str]) -> Option<String> {
+/// was started with, so `./rilldisk` stays runnable under `sudo`. A bare name found
+/// through `PATH` becomes `current_exe`, the resolved path, because `sudo` searches
+/// its own `secure_path`, which may not list that directory.
+fn rerun_command(argv: &[&str], current_exe: Option<&Path>) -> Option<String> {
     let (program, args) = argv.split_first()?;
     let program = if program.is_empty() {
         "rilldisk"
+    } else if !program.contains('/')
+        && let Some(exe) = current_exe
+            .filter(|exe| exe.is_file())
+            .and_then(|exe| exe.to_str())
+    {
+        exe
     } else {
         program
     };
@@ -831,16 +839,40 @@ mod tests {
     #[test]
     fn rerun_command_quotes_for_a_shell() {
         assert_eq!(
-            rerun_command(&["rilldisk", "scan", "/", "--format", "table"]).unwrap(),
+            rerun_command(&["rilldisk", "scan", "/", "--format", "table"], None).unwrap(),
             "rilldisk scan / --format table"
         );
         // The program as it was started, so a binary outside PATH still runs.
         assert_eq!(
-            rerun_command(&["./rilldisk", "scan", "/Volumes/My Disk", "it's"]).unwrap(),
+            rerun_command(&["./rilldisk", "scan", "/Volumes/My Disk", "it's"], None).unwrap(),
             r"./rilldisk scan '/Volumes/My Disk' 'it'\''s'"
         );
-        assert_eq!(rerun_command(&["", "scan"]).unwrap(), "rilldisk scan");
-        assert_eq!(rerun_command(&[]), None);
+        assert_eq!(rerun_command(&["", "scan"], None).unwrap(), "rilldisk scan");
+        assert_eq!(rerun_command(&[], None), None);
+    }
+
+    #[test]
+    fn rerun_command_resolves_a_bare_program_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("my rilldisk");
+        std::fs::write(&exe, b"").unwrap();
+        let resolved = exe.to_str().unwrap();
+        // Found through PATH: the resolved path, which sudo's secure_path need not list.
+        assert_eq!(
+            rerun_command(&["rilldisk", "scan", "/"], Some(&exe)).unwrap(),
+            format!("{} scan /", shell_quote(resolved))
+        );
+        // A path as typed stays as typed.
+        assert_eq!(
+            rerun_command(&["./rilldisk", "scan"], Some(&exe)).unwrap(),
+            "./rilldisk scan"
+        );
+        // An executable path that does not exist keeps the name as written.
+        let missing = dir.path().join("gone");
+        assert_eq!(
+            rerun_command(&["rilldisk", "scan"], Some(&missing)).unwrap(),
+            "rilldisk scan"
+        );
     }
 
     #[test]
