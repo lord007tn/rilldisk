@@ -195,3 +195,16 @@ it into a long press), preserved existing pending navigation on scan completion,
 and fixed stale documentation/units assumptions. Local Windows workspace tests,
 Clippy and real stdio MCP acceptance passed; native fixture recording assertions
 passed. Cross-platform CI and release-package acceptance remain separate gates.
+
+PR review follow-up: directory focus now publishes during idle receive cycles,
+and a changed focus bypasses the normal update throttle. Parent is gated until
+published ancestors match the request. Completion uses the entry id directly,
+so non-Unicode names and literal Unix backslashes need no path reconstruction.
+Animated-map clicks retain the pressed id and live-list rows have stable ids.
+Hidden ancestors have an ellipsis menu; MFT browse controls/hints wait for a
+live view. Unix Auto status now identifies the Legacy backend, and reproduction
+commands distinguish the 20,000 default from explicit million-file workloads.
+The native tour asserts deep folder to immediate parent to root. Cleanup review
+of these follow-ups found no additional actionable issues. Windows workspace,
+focused tests, Clippy and real stdio MCP acceptance passed; Unix status has a
+platform-gated regression test for CI.

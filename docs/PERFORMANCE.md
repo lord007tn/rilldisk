@@ -229,7 +229,8 @@ batching and `getattrlistbulk` (not implemented).
 
 ```text
 cargo build --release -p rilldisk-core --examples
-python scripts/benchmark.py target/release/examples                      # generates 1M files (~2.5 GB reserved)
+python scripts/benchmark.py target/release/examples                      # generates 20,000 files
+python scripts/benchmark.py target/release/examples --files 1000000  # reproduce the 1M-file workload
 python scripts/benchmark.py target/release/examples --files 300000 --flush --verify-allocation --require-identical
 python scripts/benchmark.py target/release/examples --path D:\some\tree --backends directory mft   # counts only
 python scripts/benchmark.py target/release/examples --ntfs-image fx.img  # MFT parser without admin

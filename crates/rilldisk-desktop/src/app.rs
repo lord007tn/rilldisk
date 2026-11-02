@@ -387,18 +387,20 @@ impl RillApp {
                 Ok(Ok(data)) => {
                     let long = running.started.elapsed().as_secs() >= 10;
                     let id = running.control.live_focus();
-                    if id != 0
+                    let focus = (id != 0
                         && self.pending_open.is_none()
                         && data
                             .snapshot
                             .entries
                             .get(id)
-                            .is_some_and(|e| e.kind == EntryKind::Directory)
-                    {
-                        self.pending_open = Some(data.snapshot.path(id).display().to_string());
-                    }
+                            .is_some_and(|e| e.kind == EntryKind::Directory))
+                    .then_some(id);
                     self.running = None;
                     self.install(data);
+                    if let Some(id) = focus {
+                        self.zoom = id;
+                        self.tab = Tab::Explore;
+                    }
                     if long && !ctx.input(|i| i.viewport().focused.unwrap_or(true)) {
                         ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
                             egui::UserAttentionType::Informational,
@@ -1219,42 +1221,54 @@ impl RillApp {
             });
         });
         ui.add_space(4.0);
-        ui.horizontal_wrapped(|ui| {
-            let ancestors = view
-                .as_ref()
-                .map(|v| v.ancestors.as_slice())
-                .unwrap_or_default();
-            let go_up = ui
-                .add_enabled(!ancestors.is_empty(), egui::Button::new("← Parent"))
-                .clicked()
-                || (!ui.ctx().egui_wants_keyboard_input()
-                    && ui.input(|i| {
-                        i.key_pressed(Key::Backspace)
-                            || i.pointer.button_pressed(egui::PointerButton::Extra1)
-                    }));
-            if go_up {
-                control.focus_live(ancestors.iter().rev().nth(1).map_or(0, |a| a.0));
-                self.live_anim.reset();
-            }
-            if crumb(ui, &root, false).clicked() {
-                control.focus_live(0);
-                self.live_anim.reset();
-            }
-            let chain = view
-                .as_ref()
-                .map(|v| v.ancestors.as_slice())
-                .unwrap_or_default();
-            for (index, (id, name)) in chain.iter().enumerate() {
-                if chain.len() > 3 && index < chain.len() - 2 {
-                    continue;
-                }
-                crumb_separator(ui);
-                if crumb(ui, name, index == chain.len() - 1).clicked() {
-                    control.focus_live(*id);
+        if view.is_some() {
+            ui.horizontal_wrapped(|ui| {
+                let parent = live::parent(view.as_deref(), control.live_focus());
+                let go_up = ui
+                    .add_enabled(parent.is_some(), egui::Button::new("← Parent"))
+                    .clicked()
+                    || (parent.is_some()
+                        && !ui.ctx().egui_wants_keyboard_input()
+                        && ui.input(|i| {
+                            i.key_pressed(Key::Backspace)
+                                || i.pointer.button_pressed(egui::PointerButton::Extra1)
+                        }));
+                if go_up {
+                    control.focus_live(parent.unwrap_or(0));
                     self.live_anim.reset();
                 }
-            }
-        });
+                if crumb(ui, &root, false).clicked() {
+                    control.focus_live(0);
+                    self.live_anim.reset();
+                }
+                let chain = view
+                    .as_ref()
+                    .map(|v| v.ancestors.as_slice())
+                    .unwrap_or_default();
+                for (index, (id, name)) in chain.iter().enumerate() {
+                    if chain.len() > 3 && index < chain.len() - 2 {
+                        if index == 0 {
+                            crumb_separator(ui);
+                            ui.menu_button("…", |ui| {
+                                for (id, name) in &chain[..chain.len() - 2] {
+                                    if ui.button(name).clicked() {
+                                        control.focus_live(*id);
+                                        self.live_anim.reset();
+                                        ui.close();
+                                    }
+                                }
+                            });
+                        }
+                        continue;
+                    }
+                    crumb_separator(ui);
+                    if crumb(ui, name, index == chain.len() - 1).clicked() {
+                        control.focus_live(*id);
+                        self.live_anim.reset();
+                    }
+                }
+            });
+        }
         ui.label(RichText::new(control.backend_status()).small().color(th.dim))
             .on_hover_text("Auto uses the fast MFT backend for whole NTFS volumes when existing administrator access permits it. Other paths use a directory walk. Standard-access whole-drive scans may be much slower; restart as administrator from Settings before scanning if desired.");
         ui.label(
@@ -1281,7 +1295,7 @@ impl RillApp {
         ui.painter().text(
             egui::pos2(full.left() + 4.0, full.bottom() - 4.0),
             Align2::LEFT_BOTTOM,
-            "Partial sizes grow as folders are read. Click folders to browse; Parent or Backspace goes up. On disk is file allocation, not volume used space.",
+            if view.is_some() { "Partial sizes grow as folders are read. Click folders to browse; Parent or Backspace goes up. On disk is file allocation, not volume used space." } else { "Reading metadata. MFT scans publish folders after table processing; directory scans publish as batches arrive." },
             style::regular(11.5),
             th.faint,
         );

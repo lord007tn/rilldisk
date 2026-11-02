@@ -969,6 +969,7 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
             // Linux and macOS: the descriptor-relative walk measured no faster
             // than `std::fs::read_dir` (docs/PERFORMANCE.md), so it stays opt-in.
             if cfg!(unix) {
+                control.set_backend_status("Legacy directory scan".into());
                 walk_backend = Backend::Legacy;
             }
         }
@@ -1083,6 +1084,9 @@ fn walk(
                         stop = true;
                     }
                     if !stop {
+                        collector
+                            .live
+                            .publish(&control.live, false, control.live_focus());
                         continue;
                     }
                 }

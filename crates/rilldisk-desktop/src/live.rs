@@ -13,12 +13,14 @@ use std::collections::HashMap;
 pub struct Anim {
     rects: HashMap<String, Rect>,
     last_time: Option<f64>,
+    pressed: Option<usize>,
 }
 
 impl Anim {
     pub fn reset(&mut self) {
         self.rects.clear();
         self.last_time = None;
+        self.pressed = None;
     }
 
     /// Move the remembered rect for `key` toward `target`.
@@ -39,6 +41,12 @@ impl Anim {
         );
         *current
     }
+}
+
+/// Navigate only from the view the user actually sees, after it catches up.
+pub fn parent(view: Option<&LiveView>, requested: usize) -> Option<usize> {
+    let ancestors = &view?.ancestors;
+    (ancestors.last()?.0 == requested).then(|| ancestors.iter().rev().nth(1).map_or(0, |a| a.0))
 }
 
 fn value(folder: &LiveFolder, allocated: bool) -> u64 {
@@ -210,10 +218,18 @@ pub fn paint(
         }
     }
     let response = ui.interact(map_rect, ui.scope_id().with("live-map"), Sense::click());
+    if ui.input(|i| i.pointer.primary_pressed()) {
+        anim.pressed = hovered
+            .filter(|_| response.contains_pointer())
+            .map(|(folder, kid)| kid.unwrap_or(folder).id);
+    }
+    if response.clicked() {
+        clicked = anim.pressed.take();
+    }
+    if ui.input(|i| i.pointer.primary_released()) {
+        anim.pressed = None;
+    }
     if let Some((folder, kid)) = hovered {
-        if response.clicked() {
-            clicked = Some(kid.unwrap_or(folder).id);
-        }
         response.on_hover_ui_at_pointer(|ui| {
             let f = kid.unwrap_or(folder);
             let label = match kid {
@@ -243,15 +259,18 @@ pub fn paint(
         .show_rows(&mut list, 22.0, view.folders.len(), |ui, rows| {
             for folder in &view.folders[rows] {
                 if ui
-                    .selectable_label(
-                        false,
-                        format!(
-                            "{}   {}",
-                            folder.name,
-                            style::bytes(value(folder, allocated))
-                        ),
-                    )
-                    .clicked()
+                    .push_id(folder.id, |ui| {
+                        ui.selectable_label(
+                            false,
+                            format!(
+                                "{}   {}",
+                                folder.name,
+                                style::bytes(value(folder, allocated))
+                            ),
+                        )
+                        .clicked()
+                    })
+                    .inner
                 {
                     clicked = Some(folder.id);
                 }
@@ -316,9 +335,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parent_waits_for_current_view_and_moves_exactly_one_level() {
+        let view = LiveView {
+            ancestors: vec![(1, "A".into()), (2, "B".into())],
+            ..Default::default()
+        };
+        assert_eq!(parent(Some(&view), 3), None);
+        assert_eq!(parent(Some(&view), 2), Some(1));
+        let top = LiveView {
+            ancestors: vec![(1, "A".into())],
+            ..Default::default()
+        };
+        assert_eq!(parent(Some(&top), 1), Some(0));
+        assert_eq!(parent(None, 1), None);
+        assert_eq!(parent(Some(&LiveView::default()), 0), None);
+    }
+
+    #[test]
     fn map_click_enters_a_folder_during_scan() {
         let ctx = egui::Context::default();
-        let view = LiveView {
+        let mut view = LiveView {
             folders: vec![LiveFolder {
                 id: 42,
                 name: "Synthetic folder".into(),
@@ -330,6 +366,11 @@ mod tests {
         let mut anim = Anim::default();
         let mut selected = None;
         for pressed in [None, Some(true), Some(false)] {
+            // A publication replaces the tile under the stationary pointer
+            // between press and release; the original folder must still open.
+            if pressed == Some(false) {
+                view.folders[0].id = 43;
+            }
             let pos = pos2(150.0, 150.0);
             let mut input = egui::RawInput {
                 screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 600.0))),

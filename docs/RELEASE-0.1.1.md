@@ -29,3 +29,14 @@ can be recorded. No personal scan inventory is included.
 
 Reproduce with `python scripts/make_demo_fixture.py PATH --scale 0.01`, then
 `rilldisk-desktop PATH --capture OUTPUT --tour navigation --theme light`.
+
+MFT scans do not provide an intermediate folder tree while reading and parsing
+the table. Browse controls and the browse hint appear only once a live view
+exists; directory scans publish as batches arrive. Focus changes also refresh
+during silent directory reads. Parent waits for the requested view to arrive,
+and a map click targets the folder pressed even if its tile moves before release.
+The navigation tour now enters Projects/atlas-web and checks its immediate
+parent before returning to the scan root.
+
+![Deep folder](media/v0.1.1-navigation-deep.png)
+![Immediate parent](media/v0.1.1-navigation-immediate-parent.png)

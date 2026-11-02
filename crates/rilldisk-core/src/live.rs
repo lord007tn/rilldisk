@@ -71,6 +71,7 @@ pub(crate) struct LiveTracker {
     generation: u64,
     last_publish: Instant,
     publish_cost: std::time::Duration,
+    published_focus: usize,
 }
 
 impl LiveTracker {
@@ -82,6 +83,7 @@ impl LiveTracker {
             generation: 0,
             last_publish: Instant::now(),
             publish_cost: std::time::Duration::ZERO,
+            published_focus: 0,
         }
     }
 
@@ -154,7 +156,7 @@ impl LiveTracker {
         // Bound publication to roughly 5% of scan time on a large tree.
         let interval = std::time::Duration::from_millis(PUBLISH_EVERY_MS as u64)
             .max(self.publish_cost.saturating_mul(20));
-        if !force && self.last_publish.elapsed() < interval {
+        if !force && focus == self.published_focus && self.last_publish.elapsed() < interval {
             return;
         }
         let started = Instant::now();
@@ -164,6 +166,7 @@ impl LiveTracker {
             *slot = Some(view);
         }
         self.publish_cost = started.elapsed();
+        self.published_focus = focus;
         self.last_publish = Instant::now();
     }
 
@@ -255,6 +258,18 @@ impl LiveTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn focus_changes_publish_without_new_entries_or_waiting_for_the_interval() {
+        let mut tracker = LiveTracker::new();
+        tracker.add(1, 0, EntryKind::Directory, OsStr::new("folder"), 0, Some(0));
+        let slot = std::sync::Mutex::new(None);
+        tracker.publish(&slot, true, 0);
+        tracker.publish(&slot, false, 1);
+        assert_eq!(slot.lock().unwrap().as_ref().unwrap().ancestors[0].0, 1);
+        tracker.publish(&slot, false, 0);
+        assert!(slot.lock().unwrap().as_ref().unwrap().ancestors.is_empty());
+    }
 
     #[test]
     fn browse_deep_folders_and_return_without_losing_totals() {
