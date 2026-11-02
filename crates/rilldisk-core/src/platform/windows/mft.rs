@@ -44,6 +44,17 @@ const ATTR_STANDARD_INFORMATION: u32 = 0x10;
 const ATTR_ATTRIBUTE_LIST: u32 = 0x20;
 const ATTR_FILE_NAME: u32 = 0x30;
 const ATTR_DATA: u32 = 0x80;
+const ATTR_REPARSE_POINT: u32 = 0xC0;
+
+const TAG_DEDUP: u32 = 0x8000_0013;
+const TAG_WOF: u32 = 0x8000_0017;
+const TAG_PROJFS: u32 = 0x9000_001C;
+/// `IO_REPARSE_TAG_CLOUD` and its 16 variants `0x9000_x01A`.
+const TAG_CLOUD_MASK: u32 = 0xFFFF_0FFF;
+const TAG_CLOUD: u32 = 0x9000_001A;
+
+/// The named stream that holds a WOF-compressed (CompactOS) file's data.
+const WOF_STREAM: &str = "WofCompressedData";
 const ATTR_END: u32 = 0xFFFF_FFFF;
 
 const ATTR_FLAG_COMPRESSED: u16 = 0x0001;
@@ -81,6 +92,8 @@ pub(crate) struct Slot {
     base: u32,
     /// Names (hard links) this record has in listed folders.
     pub links: u16,
+    /// Reparse tag (`IO_REPARSE_TAG_*`) when the record is a reparse point.
+    pub reparse_tag: u32,
     /// Last write time, FILETIME (100 ns since 1601), or 0.
     pub modified: i64,
     pub logical: u64,
@@ -97,6 +110,35 @@ impl Slot {
     pub fn is_reparse(&self) -> bool {
         self.flags & SLOT_REPARSE != 0
     }
+    /// A reparse point that a directory listing shows as one: junctions,
+    /// symlinks, mount points, app execution aliases and the like, which are
+    /// never followed. WOF compression (CompactOS), deduplication, cloud-file
+    /// placeholders (OneDrive) and ProjFS are reparse points too, but their
+    /// filter drivers present them to programs as ordinary files and folders,
+    /// so the walk lists, sizes and enters them; the MFT backend does the same.
+    pub fn is_link(&self) -> bool {
+        self.is_reparse() && !disguised(self.reparse_tag)
+    }
+}
+
+fn disguised(tag: u32) -> bool {
+    matches!(tag, TAG_WOF | TAG_DEDUP | TAG_PROJFS) || tag & TAG_CLOUD_MASK == TAG_CLOUD
+}
+
+/// Whether a non-resident or resident attribute is named `name`.
+fn attribute_named(raw: &[u8], name: &str) -> bool {
+    let (Some(&len), Some(at)) = (raw.get(9), u16_at(raw, 0x0A)) else {
+        return false;
+    };
+    let at = usize::from(at);
+    raw.get(at..at + usize::from(len) * 2).is_some_and(|bytes| {
+        bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
+            .eq(name.encode_utf16())
+    })
 }
 
 /// One (parent, name) link of a record. Hard links have several.
@@ -589,6 +631,11 @@ fn parse_record(record: &mut [u8], index: u64, slot: &mut Slot, chunk: &mut Chun
                 else {
                     continue;
                 };
+                // A reparse point's tag is duplicated here (offset 0x3C), in case
+                // `$REPARSE_POINT` itself is not resident.
+                if slot.flags & SLOT_REPARSE != 0 && slot.reparse_tag == 0 {
+                    slot.reparse_tag = u32_at(value, 0x3C).unwrap_or(0);
+                }
                 // 8.3 aliases name the same link again.
                 if namespace == NAMESPACE_DOS {
                     continue;
@@ -611,7 +658,19 @@ fn parse_record(record: &mut [u8], index: u64, slot: &mut Slot, chunk: &mut Chun
                 if let Some((logical, allocated)) = data_sizes(&attribute) {
                     slot.flags |= SLOT_HAS_DATA;
                     slot.logical = logical;
-                    slot.allocated = allocated;
+                    slot.allocated += allocated;
+                }
+            }
+            // A WOF-compressed file keeps its logical size on the (sparse)
+            // unnamed stream and its data here: count what this stream occupies.
+            ATTR_DATA if attribute_named(attribute.raw, WOF_STREAM) => {
+                if let Some((_, allocated)) = data_sizes(&attribute) {
+                    slot.allocated += allocated;
+                }
+            }
+            ATTR_REPARSE_POINT => {
+                if let Some(tag) = attribute.value.and_then(|v| u32_at(v, 0)) {
+                    slot.reparse_tag = tag;
                 }
             }
             _ => {}
@@ -760,7 +819,7 @@ impl Mft {
                 let target = &mut slots[slot.base as usize];
                 target.flags |= SLOT_HAS_DATA;
                 target.logical = slot.logical;
-                target.allocated = slot.allocated;
+                target.allocated += slot.allocated;
             }
         }
         for name in &mut names {
@@ -1267,6 +1326,77 @@ mod tests {
             disk: Some(0),
         }];
         assert!(read_mapped(&Zeros, &whole, 0, &mut buffer).is_ok());
+    }
+
+    #[test]
+    fn disguised_reparse_points_are_files_and_wof_data_counts() {
+        let reparse = |tag: u32| {
+            let mut v = vec![0_u8; 8];
+            v[0..4].copy_from_slice(&tag.to_le_bytes());
+            resident(ATTR_REPARSE_POINT, &v, &[])
+        };
+        let wof_name: Vec<u16> = WOF_STREAM.encode_utf16().collect();
+        let mut wof_stream = nonresident(0, 0, 61_440, 61_440, 0, &[0x11, 0x0F, 0x20, 0x00]);
+        // Name the stream: grow the header and move the runs.
+        let mut named = wof_stream[..0x48].to_vec();
+        named[9] = wof_name.len() as u8;
+        named[0x0A..0x0C].copy_from_slice(&0x48_u16.to_le_bytes());
+        for c in &wof_name {
+            named.extend_from_slice(&c.to_le_bytes());
+        }
+        while named.len() % 8 != 0 {
+            named.push(0);
+        }
+        let runs_at = named.len();
+        named.extend_from_slice(&[0x11, 0x0F, 0x20, 0x00, 0, 0, 0, 0]);
+        named[0x20..0x22].copy_from_slice(&(runs_at as u16).to_le_bytes());
+        let len = named.len() as u32;
+        named[4..8].copy_from_slice(&len.to_le_bytes());
+        wof_stream = named;
+        let mut r = record(
+            4096,
+            RECORD_IN_USE,
+            1,
+            0,
+            &[
+                standard(FILE_ATTRIBUTE_REPARSE_POINT, 0),
+                file_name(5, 5, 1, "compact.dll"),
+                nonresident(
+                    ATTR_FLAG_SPARSE,
+                    0,
+                    900_000,
+                    900_000,
+                    0,
+                    &[0x01, 0xDC, 0x00],
+                ),
+                wof_stream,
+                reparse(TAG_WOF),
+            ],
+        );
+        let (slot, _) = parse(&mut r, 60);
+        assert!(slot.is_reparse() && !slot.is_link());
+        assert_eq!((slot.logical, slot.allocated), (900_000, 61_440));
+        for (tag, link) in [
+            (0xA000_0003, true),  // junction / mount point
+            (0xA000_000C, true),  // symbolic link
+            (0x8000_001B, true),  // app execution alias
+            (0x9000_101A, false), // OneDrive placeholder
+            (TAG_DEDUP, false),
+            (TAG_PROJFS, false),
+        ] {
+            let mut r = record(
+                1024,
+                RECORD_IN_USE,
+                1,
+                0,
+                &[
+                    standard(FILE_ATTRIBUTE_REPARSE_POINT, 0),
+                    file_name(5, 5, 1, "x"),
+                    reparse(tag),
+                ],
+            );
+            assert_eq!(parse(&mut r, 61).0.is_link(), link, "{tag:#x}");
+        }
     }
 
     #[test]

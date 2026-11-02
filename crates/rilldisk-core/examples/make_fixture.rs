@@ -376,6 +376,38 @@ fn extras(dir: &Path, m: &mut Manifest) {
         m.directories += 1;
         add(path.join("inside.bin"), 5000, m);
     }
+    // Windows: files compressed with WOF (`compact /exe`, as CompactOS does with
+    // system files). Their data lives in a hidden stream behind a reparse point
+    // that directory listings do not show; they must still count as files.
+    let compressed = dir.join("compressed");
+    fs::create_dir(&compressed).unwrap();
+    m.directories += 1;
+    for i in 0..3_u64 {
+        let size = 200_000 + i * 50_000;
+        let text: Vec<u8> = b"rilldisk "
+            .iter()
+            .copied()
+            .cycle()
+            .take(size as usize)
+            .collect();
+        let path = compressed.join(format!("library-{i}.dll"));
+        fs::write(&path, text).unwrap();
+        m.files += 1;
+        m.logical += size;
+        m.unique += size;
+        #[cfg(windows)]
+        {
+            // compact.exe does not accept verbatim (`\\?\`) paths.
+            let done = std::process::Command::new("compact")
+                .args(["/c", "/exe:xpress4k"])
+                .arg(rilldisk_core::simplify(path.clone()))
+                .output()
+                .is_ok_and(|o| o.status.success());
+            if !done {
+                eprintln!("warning: could not WOF-compress {}", path.display());
+            }
+        }
+    }
     // A path well beyond MAX_PATH (260 characters).
     let mut deep = odd.clone();
     for i in 0..12 {

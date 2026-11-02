@@ -763,7 +763,7 @@ fn emit_mft(
     // then build the entries in parallel: names and sizes for millions of
     // entries are the expensive part.
     let kind_of = |slot: &mft::Slot| {
-        if slot.is_reparse() {
+        if slot.is_link() {
             EntryKind::Link
         } else if slot.is_directory() {
             EntryKind::Directory
