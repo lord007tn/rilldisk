@@ -186,6 +186,20 @@ removes folders from a synthetic fixture (a scan with
 `--capture DIR` runs a scripted tour that injects real pointer events and saves PNG
 frames for documentation, with invented drives in place of the real ones.
 
+## Connecting AI clients
+
+`rilldisk-mcp-setup` finds AI clients (Claude Code, Claude Desktop, Codex,
+Cursor, VS Code, Windsurf, Gemini CLI, Zed, OpenCode, Cline), adds or removes
+the `rilldisk` entry in their user config, and checks an entry by starting it
+and doing an MCP `initialize` + `tools/list` handshake over stdio. It has no
+async runtime and no MCP library, so the desktop can depend on it. JSON/JSONC
+configs are edited through a concrete syntax tree (`jsonc-parser`) and TOML
+through `toml_edit`, so comments and formatting survive. Every function takes
+an `Env` (home, app data, PATH) rather than reading the process environment, so
+tests run against temporary folders. The CLI (`rilldisk mcp setup|doctor`) and
+the desktop (`src/assistants.rs`) call it. Scope:
+[proposals/mcp-setup.md](proposals/mcp-setup.md).
+
 ## Updates and releases
 
 `rilldisk-update` is the only crate with network code and depends on nothing

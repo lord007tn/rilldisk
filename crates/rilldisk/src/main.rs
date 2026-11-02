@@ -18,6 +18,7 @@ use std::{
 
 mod cleanup;
 mod mcp;
+mod setup;
 mod update;
 
 #[derive(Parser)]
@@ -91,8 +92,12 @@ enum Command {
         #[arg(long, value_enum, default_value = "table")]
         format: ReportFormat,
     },
-    /// Run the local MCP server over stdio (stdout is reserved for the protocol).
+    /// Run the local MCP server over stdio (stdout is reserved for the protocol),
+    /// or add it to your AI clients (`setup`) and check them (`doctor`).
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
     Mcp {
+        #[command(subcommand)]
+        action: Option<McpAction>,
         /// Explicitly allow scans under this directory. Repeat for more roots.
         #[arg(long, required = true, num_args = 1)]
         root: Vec<PathBuf>,
@@ -122,6 +127,46 @@ enum Command {
         channel: Option<update::ChannelArg>,
         #[arg(long, value_enum, default_value = "table")]
         format: ReportFormat,
+    },
+}
+
+#[derive(Subcommand)]
+enum McpAction {
+    /// Add RillDisk to installed AI clients (Claude Code, Codex, Cursor, VS Code...).
+    /// Shows the exact change and asks before writing; keeps a backup.
+    #[command(
+        after_help = "Clients: claude-code, claude-desktop, codex, cursor, vscode, windsurf, gemini, zed, opencode, cline.
+Only the `rilldisk` entry is written or removed. See docs/MCP.md."
+    )]
+    Setup {
+        /// Client to change. Repeat for more.
+        #[arg(long = "client", value_name = "NAME", conflicts_with = "all")]
+        clients: Vec<String>,
+        /// Every installed client (with --remove: every client that has the entry).
+        #[arg(long)]
+        all: bool,
+        /// Show the changes without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Remove the RillDisk entry instead of adding it.
+        #[arg(long)]
+        remove: bool,
+        /// Apply without asking.
+        #[arg(long, short = 'y', conflicts_with = "dry_run")]
+        yes: bool,
+        /// Directory the server may scan (default: your home folder). Repeat for more.
+        #[arg(long = "root", value_name = "DIR")]
+        roots: Vec<PathBuf>,
+    },
+    /// Show which AI clients are installed and configured, and test each
+    /// configured RillDisk entry with a real MCP handshake. Changes nothing.
+    #[command(after_help = "Exit codes: 0 all configured entries answered, 1 a check failed.")]
+    Doctor {
+        #[arg(long, value_enum, default_value = "table")]
+        format: ReportFormat,
+        /// Seconds to wait for each server.
+        #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=120))]
+        timeout: u64,
     },
 }
 
@@ -174,6 +219,34 @@ async fn main() -> Result<ExitCode> {
             .await
         }
         Command::Mcp {
+            action: Some(action),
+            ..
+        } => {
+            tokio::task::spawn_blocking(move || match action {
+                McpAction::Setup {
+                    clients,
+                    all,
+                    dry_run,
+                    remove,
+                    yes,
+                    roots,
+                } => setup::run_setup(setup::SetupArgs {
+                    clients,
+                    all,
+                    dry_run,
+                    remove,
+                    yes,
+                    roots,
+                }),
+                McpAction::Doctor { format, timeout } => setup::run_doctor(
+                    matches!(format, ReportFormat::Json),
+                    std::time::Duration::from_secs(timeout),
+                ),
+            })
+            .await?
+        }
+        Command::Mcp {
+            action: None,
             root,
             threads,
             max_entries,

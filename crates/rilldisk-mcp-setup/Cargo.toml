@@ -1,0 +1,21 @@
+[package]
+name = "rilldisk-mcp-setup"
+description = "Detect AI clients, add RillDisk to their MCP config and check the connection"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+# Writes other applications' config files and starts processes.
+# See docs/proposals/mcp-setup.md for the exact scope.
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+jsonc-parser = { version = "0.34", features = ["cst", "serde"] }
+toml_edit = "0.25"
+
+[dev-dependencies]
+tempfile = "3"

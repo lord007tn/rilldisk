@@ -203,6 +203,27 @@ cannot delete anything.
 `rilldisk mcp` is a local stdio MCP server. Give it explicit roots; it cannot reach
 anything outside them.
 
+**Connect it in one step.** The desktop's Home page lists the AI clients it finds
+(Claude Code, Claude Desktop, Codex CLI, Cursor, VS Code, Windsurf, Gemini CLI,
+Zed, OpenCode and Cline). **Connect** shows the exact change to the client's
+config before writing it, keeps a backup, then checks the connection with a real
+MCP handshake. **Test** and **Remove** do what they say.
+
+![AI assistants card: detected clients with status, a test result and Connect, Repair, Test and Remove buttons](docs/media/assistants.png)
+
+From a terminal:
+
+```powershell
+rilldisk mcp doctor                          # which clients are installed, configured, and do they answer?
+rilldisk mcp setup --client codex --dry-run  # show the change, write nothing
+rilldisk mcp setup --client codex            # asks before writing; keeps a backup
+rilldisk mcp setup --all --remove            # take RillDisk out again
+```
+
+Only the `rilldisk` entry is ever written. Comments, formatting and other servers
+stay as they were. The scope is in [the proposal](docs/proposals/mcp-setup.md).
+By hand, any MCP client takes:
+
 ```json
 {
   "mcpServers": {
@@ -213,8 +234,6 @@ anything outside them.
   }
 }
 ```
-
-Claude Code: `claude mcp add rilldisk -- C:\Tools\RillDisk\rilldisk.exe mcp --root C:\Users\YourName`
 
 | Tool | What it does |
 | --- | --- |
@@ -317,9 +336,10 @@ cargo build --release --locked
 ./target/release/rilldisk-desktop
 ```
 
-The workspace has four crates: `rilldisk-core` (scanner, accounting, reclaim
-rules), `rilldisk` (CLI + MCP), `rilldisk-desktop` (egui + wgpu) and
-`rilldisk-update` (the only network code: opt-in update checks). CLI and MCP
+The workspace has five crates: `rilldisk-core` (scanner, accounting, reclaim
+rules), `rilldisk` (CLI + MCP), `rilldisk-desktop` (egui + wgpu),
+`rilldisk-update` (the only network code: opt-in update checks) and
+`rilldisk-mcp-setup` (AI client detection, config edits and connection checks). CLI and MCP
 builds carry no renderer dependencies. See [architecture](docs/ARCHITECTURE.md).
 
 ```powershell
