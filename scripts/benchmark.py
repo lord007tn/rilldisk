@@ -380,6 +380,10 @@ def summarize(report, args):
                 expected[backend] = truth["allocated_bytes"]
             elif locked is not None:
                 expected[backend] = truth["allocated_bytes"] + locked
+    if truth is not None:
+        locked = (manifest or {}).get("unreadable", {}).get("allocated_bytes")
+        print(f"  (measured allocation {truth['allocated_bytes']:,} over readable folders; "
+              f"{truth['unreadable_folders']} unreadable; locked folder per manifest: {locked})")
     stable_exact = True
     for backend, values in sorted(allocations.items()):
         listing = backend in LISTING_ALLOCATION
