@@ -2,7 +2,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use rilldisk_core::{
-    ReclaimReport, ScanControl, ScanOptions, Snapshot, find_reclaimable, scan, volumes,
+    ReclaimReport, Safety, ScanControl, ScanOptions, Snapshot, find_reclaimable, scan, volumes,
 };
 use std::{
     fs::OpenOptions,
@@ -16,13 +16,14 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+mod cleanup;
 mod mcp;
 mod update;
 
 #[derive(Parser)]
 #[command(
     version,
-    about = "Disk intelligence for Windows, Linux and macOS. Local, read-only, native Rust.",
+    about = "Disk intelligence for Windows, Linux and macOS. Local, metadata-only, native Rust.",
     after_help = "AGPL-3.0-only. Source: https://github.com/lord007tn/rilldisk"
 )]
 struct Cli {
@@ -58,7 +59,10 @@ enum Command {
         top: u16,
     },
     /// Find space you can likely reclaim: worktrees, build output, dependency
-    /// folders and caches. Suggests actions; never deletes anything.
+    /// folders and caches. Only lists suggestions unless you pass --delete.
+    #[command(
+        after_help = "With --delete, the matching candidates (default: regenerable and cache) are listed and, after you confirm, moved to the Recycle Bin / Trash. Exit codes: 0 done, 2 partial scan (listing only), 3 some items failed or were refused, 130 cancelled, 1 error or not confirmed."
+    )]
     Reclaim {
         #[command(flatten)]
         args: ScanArgs,
@@ -67,6 +71,20 @@ enum Command {
         /// Hide candidates smaller than this (e.g. 500MB, 2GiB, 0).
         #[arg(long, default_value = "10MiB", value_parser = parse_size)]
         min_size: u64,
+        /// Only these safety classes. With --delete the default is
+        /// regenerable,cache; 'review' items are only removed when named here.
+        #[arg(long, value_enum, value_delimiter = ',')]
+        safety: Option<Vec<SafetyArg>>,
+        /// Remove the listed candidates after confirmation. Moves them to the
+        /// Recycle Bin / Trash unless --permanent is given.
+        #[arg(long)]
+        delete: bool,
+        /// Delete immediately instead of moving to the Recycle Bin / Trash.
+        #[arg(long, requires = "delete")]
+        permanent: bool,
+        /// Do not ask for confirmation. Required when stdin is not a terminal.
+        #[arg(long, short = 'y', requires = "delete")]
+        yes: bool,
     },
     /// List local drives with capacity and free space.
     Drives {
@@ -112,6 +130,24 @@ enum Format {
     Table,
     Json,
     Jsonl,
+}
+
+#[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum SafetyArg {
+    Regenerable,
+    Cache,
+    Review,
+}
+
+impl SafetyArg {
+    fn matches(self, safety: Safety) -> bool {
+        matches!(
+            (self, safety),
+            (SafetyArg::Regenerable, Safety::Regenerable)
+                | (SafetyArg::Cache, Safety::Cache)
+                | (SafetyArg::Review, Safety::Review)
+        )
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -191,10 +227,48 @@ async fn main() -> Result<ExitCode> {
             args,
             format,
             min_size,
+            safety,
+            delete,
+            permanent,
+            yes,
+        } if delete => {
+            let code = std::cell::Cell::new(None);
+            let scan_code = run(args, |writer, snapshot| {
+                let safety = safety.unwrap_or(vec![SafetyArg::Regenerable, SafetyArg::Cache]);
+                let mut report = find_reclaimable(snapshot, now_ms());
+                report.retain(|c| {
+                    c.logical_bytes >= min_size && safety.iter().any(|s| s.matches(c.safety))
+                });
+                code.set(Some(cleanup::run(
+                    writer,
+                    snapshot,
+                    &report,
+                    cleanup::Options {
+                        permanent,
+                        yes,
+                        json: matches!(format, ReportFormat::Json),
+                    },
+                )?));
+                Ok(())
+            })
+            .await?;
+            Ok(code.get().map_or(scan_code, ExitCode::from))
+        }
+        Command::Reclaim {
+            args,
+            format,
+            min_size,
+            safety,
+            ..
         } => {
             run(args, |writer, snapshot| {
                 let mut report = find_reclaimable(snapshot, now_ms());
-                report.retain(|c| c.logical_bytes >= min_size);
+                report.retain(|c| {
+                    c.logical_bytes >= min_size
+                        && safety
+                            .as_ref()
+                            .is_none_or(|s| s.iter().any(|s| s.matches(c.safety)))
+                });
                 match format {
                     ReportFormat::Json => {
                         serde_json::to_writer(&mut *writer, &report)?;
@@ -221,6 +295,10 @@ async fn run(
     let signal_control = control.clone();
     let signal = tokio::spawn(async move {
         while tokio::signal::ctrl_c().await.is_ok() {
+            // A running cleanup stops between items rather than mid-folder.
+            if cleanup::cancel_if_running() {
+                continue;
+            }
             if signal_exporting.load(Ordering::Relaxed) {
                 std::process::exit(130);
             }
@@ -465,7 +543,7 @@ fn parse_size(text: &str) -> Result<u64, String> {
     Ok((number * multiplier as f64) as u64)
 }
 
-fn human(bytes: u64) -> String {
+pub(crate) fn human(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut size = bytes as f64;
     let mut unit = 0;
