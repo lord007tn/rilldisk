@@ -4,6 +4,7 @@
 
 mod app;
 mod capture;
+mod elevation;
 mod icons;
 mod settings;
 mod style;
@@ -22,6 +23,7 @@ const APP_ID: &str = "io.github.lord007tn.RillDisk";
 fn main() -> eframe::Result {
     let mut path = None;
     let mut capture = None;
+    let mut tour_name = None;
     let mut dark = None;
     let mut identity = None;
     let mut size = [1480.0_f32, 920.0];
@@ -35,6 +37,7 @@ fn main() -> eframe::Result {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--capture" => capture = value(&mut args).map(PathBuf::from),
+            "--tour" => tour_name = value(&mut args),
             // Unknown values keep the saved or system theme.
             "--theme" => match value(&mut args).as_deref() {
                 Some("dark") => dark = Some(true),
@@ -54,7 +57,7 @@ fn main() -> eframe::Result {
             "--help" | "-h" => {
                 attach_console();
                 println!(
-                    "rilldisk-desktop [PATH] [--theme light|dark] [--palette tide|moss|aurora] [--size WIDTHxHEIGHT] [--capture DIR]\n\nOpens the RillDisk desktop app. PATH starts a scan immediately.\n--capture runs a scripted tour and saves screenshots to DIR (development).\n--version prints the version."
+                    "rilldisk-desktop [PATH] [--theme light|dark] [--palette tide|moss|aurora] [--size WIDTHxHEIGHT] [--capture DIR [--tour issues]]\n\nOpens the RillDisk desktop app. PATH starts a scan immediately.\n--capture runs a scripted tour and saves screenshots to DIR (development).\n--version prints the version."
                 );
                 return Ok(());
             }
@@ -66,7 +69,7 @@ fn main() -> eframe::Result {
             _ => path = Some(arg),
         }
     }
-    let tour = capture.map(|dir| capture::Tour::new(dir, path.is_none()));
+    let tour = capture.map(|dir| capture::Tour::new(dir, path.is_none(), tour_name.as_deref()));
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("RillDisk")

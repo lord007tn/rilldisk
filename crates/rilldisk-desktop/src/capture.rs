@@ -40,6 +40,8 @@ pub enum Step {
     Theme(bool),
     /// Tick the largest candidates of a category in Clean up.
     Pick(Category, usize),
+    /// Show the elevated look (badge) without elevating.
+    Elevated(bool),
     Quit,
 }
 
@@ -57,10 +59,30 @@ pub struct Tour {
 }
 
 impl Tour {
-    pub fn new(dir: PathBuf, welcome_only: bool) -> Self {
+    /// `name` picks a focused tour (`issues`); otherwise the full product tour.
+    pub fn new(dir: PathBuf, welcome_only: bool, name: Option<&str>) -> Self {
         use Step::*;
         use Target::*;
-        let steps = if welcome_only {
+        let steps = if name == Some("issues") {
+            // Scan a fixture with unreadable folders: the restart offer, then the
+            // elevated look (simulated; nothing is elevated).
+            vec![
+                Theme(false),
+                WaitData,
+                Tab(View::Issues),
+                Wait(24),
+                Shot("issues"),
+                Theme(true),
+                Wait(20),
+                Shot("issues-dark"),
+                Theme(false),
+                Elevated(true),
+                Wait(20),
+                Shot("issues-elevated"),
+                Wait(6),
+                Quit,
+            ]
+        } else if welcome_only {
             vec![
                 Theme(false),
                 Wait(30),
@@ -289,6 +311,7 @@ pub fn advance(app: &mut RillApp, ctx: &egui::Context) {
             app.selected = None;
         }
         Step::Theme(dark) => app.dark = dark,
+        Step::Elevated(on) => app.elevate.preview_elevated = on,
         Step::Pick(category, n) => {
             if let Some(data) = &app.data {
                 let picks: Vec<usize> = data
