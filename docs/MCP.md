@@ -2,8 +2,67 @@
 
 The command `rilldisk mcp --root C:\Data` starts a stdio server. Repeat `--root`
 for more allowed directories. Configure the executable as a local MCP server in
-your client; use an absolute executable path. There is no shell wrapper and no
+your client with an absolute executable path, or let `rilldisk mcp setup` (or
+the desktop) do it; see [Setup](#setup). There is no shell wrapper and no
 network server. Stdout contains only protocol messages.
+
+## Setup
+
+RillDisk can add itself to your AI clients and check that they can start it.
+
+- **Desktop:** the **AI assistants** card on Home lists the clients it finds.
+  **Connect** shows the exact change to the client's config, writes it only
+  after you click Apply, keeps a backup next to the file, then runs a
+  connection check. **Repair** points a stale entry at this RillDisk, **Test**
+  runs the check again and **Remove** takes the entry out.
+- **CLI:**
+
+  ```powershell
+  rilldisk mcp doctor [--format json] [--timeout 10]
+  rilldisk mcp setup --client <name> [--client <name>...] [--dry-run] [--remove] [--yes] [--root DIR]
+  rilldisk mcp setup --all [--remove]
+  ```
+
+  `setup` prints a diff for each client and asks `Apply these changes? [y/N]`.
+  Without a terminal it refuses unless `--yes` is given. `--dry-run` writes
+  nothing. After each change it checks the new entry. `doctor` changes nothing.
+  It reports each client's status (not installed, not configured, configured,
+  stale, unreadable config) and runs the connection check against every
+  existing entry. It exits 1 if any check fails.
+
+Client names: `claude-code`, `claude-desktop`, `codex`, `cursor`, `vscode`,
+`windsurf`, `gemini`, `zed`, `opencode`, `cline`. The entry runs the absolute
+path of `rilldisk` with `mcp --root <your home>` (the desktop uses the CLI
+shipped next to it). Only the `rilldisk` entry is written or removed. Comments,
+formatting and other servers stay as they were. Claude Code is changed through
+`claude mcp add --scope user` when the `claude` command is on `PATH`.
+
+The connection check starts the command and arguments exactly as the client's
+config lists them, sends `initialize`, `notifications/initialized` and
+`tools/list`, reports the server, tool count and latency (or why it failed:
+missing executable, exit with its last stderr line, timeout, protocol error),
+then kills the process.
+
+Example `rilldisk mcp doctor` output:
+
+```text
+RillDisk MCP server: C:\Tools\RillDisk\rilldisk.exe
+
+CLIENT          STATUS                CONNECTION                        CONFIG
+Claude Code     configured            ok · 7 tools · 41 ms              ~\.claude.json
+Claude Desktop  not installed         -                                 -
+Codex CLI       stale (missing exe)   FAILED: executable not found: C:\Old\rilldisk.exe ~\.codex\config.toml
+                  points to C:\Old\rilldisk.exe
+Cursor          not configured        -                                 ~\.cursor\mcp.json
+...
+
+Connect with: rilldisk mcp setup --client codex --client cursor --dry-run
+```
+
+Exactly which files are written, the backups, consent and what is never done:
+[proposals/mcp-setup.md](proposals/mcp-setup.md).
+
+## Using the tools
 
 1. Call `allowed_roots` to learn the configured scope.
 2. Call `start_scan` with `{"path":"C:\\Data"}`. Keep the returned `scan_id`.
