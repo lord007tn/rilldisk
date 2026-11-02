@@ -27,6 +27,8 @@ RillDisk to the Start menu and puts `rilldisk` on the PATH for new terminals.
 Windows asks for administrator approval to install to Program Files. Uninstall
 from **Settings > Apps > Installed apps**.
 
+![The RillDisk setup wizard](media/install-windows.png)
+
 **Portable.** Download `rilldisk-<tag>-x86_64-pc-windows-msvc.zip` (or
 `aarch64-pc-windows-msvc`), extract it anywhere and run `rilldisk-desktop.exe`.
 No installation and no admin rights. Delete the folder to remove it.
