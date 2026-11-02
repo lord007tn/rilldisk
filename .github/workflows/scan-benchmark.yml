@@ -42,7 +42,7 @@ jobs:
         run: |
           python scripts/benchmark.py target/release/examples \
             --files "${{ github.event.inputs.files || '300000' }}" --runs 3 \
-            --flush --require-identical --json bench.json | tee bench.md
+            --flush --verify-allocation --require-identical --json bench.json | tee bench.md
           cat bench.md >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
