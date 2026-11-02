@@ -232,6 +232,8 @@ struct Manifest {
     locked_files: u64,
     locked_directories: u64,
     locked_logical: u64,
+    /// Measured from each file's own handle before the folder is locked.
+    locked_allocated: u64,
 }
 
 fn main() {
@@ -304,6 +306,7 @@ fn main() {
         locked_files: 0,
         locked_directories: 0,
         locked_logical: 0,
+        locked_allocated: 0,
     };
     extras(&dir, &mut manifest);
     let json = format!(
@@ -311,7 +314,7 @@ fn main() {
             "{{\n  \"seed\": {}, \"requested_files\": {},\n",
             "  \"files\": {}, \"directories\": {}, \"logical_bytes\": {}, \"unique_logical_bytes\": {},\n",
             "  \"hard_link_duplicates\": {}, \"skipped_links\": {},\n",
-            "  \"unreadable\": {{\"folders\": 1, \"files\": {}, \"directories\": {}, \"logical_bytes\": {}}}\n}}"
+            "  \"unreadable\": {{\"folders\": 1, \"files\": {}, \"directories\": {}, \"logical_bytes\": {}, \"allocated_bytes\": {}}}\n}}"
         ),
         seed,
         files,
@@ -324,6 +327,7 @@ fn main() {
         manifest.locked_files,
         manifest.locked_directories,
         manifest.locked_logical,
+        manifest.locked_allocated,
     );
     println!("{json}");
     let mut sidecar = dir.clone().into_os_string();
@@ -409,7 +413,80 @@ fn extras(dir: &Path, m: &mut Manifest) {
     add(locked.join("inner").join("more.dat"), 4096, m);
     m.locked_files += 1;
     m.locked_logical += 4096;
+    let cluster = cluster_size(dir);
+    for name in [
+        "secret-0.dat",
+        "secret-1.dat",
+        "secret-2.dat",
+        "inner/more.dat",
+    ] {
+        m.locked_allocated += allocation(&locked.join(name), cluster);
+    }
     lock(&locked);
+}
+
+/// Bytes allocated to one file, the way RillDisk counts them: from the file's
+/// own handle (not a folder listing), and zero for data stored in the MFT record
+/// (less than a cluster).
+#[cfg(windows)]
+fn allocation(path: &Path, cluster: u64) -> u64 {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_STANDARD_INFO, FileStandardInfo, GetFileInformationByHandleEx,
+    };
+    let file = fs::File::open(path).unwrap();
+    // SAFETY: zeroed is valid for this plain structure; the call fills it.
+    let mut info: FILE_STANDARD_INFO = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle is open and info is the documented structure.
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileStandardInfo,
+            (&mut info as *mut FILE_STANDARD_INFO).cast(),
+            size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    };
+    assert!(ok != 0);
+    let allocated = info.AllocationSize.max(0) as u64;
+    if allocated < cluster { 0 } else { allocated }
+}
+
+#[cfg(windows)]
+fn cluster_size(dir: &Path) -> u64 {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceW;
+    let drive: Vec<u16> = dir
+        .components()
+        .next()
+        .map(|c| c.as_os_str().to_owned())
+        .unwrap()
+        .encode_wide()
+        .chain([u16::from(b'\\'), 0])
+        .collect();
+    let (mut sectors, mut bytes, mut free, mut total) = (0, 0, 0, 0);
+    // SAFETY: drive is terminated; outputs are writable integers.
+    let ok = unsafe {
+        GetDiskFreeSpaceW(
+            drive.as_ptr(),
+            &mut sectors,
+            &mut bytes,
+            &mut free,
+            &mut total,
+        )
+    };
+    assert!(ok != 0);
+    u64::from(sectors) * u64::from(bytes)
+}
+
+#[cfg(unix)]
+fn allocation(path: &Path, _cluster: u64) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    fs::symlink_metadata(path).unwrap().blocks() * 512
+}
+
+#[cfg(unix)]
+fn cluster_size(_dir: &Path) -> u64 {
+    0
 }
 
 #[cfg(windows)]
