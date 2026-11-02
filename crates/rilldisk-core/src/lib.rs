@@ -357,6 +357,8 @@ pub struct ScanControl {
     abandoned: AtomicBool,
     /// Latest picture of the scan in progress; see [`ScanControl::live`].
     live: std::sync::Mutex<Option<Arc<LiveView>>>,
+    live_focus: AtomicUsize,
+    backend_status: std::sync::Mutex<String>,
 }
 
 impl ScanControl {
@@ -366,9 +368,27 @@ impl ScanControl {
     pub fn is_cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
     }
-    /// Running totals of the largest folders one and two levels below the scan
-    /// root, refreshed a few times per second while the scan runs (None before
-    /// the first refresh). Draw it to show the scan growing.
+    /// Current backend selection, including an Auto fallback reason.
+    pub fn backend_status(&self) -> String {
+        self.backend_status
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default()
+    }
+    fn set_backend_status(&self, status: String) {
+        if let Ok(mut slot) = self.backend_status.lock() {
+            *slot = status;
+        }
+    }
+    /// Request a directory from the current live view; root is zero.
+    pub fn focus_live(&self, id: usize) {
+        self.live_focus.store(id, Ordering::Relaxed);
+    }
+    /// Requested focus, including a navigation click not yet published.
+    pub fn live_focus(&self) -> usize {
+        self.live_focus.load(Ordering::Relaxed)
+    }
+    /// Partial totals below the requested directory, refreshed during scanning.
     pub fn live(&self) -> Option<Arc<LiveView>> {
         self.live.lock().ok().and_then(|slot| slot.clone())
     }
@@ -893,6 +913,8 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
         .and_then(|m| m.modified())
         .ok()
         .and_then(unix_ms);
+    control.focus_live(0);
+    control.set_backend_status("Selecting scan backend".into());
     let fresh = || Collector::new(root.clone(), root_modified);
     let reset = || reset_progress(&control, &options);
     reset();
@@ -906,39 +928,56 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
         Backend::Mft => {
             let source = platform::mft_source(&verbatim, true)
                 .context("the MFT backend needs an NTFS volume and administrator rights")?;
+            control.set_backend_status("NTFS MFT scan".into());
             collector.summary.backend = platform::BACKEND_MFT;
             pool.install(|| platform::scan_mft(source, &verbatim, &control, &mut collector))
                 .context("cannot read the NTFS Master File Table")?;
             return Ok(pool.install(|| finish(collector, &options, &control, start)));
         }
         Backend::Auto => {
-            if let Ok(source) = platform::mft_source(&verbatim, false) {
-                collector.summary.backend = platform::BACKEND_MFT;
-                let result = pool
-                    .install(|| platform::scan_mft(source, &verbatim, &control, &mut collector));
-                // Anything that fails before entries are produced falls back to the walk.
-                match result {
-                    Ok(()) => {
-                        return Ok(pool.install(|| finish(collector, &options, &control, start)));
+            match platform::mft_source(&verbatim, false) {
+                Ok(source) => {
+                    control.set_backend_status("NTFS MFT scan".into());
+                    collector.summary.backend = platform::BACKEND_MFT;
+                    let result = pool.install(|| {
+                        platform::scan_mft(source, &verbatim, &control, &mut collector)
+                    });
+                    // A failed MFT attempt resets entries and progress before falling back.
+                    match result {
+                        Ok(()) => {
+                            return Ok(
+                                pool.install(|| finish(collector, &options, &control, start))
+                            );
+                        }
+                        Err(error) if !control.is_cancelled() => {
+                            control.set_backend_status(format!(
+                                "Directory scan - MFT unavailable: {error}"
+                            ));
+                            collector = fresh()?;
+                            reset();
+                        }
+                        Err(_) => {
+                            collector.summary.backend = platform::BACKEND_MFT;
+                            return Ok(finish(collector, &options, &control, start));
+                        }
                     }
-                    Err(_) if !control.is_cancelled() => {
-                        collector = fresh()?;
-                        reset();
-                    }
-                    Err(_) => {
-                        collector.summary.backend = platform::BACKEND_MFT;
-                        return Ok(finish(collector, &options, &control, start));
-                    }
+                }
+                Err(error) => {
+                    control.set_backend_status(format!("Directory scan - MFT unavailable: {error}"))
                 }
             }
             // Linux and macOS: the descriptor-relative walk measured no faster
             // than `std::fs::read_dir` (docs/PERFORMANCE.md), so it stays opt-in.
             if cfg!(unix) {
+                control.set_backend_status("Legacy directory scan".into());
                 walk_backend = Backend::Legacy;
             }
         }
-        Backend::Directory => {}
-        Backend::Legacy => walk_backend = Backend::Legacy,
+        Backend::Directory => control.set_backend_status("Directory scan".into()),
+        Backend::Legacy => {
+            control.set_backend_status("Legacy directory scan".into());
+            walk_backend = Backend::Legacy;
+        }
     }
     // Links are never traversed; each backend also keeps the scan on the root's
     // filesystem (Windows: reparse points; Unix: device and mount checks).
@@ -1045,6 +1084,9 @@ fn walk(
                         stop = true;
                     }
                     if !stop {
+                        collector
+                            .live
+                            .publish(&control.live, false, control.live_focus());
                         continue;
                     }
                 }
@@ -1073,7 +1115,11 @@ fn walk(
                 }
             }
         }
-        collector.live.publish(&control.live, false);
+        collector.live.publish(
+            &control.live,
+            false,
+            control.live_focus.load(Ordering::Relaxed),
+        );
         if stop {
             break;
         }
@@ -1112,7 +1158,11 @@ fn finish(
         links,
         mut live,
     } = collector;
-    live.publish(&control.live, true);
+    live.publish(
+        &control.live,
+        true,
+        control.live_focus.load(Ordering::Relaxed),
+    );
     let mut phase = Instant::now();
     control.abandoned.store(true, Ordering::Relaxed);
     drop(links);

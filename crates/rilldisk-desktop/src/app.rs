@@ -386,8 +386,21 @@ impl RillApp {
             match running.rx.try_recv() {
                 Ok(Ok(data)) => {
                     let long = running.started.elapsed().as_secs() >= 10;
+                    let id = running.control.live_focus();
+                    let focus = (id != 0
+                        && self.pending_open.is_none()
+                        && data
+                            .snapshot
+                            .entries
+                            .get(id)
+                            .is_some_and(|e| e.kind == EntryKind::Directory))
+                    .then_some(id);
                     self.running = None;
                     self.install(data);
+                    if let Some(id) = focus {
+                        self.zoom = id;
+                        self.tab = Tab::Explore;
+                    }
                     if long && !ctx.input(|i| i.viewport().focused.unwrap_or(true)) {
                         ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
                             egui::UserAttentionType::Informational,
@@ -550,6 +563,7 @@ impl RillApp {
                             self.zoom = folder;
                         }
                     } else {
+                        self.tab = Tab::Explore;
                         self.zoom = folder;
                         self.selected = (folder != id).then_some(id);
                     }
@@ -1028,6 +1042,19 @@ impl RillApp {
                     .header(ui, s, scanning, self.tab != Tab::Issues);
             });
         });
+        let s = &snapshot.summary;
+        ui.label(RichText::new(format!("Scan logical: {} · unique: {} · allocated: {} · backend: {}",
+            style::bytes(s.logical_bytes), style::bytes(s.unique_logical_bytes),
+            s.allocated_bytes.map(style::bytes).unwrap_or_else(|| "unknown".into()), s.backend)).small().color(th.dim))
+            .on_hover_text(format!("Exact bytes: logical {} · unique {} · allocated {:?}. Logical includes every hard-link name; allocated counts identities once. Sparse/compressed files differ. Partial scans omit unreadable paths. Volume used space also includes filesystem metadata, snapshots and unscanned files.", s.logical_bytes, s.unique_logical_bytes, s.allocated_bytes));
+        if let Some(v) = self
+            .volumes
+            .iter()
+            .find(|v| same_path(&v.root.display().to_string(), &s.root.display().to_string()))
+        {
+            ui.label(RichText::new(format!("Volume used: {} · free: {} · capacity: {} (volume information at app startup)", style::bytes(v.total_bytes.saturating_sub(v.free_bytes)), style::bytes(v.free_bytes), style::bytes(v.total_bytes))).small().color(th.dim))
+                .on_hover_text(format!("Volume used: {} bytes. Compare this field with Explorer drive properties. File totals above measure different things.", v.total_bytes.saturating_sub(v.free_bytes)));
+        }
         actions
     }
 
@@ -1155,6 +1182,7 @@ impl RillApp {
             bytes: control.bytes.load(Ordering::Relaxed),
             seconds: running.started.elapsed().as_secs_f64(),
         };
+        let view = control.live();
         ui.horizontal(|ui| {
             ui.set_height(34.0);
             let (rect, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
@@ -1166,7 +1194,7 @@ impl RillApp {
             let icon = if is_drive { Icon::Drive } else { Icon::Folder };
             icons::paint(ui.painter(), rect, icon, th.dim);
             ui.add_space(4.0);
-            ui.label(RichText::new(&root).font(style::semibold(16.0)));
+            ui.label(RichText::new("Scan in progress").font(style::semibold(16.0)));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 if w::button(ui, Kind::Soft, Some(Icon::Stop), "Stop")
@@ -1193,6 +1221,56 @@ impl RillApp {
             });
         });
         ui.add_space(4.0);
+        if view.is_some() {
+            ui.horizontal_wrapped(|ui| {
+                let parent = live::parent(view.as_deref(), control.live_focus());
+                let go_up = ui
+                    .add_enabled(parent.is_some(), egui::Button::new("← Parent"))
+                    .clicked()
+                    || (parent.is_some()
+                        && !ui.ctx().egui_wants_keyboard_input()
+                        && ui.input(|i| {
+                            i.key_pressed(Key::Backspace)
+                                || i.pointer.button_pressed(egui::PointerButton::Extra1)
+                        }));
+                if go_up {
+                    control.focus_live(parent.unwrap_or(0));
+                    self.live_anim.reset();
+                }
+                if crumb(ui, &root, false).clicked() {
+                    control.focus_live(0);
+                    self.live_anim.reset();
+                }
+                let chain = view
+                    .as_ref()
+                    .map(|v| v.ancestors.as_slice())
+                    .unwrap_or_default();
+                for (index, (id, name)) in chain.iter().enumerate() {
+                    if chain.len() > 3 && index < chain.len() - 2 {
+                        if index == 0 {
+                            crumb_separator(ui);
+                            ui.menu_button("…", |ui| {
+                                for (id, name) in &chain[..chain.len() - 2] {
+                                    if ui.button(name).clicked() {
+                                        control.focus_live(*id);
+                                        self.live_anim.reset();
+                                        ui.close();
+                                    }
+                                }
+                            });
+                        }
+                        continue;
+                    }
+                    crumb_separator(ui);
+                    if crumb(ui, name, index == chain.len() - 1).clicked() {
+                        control.focus_live(*id);
+                        self.live_anim.reset();
+                    }
+                }
+            });
+        }
+        ui.label(RichText::new(control.backend_status()).small().color(th.dim))
+            .on_hover_text("Auto uses the fast MFT backend for whole NTFS volumes when existing administrator access permits it. Other paths use a directory walk. Standard-access whole-drive scans may be much slower; restart as administrator from Settings before scanning if desired.");
         ui.label(
             RichText::new(progress.summary())
                 .font(style::regular(12.5))
@@ -1204,18 +1282,20 @@ impl RillApp {
         ui.add_space(16.0);
         let full = ui.available_rect_before_wrap();
         let area = Rect::from_min_max(full.min, egui::pos2(full.right(), full.bottom() - 26.0));
-        let view = control.live();
-        live::paint(
+        if let Some(id) = live::paint(
             ui,
             area,
             view.as_deref(),
             &mut self.live_anim,
             self.allocated,
-        );
+        ) {
+            control.focus_live(id);
+            self.live_anim.reset();
+        }
         ui.painter().text(
             egui::pos2(full.left() + 4.0, full.bottom() - 4.0),
             Align2::LEFT_BOTTOM,
-            "Sizes grow as folders are read; the full dashboard opens when the scan ends. Reads metadata only: nothing is opened, changed or uploaded.",
+            if view.is_some() { "Partial sizes grow as folders are read. Click folders to browse; Parent or Backspace goes up. On disk is file allocation, not volume used space." } else { "Reading metadata. MFT scans publish folders after table processing; directory scans publish as batches arrive." },
             style::regular(11.5),
             th.faint,
         );
@@ -1263,9 +1343,9 @@ impl RillApp {
                             v.root.display().to_string().trim_end_matches('\\')
                         ),
                         share,
-                        v.free_bytes,
-                        format!("free of {}", style::bytes(v.total_bytes)),
-                        format!("This scan {}", style::bytes(total)),
+                        used,
+                        format!("volume used of {}", style::bytes(v.total_bytes)),
+                        format!("Scanned files {}", style::bytes(total)),
                     )
                 }
                 None => (

@@ -15,6 +15,16 @@ fn scan_with(root: &Path, backend: Backend) -> Snapshot {
     .unwrap()
 }
 
+#[cfg(unix)]
+#[test]
+fn auto_status_describes_the_unix_backend_that_actually_runs() {
+    let root = tempfile::tempdir().unwrap();
+    let control = Arc::new(ScanControl::default());
+    let snapshot = scan(root.path(), ScanOptions::default(), control.clone()).unwrap();
+    assert_eq!(snapshot.summary.backend, "unix-readdir");
+    assert_eq!(control.backend_status(), "Legacy directory scan");
+}
+
 /// Totals that must not depend on the backend.
 fn totals(s: &Snapshot) -> [u64; 9] {
     let m = &s.summary;

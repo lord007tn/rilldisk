@@ -6,7 +6,7 @@ Builds nothing: point it at the release examples built with
 
 Then:
 
-    python scripts/benchmark.py target/release/examples            # 1M-file fixture
+    python scripts/benchmark.py target/release/examples            # 20k-file fixture
     python scripts/benchmark.py target/release/examples --files 200000 --runs 5
     python scripts/benchmark.py target/release/examples --path D:\\some\\tree   # a real tree
     python scripts/benchmark.py target/release/examples --ntfs-image fx.img     # MFT parser, no admin
@@ -209,7 +209,7 @@ def median(values):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("examples", help="directory holding scan_bench and make_fixture")
-    parser.add_argument("--files", type=int, default=1_000_000, help="synthetic fixture size")
+    parser.add_argument("--files", type=int, default=20_000, help="synthetic fixture size (default: 20000; larger trees are opt-in)")
     parser.add_argument("--fixture", help="reuse an existing make_fixture directory")
     parser.add_argument("--keep", action="store_true", help="keep the generated fixture")
     parser.add_argument("--path", help="benchmark a real tree instead (counts only are printed)")

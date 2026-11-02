@@ -40,6 +40,8 @@ pub enum Step {
     ChartKind(Chart),
     /// Back to the scanned root.
     Root,
+    Back,
+    ExpectFolder(&'static str),
     Theme(bool),
     /// Tick the largest candidates of a category in Clean up.
     Pick(Category, usize),
@@ -79,11 +81,48 @@ pub struct Tour {
     recording: bool,
     pointer: Pos2,
     motion: Option<(Pos2, Pos2, u32, u32)>,
-    release: Option<Pos2>,
     pending: Arc<AtomicUsize>,
 }
 
 impl Tour {
+    /// Focused navigation acceptance on the fictional demo fixture.
+    pub fn navigation(dir: PathBuf) -> Self {
+        use Step::*;
+        use Target::*;
+        Self::with_steps(
+            dir,
+            vec![
+                Theme(false),
+                WaitData,
+                Wait(10),
+                Shot("navigation-overview"),
+                Record(true),
+                ChartKind(Chart::Rings),
+                Tab(View::Explore),
+                Wait(5),
+                Move(Entry("Projects"), 4),
+                Wait(4),
+                Click(Entry("Projects")),
+                Wait(8),
+                ExpectFolder("Projects"),
+                Shot("navigation-folder"),
+                Click(Entry("Projects/atlas-web")),
+                Wait(8),
+                ExpectFolder("Projects/atlas-web"),
+                Shot("navigation-deep"),
+                Back,
+                Wait(8),
+                ExpectFolder("Projects"),
+                Shot("navigation-immediate-parent"),
+                Back,
+                Wait(8),
+                ExpectFolder(""),
+                Shot("navigation-parent"),
+                Record(false),
+                Quit,
+            ],
+        )
+    }
     /// Selection bar and dialogs of the Clean up view. Removes folders only when
     /// the scanned folder is inside the temp folder (a synthetic fixture).
     pub fn cleanup(dir: PathBuf) -> Self {
@@ -224,6 +263,11 @@ impl Tour {
                 Move(Entry("Projects/atlas-web/node_modules"), 22),
                 Wait(18),
                 Shot("rings"),
+                ExpectFolder("Projects"),
+                Back,
+                Wait(20),
+                ExpectFolder(""),
+                Shot("navigation-parent"),
                 Tab(View::Cleanup),
                 Wait(14),
                 Pick(Category::GitWorktree, 2),
@@ -277,7 +321,6 @@ impl Tour {
             recording: false,
             pointer: pos2(700.0, 500.0),
             motion: None,
-            release: None,
             pending: Arc::default(),
         }
     }
@@ -349,14 +392,6 @@ pub fn advance(app: &mut RillApp, ctx: &egui::Context) {
         tour.frame += 1;
         save(ctx, &tour.pending, path);
     }
-    if let Some(pos) = tour.release.take() {
-        app.injected.push(egui::Event::PointerButton {
-            pos,
-            button: egui::PointerButton::Primary,
-            pressed: false,
-            modifiers: Default::default(),
-        });
-    }
     if let Some((from, to, step, total)) = tour.motion {
         let t = (step as f32 / total as f32).min(1.0);
         let eased = t * t * (3.0 - 2.0 * t);
@@ -415,7 +450,14 @@ pub fn advance(app: &mut RillApp, ctx: &egui::Context) {
                     pressed: true,
                     modifiers: Default::default(),
                 });
-                tour.release = Some(pos);
+                // Keep a scripted click short even when PNG capture stalls a
+                // frame long enough to exceed egui's click-duration limit.
+                app.injected.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                });
             }
         }
         Step::Tab(tab) => app.tab = tab,
@@ -429,6 +471,36 @@ pub fn advance(app: &mut RillApp, ctx: &egui::Context) {
         Step::Root => {
             app.zoom = 0;
             app.selected = None;
+        }
+        Step::Back => {
+            app.injected.push(egui::Event::Key {
+                key: egui::Key::Backspace,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Default::default(),
+            });
+            app.injected.push(egui::Event::Key {
+                key: egui::Key::Backspace,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers: Default::default(),
+            });
+        }
+        Step::ExpectFolder(suffix) => {
+            let data = app
+                .data
+                .as_ref()
+                .expect("navigation tour requires scan results");
+            if suffix.is_empty() {
+                assert_eq!(app.zoom, 0, "Backspace must return to scan root");
+            } else {
+                assert!(
+                    data.snapshot.path(app.zoom).ends_with(suffix),
+                    "folder click must navigate"
+                );
+            }
         }
         Step::Theme(dark) => app.dark = dark,
         Step::Settings(open) => app.settings_open = open,
