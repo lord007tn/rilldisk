@@ -50,7 +50,14 @@ fn value(folder: &LiveFolder, allocated: bool) -> u64 {
 }
 
 /// Draw the live treemap and the "largest so far" list into `area`.
-pub fn paint(ui: &mut Ui, area: Rect, view: Option<&LiveView>, anim: &mut Anim, allocated: bool) {
+pub fn paint(
+    ui: &mut Ui,
+    area: Rect,
+    view: Option<&LiveView>,
+    anim: &mut Anim,
+    allocated: bool,
+) -> Option<usize> {
+    let mut clicked = None;
     let th = t();
     let now = ui.input(|i| i.time);
     let dt = anim
@@ -71,7 +78,7 @@ pub fn paint(ui: &mut Ui, area: Rect, view: Option<&LiveView>, anim: &mut Anim, 
     p.rect_filled(map_rect, 18, th.card);
     p.rect_filled(list_rect, 18, th.card);
 
-    let Some(view) = view.filter(|v| v.folders.iter().any(|f| value(f, allocated) > 0)) else {
+    let Some(view) = view else {
         p.text(
             map_rect.center(),
             Align2::CENTER_CENTER,
@@ -79,7 +86,7 @@ pub fn paint(ui: &mut Ui, area: Rect, view: Option<&LiveView>, anim: &mut Anim, 
             style::regular(13.0),
             th.faint,
         );
-        return;
+        return None;
     };
 
     // ---- treemap of first-level folders, with their largest subfolders inside.
@@ -88,6 +95,7 @@ pub fn paint(ui: &mut Ui, area: Rect, view: Option<&LiveView>, anim: &mut Anim, 
         .folders
         .iter()
         .filter(|f| value(f, allocated) > 0)
+        .take(48)
         .collect();
     let total: u64 = tops.iter().map(|f| value(f, allocated)).sum();
     let items: Vec<(u32, f64)> = tops
@@ -201,8 +209,11 @@ pub fn paint(ui: &mut Ui, area: Rect, view: Option<&LiveView>, anim: &mut Anim, 
             hovered = Some((folder, None));
         }
     }
-    let response = ui.interact(map_rect, ui.scope_id().with("live-map"), Sense::hover());
+    let response = ui.interact(map_rect, ui.scope_id().with("live-map"), Sense::click());
     if let Some((folder, kid)) = hovered {
+        if response.clicked() {
+            clicked = Some(kid.unwrap_or(folder).id);
+        }
         response.on_hover_ui_at_pointer(|ui| {
             let f = kid.unwrap_or(folder);
             let label = match kid {
@@ -218,47 +229,35 @@ pub fn paint(ui: &mut Ui, area: Rect, view: Option<&LiveView>, anim: &mut Anim, 
         });
     }
 
-    // ---- "Largest so far" list.
-    let lp = ui.painter_at(list_rect);
-    let mut y = list_rect.top() + 18.0;
-    lp.text(
-        pos2(list_rect.left() + 18.0, y),
-        Align2::LEFT_TOP,
-        "Largest so far",
-        style::semibold(14.0),
-        th.text,
-    );
-    y += 28.0;
-    let biggest = tops.first().map_or(1, |f| value(f, allocated)).max(1);
-    let row_h = 40.0;
-    for (i, folder) in tops.iter().enumerate() {
-        if y + row_h > list_rect.bottom() - 12.0 {
-            break;
-        }
-        let left = list_rect.left() + 18.0;
-        let right = list_rect.right() - 18.0;
-        let color = style::chart(position[&(i as u32)], 0);
-        lp.circle_filled(pos2(left + 4.0, y + 9.0), 4.0, color);
-        let size = style::bytes(value(folder, allocated));
-        let size_g = lp.layout_no_wrap(size, style::semibold(12.0), th.text);
-        let name = w::fit(
-            &lp,
-            folder.name.clone(),
-            style::regular(12.5),
-            th.text,
-            right - left - 22.0 - size_g.size().x - 8.0,
-        );
-        lp.galley(pos2(left + 16.0, y + 1.0), name, th.text);
-        lp.galley(pos2(right - size_g.size().x, y + 1.0), size_g, th.text);
-        let bar = Rect::from_min_size(pos2(left + 16.0, y + 22.0), vec2(right - left - 16.0, 4.0));
-        w::progress(
-            &lp,
-            bar,
-            value(folder, allocated) as f32 / biggest as f32,
-            color,
-        );
-        y += row_h;
+    // Every immediate folder remains accessible in a scrollable list, even if
+    // it has no sized tiles yet or is too small to hit on the map.
+    let mut list = ui.new_child(egui::UiBuilder::new().max_rect(list_rect.shrink(16.0)));
+    list.label(egui::RichText::new("Folders found so far").font(style::semibold(14.0)));
+    list.label("Click a folder to enter");
+    list.label(format!("{} files directly here", view.loose_files));
+    if view.folders.is_empty() {
+        list.label("No subfolders found yet. Scanning continues.");
     }
+    egui::ScrollArea::vertical()
+        .id_salt(("live-folders", view.ancestors.last().map(|a| a.0)))
+        .show_rows(&mut list, 22.0, view.folders.len(), |ui, rows| {
+            for folder in &view.folders[rows] {
+                if ui
+                    .selectable_label(
+                        false,
+                        format!(
+                            "{}   {}",
+                            folder.name,
+                            style::bytes(value(folder, allocated))
+                        ),
+                    )
+                    .clicked()
+                {
+                    clicked = Some(folder.id);
+                }
+            }
+        });
+    clicked
 }
 
 /// Corner radius that never turns a small tile into a dot.
@@ -277,7 +276,7 @@ pub struct Progress {
 impl Progress {
     pub fn summary(&self) -> String {
         format!(
-            "{} files · {} folders · {} · {}/s · {}",
+            "{} files · {} folders · {} logical · {}/s · {}",
             style::short_count(self.files),
             style::short_count(self.folders),
             style::bytes(self.bytes),
@@ -309,5 +308,54 @@ pub fn sweep(p: &egui::Painter, rect: Rect, time: f64, color: Color32) {
     );
     if bar.width() > 0.0 {
         p.rect_filled(bar, rect.height() / 2.0, color);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn map_click_enters_a_folder_during_scan() {
+        let ctx = egui::Context::default();
+        let view = LiveView {
+            folders: vec![LiveFolder {
+                id: 42,
+                name: "Synthetic folder".into(),
+                logical_bytes: 100,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut anim = Anim::default();
+        let mut selected = None;
+        for pressed in [None, Some(true), Some(false)] {
+            let pos = pos2(150.0, 150.0);
+            let mut input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 600.0))),
+                ..Default::default()
+            };
+            input.events.push(egui::Event::PointerMoved(pos));
+            if let Some(pressed) = pressed {
+                input.events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: Default::default(),
+                });
+            }
+            ctx.run_ui(input, |ui| {
+                selected = paint(
+                    ui,
+                    ui.available_rect_before_wrap(),
+                    Some(&view),
+                    &mut anim,
+                    false,
+                )
+                .or(selected);
+            })
+            .drop_without_applying_deltas();
+        }
+        assert_eq!(selected, Some(42));
     }
 }

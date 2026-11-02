@@ -463,11 +463,14 @@ fn add_records(
     mut child: impl FnMut(&mut Listing, usize, &[u16]),
 ) -> io::Result<bool> {
     let mut offset = 0;
+    // Reuse decoding storage across the records in this listing buffer. Each
+    // retained name owns its OsString; only subfolder tasks need a UTF-16 copy.
+    let mut wide = Vec::new();
     loop {
         if control.should_stop() {
             return Ok(false);
         }
-        let (record, next) = parse_record(bytes, offset, volume.layout)?;
+        let (record, next) = parse_record(bytes, offset, volume.layout, &mut wide)?;
         match record {
             Record::Dot { reparse: true } => {
                 return Err(io::Error::other(
@@ -475,7 +478,7 @@ fn add_records(
                 ));
             }
             Record::Dot { reparse: false } => {}
-            Record::Entry(mut entry, wide) => {
+            Record::Entry(mut entry) => {
                 if !control.record(entry.kind, entry.logical) {
                     // Reported once by the scan; this directory is simply incomplete.
                     return Ok(false);
@@ -582,12 +585,18 @@ fn info<T>(file: &File, class: i32) -> io::Result<T> {
 
 enum Record {
     /// `.` (with the folder's own attributes) or `..`.
-    Dot { reparse: bool },
-    /// An entry, and its UTF-16 name (needed to open a subfolder).
-    Entry(RawEntry, Vec<u16>),
+    Dot {
+        reparse: bool,
+    },
+    Entry(RawEntry),
 }
 
-fn parse_record(bytes: &[u8], offset: usize, layout: Layout) -> io::Result<(Record, usize)> {
+fn parse_record(
+    bytes: &[u8],
+    offset: usize,
+    layout: Layout,
+    wide: &mut Vec<u16>,
+) -> io::Result<(Record, usize)> {
     let rest = bytes
         .get(offset..)
         .filter(|rest| rest.len() >= layout.min)
@@ -609,13 +618,15 @@ fn parse_record(bytes: &[u8], offset: usize, layout: Layout) -> io::Result<(Reco
     {
         return Err(io::Error::other("invalid directory record length"));
     }
-    let wide: Vec<u16> = rest[layout.name..layout.name + length]
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| u16::from_le_bytes(*pair))
-        .collect();
-    if wide == [46] || wide == [46, 46] {
+    wide.clear();
+    wide.extend(
+        rest[layout.name..layout.name + length]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair)),
+    );
+    if wide.as_slice() == [46] || wide.as_slice() == [46, 46] {
         return Ok((
             Record::Dot {
                 reparse: wide.len() == 1 && link,
@@ -637,7 +648,7 @@ fn parse_record(bytes: &[u8], offset: usize, layout: Layout) -> io::Result<(Reco
         .get(8..16)
         .map_or(0, |h| u64::from_le_bytes(h.try_into().expect("8 bytes")));
     let entry = RawEntry {
-        name: OsString::from_wide(&wide).into_boxed_os_str(),
+        name: OsString::from_wide(wide).into_boxed_os_str(),
         kind,
         logical: if is_file { i64_at(40).max(0) as u64 } else { 0 },
         allocated: Some(if is_file { i64_at(48).max(0) as u64 } else { 0 }),
@@ -646,7 +657,7 @@ fn parse_record(bytes: &[u8], offset: usize, layout: Layout) -> io::Result<(Reco
         skipped: false,
         key: None,
     };
-    Ok((Record::Entry(entry, wide), next))
+    Ok((Record::Entry(entry), next))
 }
 
 /// FILETIME counts 100 ns intervals since 1601-01-01.
@@ -1130,6 +1141,75 @@ pub(crate) fn enable_backup_privilege() -> bool {
 mod tests {
     use super::*;
 
+    fn named_record(layout: Layout, name: &[u16]) -> Vec<u8> {
+        let mut bytes = vec![0; layout.min.max(layout.name + name.len() * 2)];
+        bytes[60..64].copy_from_slice(&((name.len() * 2) as u32).to_le_bytes());
+        bytes[40..48].copy_from_slice(&12345_i64.to_le_bytes());
+        bytes[48..56].copy_from_slice(&16384_i64.to_le_bytes());
+        bytes[layout.id..layout.id + 8].copy_from_slice(&42_u64.to_le_bytes());
+        for (out, unit) in bytes[layout.name..]
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .zip(name)
+        {
+            out.copy_from_slice(&unit.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn reused_name_buffer_preserves_owned_names_and_accounting() {
+        for layout in [ID_BOTH, ID_EXTD] {
+            let mut wide = Vec::new();
+            let names = [vec![0x61; 255], vec![0xd800, 0x62], vec![0x63]];
+            let mut entries = Vec::new();
+            for name in &names {
+                let bytes = named_record(layout, name);
+                let (Record::Entry(entry), next) =
+                    parse_record(&bytes, 0, layout, &mut wide).unwrap()
+                else {
+                    panic!("expected file");
+                };
+                assert_eq!(next, 0);
+                assert_eq!(wide, *name);
+                assert_eq!(entry.kind, EntryKind::File);
+                assert_eq!(entry.logical, 12345);
+                assert_eq!(entry.allocated, Some(16384));
+                assert_eq!(entry.identity, Some((0, 42)));
+                entries.push(entry);
+            }
+            let dot = named_record(layout, &[46]);
+            assert!(matches!(
+                parse_record(&dot, 0, layout, &mut wide).unwrap().0,
+                Record::Dot { reparse: false }
+            ));
+            // Parsing a shorter name or dot must not mutate earlier owned names,
+            // including an unpaired UTF-16 surrogate (legal in Windows names).
+            for (entry, name) in entries.iter().zip(&names) {
+                assert_eq!(entry.name.encode_wide().collect::<Vec<_>>(), *name);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "CPU microbenchmark; run release with --ignored --nocapture"]
+    fn directory_record_benchmark() {
+        let name: Vec<_> = "index.generated.module.d.ts".encode_utf16().collect();
+        let bytes = named_record(ID_EXTD, &name);
+        let start = std::time::Instant::now();
+        let mut wide = Vec::new();
+        for _ in 0..2_000_000 {
+            std::hint::black_box(
+                parse_record(std::hint::black_box(&bytes), 0, ID_EXTD, &mut wide).unwrap(),
+            );
+        }
+        eprintln!(
+            "2M directory records: {:.3} ms",
+            start.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
     #[test]
     fn only_launchable_path_files_count() {
         let dir = tempfile::tempdir().unwrap();
@@ -1161,11 +1241,11 @@ mod tests {
     #[test]
     fn rejects_invalid_native_records() {
         for layout in [ID_BOTH, ID_EXTD] {
-            assert!(parse_record(&[], 0, layout).is_err());
+            assert!(parse_record(&[], 0, layout, &mut Vec::new()).is_err());
             let mut bytes = vec![0_u8; 256];
-            assert!(parse_record(&bytes, 0, layout).is_err());
+            assert!(parse_record(&bytes, 0, layout, &mut Vec::new()).is_err());
             bytes[60..64].copy_from_slice(&u32::MAX.to_le_bytes());
-            assert!(parse_record(&bytes, 0, layout).is_err());
+            assert!(parse_record(&bytes, 0, layout, &mut Vec::new()).is_err());
         }
     }
 

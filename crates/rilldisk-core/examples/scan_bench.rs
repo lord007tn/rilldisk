@@ -19,9 +19,11 @@ fn main() {
     let mut path = None;
     let mut image = None;
     let mut backup = false;
+    let mut analyze = false;
     let mut list = 0_usize;
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--analyze" => analyze = true,
             "--backend" => {
                 options.backend = match args.next().as_deref() {
                     Some("auto") => Backend::Auto,
@@ -59,6 +61,30 @@ fn main() {
     }
     .expect("scan failed");
     let wall = start.elapsed().as_secs_f64() * 1000.0;
+    if analyze {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let phase = Instant::now();
+        let reclaim = rilldisk_core::find_reclaimable(&snapshot, now);
+        let reclaim_ms = phase.elapsed().as_millis();
+        let phase = Instant::now();
+        let types = rilldisk_core::file_types(&snapshot);
+        let types_ms = phase.elapsed().as_millis();
+        let phase = Instant::now();
+        let largest = [
+            rilldisk_core::largest_files(&snapshot, 1000, false),
+            rilldisk_core::largest_files(&snapshot, 1000, true),
+        ];
+        eprintln!(
+            "analysis: reclaim_ms={reclaim_ms} file_types_ms={types_ms} largest_ms={} candidates={} types={} largest={}",
+            phase.elapsed().as_millis(),
+            reclaim.candidates.len(),
+            types.len(),
+            largest[0].len()
+        );
+    }
     if list > 0 {
         let mut depth = vec![0_usize; snapshot.entries.len()];
         for e in &snapshot.entries[1..] {

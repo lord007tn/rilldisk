@@ -4,6 +4,10 @@ RillDisk has several enumeration backends behind one collector, so every backend
 reports the same accounting (see [ARCHITECTURE.md](ARCHITECTURE.md#scan-backends)).
 `Summary.backend` names the one that ran; `--backend auto|mft|dir` chooses.
 
+See [the bounded parser/accounting investigation](PERFORMANCE-INVESTIGATION.md)
+for the November 2 follow-up, paired samples, and limits on the reported
+six-minute scan and Explorer size discrepancy.
+
 | Backend | Where | How |
 | --- | --- | --- |
 | `ntfs-mft` | Windows, NTFS, administrator | Reads the Master File Table raw, in parallel 4 MiB blocks |
@@ -14,7 +18,8 @@ reports the same accounting (see [ARCHITECTURE.md](ARCHITECTURE.md#scan-backends
 
 `auto` uses `ntfs-mft` only for a **whole NTFS volume** when the process can
 read it (administrator), and falls back to `nt-directory` whenever that is not
-possible or fails before producing entries. A folder never uses the MFT under
+possible or the MFT attempt returns an error without cancellation. The failed
+attempt's collector and progress are discarded before the walk. A folder never uses the MFT under
 `auto`: the backend reads the whole volume's table, which costs more than walking
 a small folder (measured below). `--backend mft` forces it for a large folder.
 

@@ -86,8 +86,12 @@ fn main() -> eframe::Result {
             _ => path = Some(arg),
         }
     }
+    let navigation_tour = tour_name.as_deref() == Some("navigation");
     let issues_tour = match tour_name.as_deref() {
         None => false,
+        Some("navigation") if path.is_some() && matches!(capture, Some((_, Capture::Tour))) => {
+            false
+        }
         // Named tours replace the --capture tour only; --capture-live and
         // --capture-cleanup run their own steps.
         Some("issues") if !matches!(capture, Some((_, Capture::Tour))) => {
@@ -106,12 +110,15 @@ fn main() -> eframe::Result {
         }
         Some(other) => {
             attach_console();
-            eprintln!("unknown --tour {other}; the only named tour is `issues`.");
+            eprintln!(
+                "invalid --tour {other}; use `issues` or `navigation` with PATH --capture DIR."
+            );
             return Ok(());
         }
     };
     let tour = capture.map(|(dir, mode)| {
         let kind = match (path.is_none(), mode) {
+            (false, Capture::Tour) if navigation_tour => return capture::Tour::navigation(dir),
             (_, Capture::Cleanup) => return capture::Tour::cleanup(dir),
             (true, _) => capture::TourKind::Welcome,
             (false, _) if issues_tour => capture::TourKind::Issues,
