@@ -3953,7 +3953,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rilldisk-nav-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        // TEMP can use an 8.3 alias on Windows or a symlink on macOS. Match
+        // the canonical, familiar paths returned by the scanner.
+        rilldisk_core::simplify(dir.canonicalize().unwrap())
     }
 
     /// Projects/atlas-web/src/app.ts, a zero-byte file and an empty folder.
