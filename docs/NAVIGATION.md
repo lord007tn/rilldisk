@@ -19,8 +19,10 @@ are browsed the same way.
 - A folder that listed nothing shows `unknown`, not `0 B`, and links to Issues. A
   partly read folder is marked `partial`. On disk shows `unknown` when allocation
   was not measured.
-- Going up works only in Explore, the one tab showing a folder. A rescan keeps your
-  folder, or says so when it no longer exists.
+- A new scan shows its live dashboard on any tab; its navigation keys work there.
+  During a rescan or after completion, going up applies only to Explore. A rescan
+  keeps your folder, or reports that it is absent from the new results (which may
+  be partial).
 
 ## Evidence
 

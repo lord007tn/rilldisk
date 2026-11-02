@@ -449,7 +449,7 @@ impl RillApp {
                             Some(id) => self.zoom = id,
                             None => {
                                 self.toast = Some((
-                                    "That folder is gone. Showing the top of the scan".into(),
+                                    "That folder is not in the new results. Showing the top of the scan".into(),
                                     ctx.input(|i| i.time),
                                 ));
                             }
@@ -1354,7 +1354,20 @@ impl RillApp {
                 (None, parent) if keys_go_up => parent,
                 (None, _) => None,
             };
-            if let Some(id) = target {
+            let keyboard = if !ui.ctx().egui_wants_keyboard_input() && live::caught_up(view, focus)
+            {
+                let (up, down, enter) = ui.input(|i| {
+                    (
+                        i.key_pressed(Key::ArrowUp),
+                        i.key_pressed(Key::ArrowDown),
+                        i.key_pressed(Key::Enter) || i.key_pressed(Key::ArrowRight),
+                    )
+                });
+                self.live_anim.keyboard(view, up, down, enter)
+            } else {
+                None
+            };
+            if let Some(id) = target.or(keyboard) {
                 self.live_anim.open(&control, id, Some(view));
             }
         }
@@ -4407,6 +4420,24 @@ mod tests {
         d.press(egui::Key::ArrowLeft);
         assert_eq!(shown(&d), "");
 
+        // Live keyboard selection follows the same visible row order.
+        let view = d.app.live_view().unwrap();
+        let first = view.folders[0].id;
+        let second = view.folders[1].id;
+        assert_eq!(
+            d.app.live_anim.selection(),
+            Some(first),
+            "going up remembered the branch"
+        );
+        d.press(egui::Key::ArrowDown);
+        assert_eq!(d.app.live_anim.selection(), Some(second));
+        d.press(egui::Key::ArrowUp);
+        assert_eq!(d.app.live_anim.selection(), Some(first));
+        d.press(egui::Key::Enter);
+        assert_eq!(d.app.scan_control().unwrap().live_focus(), first);
+        d.press(egui::Key::Backspace);
+        assert_eq!(shown(&d), "");
+
         // Breadcrumbs jump straight back to the scan root.
         d.click_hit(nav::PANEL_HITS, 1);
         d.click_hit(nav::CRUMB_HITS, 0);
@@ -4438,7 +4469,14 @@ mod tests {
         d.press(egui::Key::F5);
         finish(&mut d);
         assert_eq!(d.app.zoom, 0);
-        assert!(d.app.toast.is_some(), "the move to the root is explained");
+        assert!(
+            d.app
+                .toast
+                .as_ref()
+                .unwrap()
+                .0
+                .contains("not in the new results")
+        );
     }
 
     #[test]

@@ -15,13 +15,11 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0},
+    Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
     System::{
         Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize},
         SystemInformation::GetSystemDirectoryW,
-        Threading::{
-            GetExitCodeProcess, INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
-        },
+        Threading::{GetExitCodeProcess, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
     },
     UI::Shell::{SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW},
 };
@@ -58,10 +56,18 @@ pub struct Handoff {
     request: PathBuf,
 }
 
-fn pending_path() -> Result<PathBuf> {
+fn updates_path() -> Result<PathBuf> {
     Ok(state_path()
         .context("No per-user update folder is available")?
-        .with_file_name("pending-installer.json"))
+        .with_file_name("updates"))
+}
+
+fn write_pending(request: &Path, pid: u32) -> Result<()> {
+    let path = request.with_file_name("pending.json");
+    let temp = path.with_extension("tmp");
+    fs::write(&temp, serde_json::to_vec(&pid)?)?;
+    fs::rename(temp, path)?;
+    Ok(())
 }
 
 fn write_status(request: &Path, status: &Status) -> Result<()> {
@@ -111,9 +117,7 @@ pub fn prepare(release: &Release, progress: &mut dyn FnMut(u64, Option<u64>)) ->
         .context("The MSI has no release checksum")?;
     let bytes = net::download(&asset.url, 1 << 30, progress)?;
     verify_sha256(&bytes, expected)?;
-    let root = state_path()
-        .context("No update storage is available")?
-        .with_file_name("updates");
+    let root = updates_path()?;
     fs::create_dir_all(&root)?;
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let dir = root.join(format!(
@@ -142,7 +146,9 @@ pub fn prepare(release: &Release, progress: &mut dyn FnMut(u64, Option<u64>)) ->
 
 impl Prepared {
     pub fn start(self) -> Result<Handoff> {
-        fs::write(pending_path()?, serde_json::to_vec(&self.request)?)?;
+        // Each handoff has its own receipt; another window cannot overwrite it.
+        // The parent pid covers the brief interval before the helper is spawned.
+        write_pending(&self.request, std::process::id())?;
         let child = Command::new(&self.helper)
             .arg(HELPER_ARG)
             .arg(&self.request)
@@ -156,6 +162,7 @@ impl Prepared {
                 return Err(error);
             }
         };
+        write_pending(&self.request, child.id())?;
         Ok(Handoff {
             child,
             request: self.request,
@@ -179,20 +186,52 @@ impl Handoff {
     }
 }
 
-/// Show a real installer result once on the next desktop launch.
-pub fn take_result() -> Result<Option<Status>> {
-    let pointer = pending_path()?;
-    let request: PathBuf = match fs::read(&pointer) {
-        Ok(bytes) => serde_json::from_slice(&bytes)?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
+/// Consume every finished handoff once, including interrupted helpers.
+pub fn take_results() -> Result<Vec<Status>> {
+    take_results_in(&updates_path()?)
+}
+
+fn take_results_in(root: &Path) -> Result<Vec<Status>> {
+    let entries = match fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
     };
-    let status = read_status(&request)?;
-    if matches!(status, Status::Finished { .. } | Status::Failed(_)) {
-        fs::remove_file(pointer)?;
-        return Ok(Some(status));
+    let mut results = Vec::new();
+    for entry in entries {
+        let dir = entry?.path();
+        let pending = dir.join("pending.json");
+        if !dir.is_dir() || !pending.is_file() {
+            continue;
+        }
+        let request = dir.join("request.json");
+        let mut status = read_status(&request)?;
+        if matches!(status, Status::AwaitingConsent | Status::InstallerStarted) {
+            let pid: u32 = serde_json::from_slice(&fs::read(&pending)?)?;
+            // SAFETY: synchronization access only, no mutation of the process.
+            let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+            if !process.is_null() {
+                let process = Handle(process);
+                // SAFETY: the process handle is owned and valid.
+                match unsafe { WaitForSingleObject(process.0, 0) } {
+                    WAIT_TIMEOUT => continue,
+                    WAIT_OBJECT_0 => {}
+                    _ => return Err(std::io::Error::last_os_error().into()),
+                }
+            } else if std::io::Error::last_os_error().raw_os_error() != Some(87) {
+                return Err(std::io::Error::last_os_error())
+                    .context("Cannot check the update helper");
+            }
+            status = Status::Failed(format!(
+                "The update helper stopped before reporting a result. Installation outcome is unknown. Check the installed version and installer log: {}",
+                dir.join("install.log").display()
+            ));
+            write_status(&request, &status)?;
+        }
+        fs::remove_file(pending)?;
+        results.push(status);
     }
-    Ok(None)
+    Ok(results)
 }
 
 struct Handle(HANDLE);
@@ -305,9 +344,15 @@ fn verified_install(request: &Path, data: &Request) -> Result<bool> {
         }
     }
     // SAFETY: the installer handle is owned and valid until this function ends.
-    if unsafe { WaitForSingleObject(installer.0, INFINITE) } != WAIT_OBJECT_0 {
-        return Err(std::io::Error::last_os_error())
-            .context("Could not wait for Windows Installer");
+    match unsafe { WaitForSingleObject(installer.0, 30 * 60 * 1000) } {
+        WAIT_OBJECT_0 => {}
+        WAIT_TIMEOUT => bail!(
+            "Windows Installer has not finished after 30 minutes. Its outcome is unknown and it may still be running. Do not retry until Windows Installer finishes; inspect the installer log."
+        ),
+        _ => {
+            return Err(std::io::Error::last_os_error())
+                .context("Could not wait for Windows Installer");
+        }
     }
     let mut code = 0;
     // SAFETY: code is writable, and the completed process handle is valid.
@@ -469,6 +514,47 @@ fn show_notice(text: &str, failed: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receipts_preserve_multiple_handoffs_and_recover_a_dead_helper() {
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("first").join("request.json");
+        let second = root.path().join("second").join("request.json");
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        fs::create_dir_all(second.parent().unwrap()).unwrap();
+        write_pending(&first, 0).unwrap();
+        write_pending(&second, std::process::id()).unwrap();
+        write_status(&first, &Status::InstallerStarted).unwrap();
+        write_status(&second, &Status::AwaitingConsent).unwrap();
+        let results = take_results_in(root.path()).unwrap();
+        assert!(matches!(&results[..], [Status::Failed(message)] if message.contains("unknown")));
+        assert!(
+            second.with_file_name("pending.json").exists(),
+            "live helper stays pending"
+        );
+        write_pending(&first, 0).unwrap();
+        write_status(&first, &Status::Failed("first failed".into())).unwrap();
+        write_status(
+            &second,
+            &Status::Finished {
+                version: "0.1.3".into(),
+                reboot_required: false,
+            },
+        )
+        .unwrap();
+        let results = take_results_in(root.path()).unwrap();
+        assert_eq!(results.len(), 2, "both handoffs survive");
+        assert!(results.iter().any(|s| matches!(s, Status::Finished { .. })));
+        assert!(
+            results
+                .iter()
+                .any(|s| matches!(s, Status::Failed(m) if m == "first failed"))
+        );
+        assert!(
+            take_results_in(root.path()).unwrap().is_empty(),
+            "receipts are consumed once"
+        );
+    }
 
     #[test]
     fn installer_results_distinguish_reboot_and_cancel() {

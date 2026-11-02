@@ -666,6 +666,12 @@ pub fn advance(app: &mut RillApp, ctx: &egui::Context) {
         return;
     };
     ctx.request_repaint();
+    // A tick can queue a recording frame and a named shot. Reserve both slots;
+    // pause the tour while four encoders/screenshots are in flight.
+    if tour.pending.load(Ordering::SeqCst) > 2 {
+        app.tour = Some(tour);
+        return;
+    }
     tour.tick += 1;
     if tour.recording && tour.tick % 3 == 0 {
         let path = tour

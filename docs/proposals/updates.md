@@ -27,6 +27,16 @@ the application closes. The helper stays at the application's original privilege
 level; only the installer requests elevation. Existing records, credentials,
 scan accounting and MCP capabilities are unchanged.
 
+Installer waits are bounded at 30 minutes. A timeout reports an unknown outcome
+without terminating Windows Installer; do not retry while it is still running.
+Each handoff retains its own receipt, and the next launch surfaces interrupted
+helpers as unknown outcomes. Windows consent launches MSI before the desktop can
+close. The helper signals closure immediately and waits for the parent, but a
+very fast installer may reach an in-use file first and require a Windows restart.
+That ordering tradeoff preserves the window when consent is declined; a stricter
+close-before-install guarantee needs a separate elevated bootstrap design and
+native upgrade acceptance. No such guarantee is claimed here.
+
 Update availability/progress/error/retry controls live in a persistent bottom
 bar, including the welcome screen. Automatic checks remain opt-out and throttled
 to once a day, also while the app stays open; manual checks remain available

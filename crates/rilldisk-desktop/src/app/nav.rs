@@ -262,15 +262,17 @@ fn breadcrumbs(ui: &mut Ui, places: &[Place], room: f32) -> Option<usize> {
                     ui.spacing_mut().button_padding = vec2(6.0, 4.0);
                     let menu = ui.menu_button(RichText::new("…").color(th.dim), |ui| {
                         ui.set_max_width(320.0);
-                        for level in &places[hidden.clone()] {
-                            let button = egui::Button::new(level.name.as_str()).truncate();
-                            let item = ui.add(button).on_hover_text(&level.detail);
-                            hits.push((level.id, item.rect));
-                            if item.clicked() {
-                                go = Some(level.id);
-                                ui.close();
+                        ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                            for level in &places[hidden.clone()] {
+                                let button = egui::Button::new(level.name.as_str()).truncate();
+                                let item = ui.add(button).on_hover_text(&level.detail);
+                                hits.push((level.id, item.rect));
+                                if item.clicked() {
+                                    go = Some(level.id);
+                                    ui.close();
+                                }
                             }
-                        }
+                        });
                     });
                     hits.push((MORE_LEVELS, menu.response.rect));
                     menu.response
@@ -361,15 +363,17 @@ pub fn panel(
                 hits.push((MORE_LEVELS, response.rect));
                 Popup::menu(&response).show(|ui| {
                     ui.set_max_width(300.0);
-                    for level in &spec.places[hidden.clone()] {
-                        let button = egui::Button::new(level.name.as_str()).truncate();
-                        let item = ui.add(button).on_hover_text(&level.detail);
-                        hits.push((level.id, item.rect));
-                        if item.clicked() {
-                            result.go = Some(level.id);
-                            ui.close();
+                    ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                        for level in &spec.places[hidden.clone()] {
+                            let button = egui::Button::new(level.name.as_str()).truncate();
+                            let item = ui.add(button).on_hover_text(&level.detail);
+                            hits.push((level.id, item.rect));
+                            if item.clicked() {
+                                result.go = Some(level.id);
+                                ui.close();
+                            }
                         }
-                    }
+                    });
                 });
                 depth += 1.0;
             }

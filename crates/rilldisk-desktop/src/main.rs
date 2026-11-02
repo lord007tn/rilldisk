@@ -105,6 +105,11 @@ fn main() -> eframe::Result {
     let updates_tour = tour_name.as_deref() == Some("updates");
     let issues_tour = match tour_name.as_deref() {
         None => false,
+        Some("updates") if path.is_some() => {
+            attach_console();
+            eprintln!("--tour updates runs with --capture DIR, without PATH.");
+            return Ok(());
+        }
         Some("updates") if matches!(capture, Some((_, Capture::Tour))) => false,
         Some("navigation") if path.is_some() && matches!(capture, Some((_, Capture::Tour))) => {
             false

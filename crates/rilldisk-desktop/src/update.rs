@@ -353,18 +353,30 @@ pub fn set_automatic_checks(enabled: bool) -> Result<(), String> {
 /// Installer receipts are displayed by the desktop, never fabricated from a launch.
 pub fn installer_notice() -> Option<Result<String, String>> {
     #[cfg(windows)]
-    match up::msi::take_result() {
-        Ok(Some(up::msi::Status::Finished {
-            version,
-            reboot_required,
-        })) => {
-            return Some(Ok(if reboot_required {
-                format!("Restart Windows to finish updating to {version}")
-            } else {
-                format!("Updated to RillDisk {version}")
-            }));
+    match up::msi::take_results() {
+        Ok(results) if !results.is_empty() => {
+            let mut notices = Vec::new();
+            let mut failed = false;
+            for result in results {
+                match result {
+                    up::msi::Status::Finished {
+                        version,
+                        reboot_required,
+                    } => notices.push(if reboot_required {
+                        format!("Restart Windows to finish updating to {version}")
+                    } else {
+                        format!("Updated to RillDisk {version}")
+                    }),
+                    up::msi::Status::Failed(error) => {
+                        failed = true;
+                        notices.push(error);
+                    }
+                    _ => {}
+                }
+            }
+            let message = notices.join("\n");
+            return Some(if failed { Err(message) } else { Ok(message) });
         }
-        Ok(Some(up::msi::Status::Failed(error))) => return Some(Err(error)),
         Err(error) => {
             return Some(Err(format!(
                 "Could not read the installer result: {error:#}"

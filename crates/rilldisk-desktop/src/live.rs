@@ -15,7 +15,7 @@ pub struct Anim {
     rects: HashMap<String, Rect>,
     last_time: Option<f64>,
     pressed: Option<usize>,
-    /// The folder the user just left, marked in the list once it is back in view.
+    /// Selected folder; going up selects the branch the user just left.
     came_from: Option<usize>,
     reveal: bool,
 }
@@ -36,6 +36,35 @@ impl Anim {
         self.reset();
         self.came_from = came_from;
         self.reveal = came_from.is_some();
+    }
+
+    #[cfg(test)]
+    pub fn selection(&self) -> Option<usize> {
+        self.came_from
+    }
+
+    /// Select a visible folder, or open the selected folder on Enter.
+    pub fn keyboard(
+        &mut self,
+        view: &LiveView,
+        up: bool,
+        down: bool,
+        enter: bool,
+    ) -> Option<usize> {
+        if (up || down) && !view.folders.is_empty() {
+            let position = self
+                .came_from
+                .and_then(|id| view.folders.iter().position(|f| f.id == id));
+            let next = match position {
+                None => 0,
+                Some(p) if up => p.saturating_sub(1),
+                Some(p) => (p + 1).min(view.folders.len() - 1),
+            };
+            self.came_from = Some(view.folders[next].id);
+            self.reveal = true;
+        }
+        self.came_from
+            .filter(|id| enter && view.folders.iter().any(|f| f.id == *id))
     }
 
     /// Move the remembered rect for `key` toward `target`.
