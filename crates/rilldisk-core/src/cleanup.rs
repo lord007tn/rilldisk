@@ -285,14 +285,16 @@ impl Guard {
 
     /// Refuse `path` and its ancestors.
     pub fn protect(&mut self, path: &Path, why: &'static str) {
-        self.exact
-            .push((canonical(path).unwrap_or_else(|| path.into()), why));
+        for form in spellings(path) {
+            self.exact.push((form, why));
+        }
     }
 
     /// Refuse `path`, its ancestors and everything inside it.
     pub fn protect_tree(&mut self, path: &Path, why: &'static str) {
-        self.trees
-            .push((canonical(path).unwrap_or_else(|| path.into()), why));
+        for form in spellings(path) {
+            self.trees.push((form, why));
+        }
     }
 
     /// Why `path` (canonical) is protected, if it is.
@@ -319,6 +321,18 @@ impl Guard {
         }
         None
     }
+}
+
+/// `path` as given and as resolved, when they differ: on macOS `/var` and
+/// `/tmp` are links into `/private`, and either spelling must be refused.
+fn spellings(path: &Path) -> Vec<PathBuf> {
+    let mut forms = vec![path.to_path_buf()];
+    if let Some(resolved) = canonical(path)
+        && resolved != path
+    {
+        forms.push(resolved);
+    }
+    forms
 }
 
 /// Reasons that do not depend on the filesystem's current state. Used to keep
