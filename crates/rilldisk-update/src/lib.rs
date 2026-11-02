@@ -28,7 +28,8 @@ mod state;
 
 pub use archive::extract_binaries;
 pub use install::{
-    InstallSource, Installed, Plan, apply_archive, cleanup_previous_update, detect_install, install,
+    INSTALL_MARKER, InstallSource, Installed, Package, Plan, apply_archive,
+    cleanup_previous_update, detect_install, install,
 };
 pub use net::{check, fetch_feed, fetch_releases};
 pub use state::{CHECK_INTERVAL_SECS, State, state_path};
@@ -141,11 +142,34 @@ pub struct Release {
     /// Archive name -> SHA-256 from the release's update feed. Empty when the
     /// release was read from the API; `SHA256SUMS` is used then.
     pub checksums: std::collections::BTreeMap<String, String>,
+    /// Installers and system packages listed in the feed (MSI, .deb, .rpm,
+    /// AppImage, .dmg). Empty when the release was read from the API.
+    pub packages: Vec<PackageFile>,
+}
+
+/// An installer or system package attached to a release.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackageFile {
+    /// `msi`, `deb`, `rpm`, `appimage` or `dmg`.
+    pub kind: String,
+    /// Rust target triple the package was built from.
+    pub target: String,
+    /// Asset name; the download is `Release::asset(name)`.
+    pub name: String,
 }
 
 impl Release {
     pub fn asset(&self, name: &str) -> Option<&Asset> {
         self.assets.iter().find(|a| a.name == name)
+    }
+
+    /// The installer of `kind` (`msi`, `deb`, ...) built for `target`, if the
+    /// release's feed lists one.
+    pub fn package_asset(&self, kind: &str, target: &str) -> Option<&Asset> {
+        self.packages
+            .iter()
+            .find(|p| p.kind == kind && p.target == target)
+            .and_then(|p| self.asset(&p.name))
     }
 
     /// True when this release ships an archive for `target` plus checksums.
@@ -166,11 +190,20 @@ impl Release {
 /// notes: https://github.com/lord007tn/rilldisk/releases/tag/v0.1.0
 /// files:
 ///   - target: x86_64-pc-windows-msvc
+///     kind: archive
 ///     name: rilldisk-v0.1.0-x86_64-pc-windows-msvc.zip
 ///     url: https://github.com/lord007tn/rilldisk/releases/download/v0.1.0/rilldisk-v0.1.0-x86_64-pc-windows-msvc.zip
 ///     sha256: <64 hex digits>
 ///     size: 8898788
+///   - target: x86_64-pc-windows-msvc
+///     kind: msi
+///     name: RillDisk-0.1.0-x64.msi
+///     ...
 /// ```
+///
+/// `kind` defaults to `archive` (feeds before 0.1.1 had no `kind`). Archives
+/// are what [`install`] uses; other kinds are offered as downloads to copies
+/// that a package installed.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Feed {
@@ -184,6 +217,10 @@ struct Feed {
 
 #[derive(Debug, Deserialize)]
 struct FeedFile {
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
     name: String,
     url: String,
     sha256: String,
@@ -209,6 +246,7 @@ pub fn parse_feed(yaml: &[u8]) -> Result<Release> {
     );
     let mut assets = Vec::new();
     let mut checksums = std::collections::BTreeMap::new();
+    let mut packages = Vec::new();
     for file in feed.files {
         let sha = file.sha256.to_ascii_lowercase();
         if file.url != format!("{base}{}", file.name)
@@ -218,6 +256,15 @@ pub fn parse_feed(yaml: &[u8]) -> Result<Release> {
             anyhow::bail!("latest.yml lists an unexpected file: {}", file.name);
         }
         checksums.insert(file.name.clone(), sha);
+        match (file.kind.as_deref(), file.target) {
+            (None | Some("archive"), _) => {}
+            (Some(kind), Some(target)) => packages.push(PackageFile {
+                kind: kind.to_owned(),
+                target,
+                name: file.name.clone(),
+            }),
+            (Some(_), None) => anyhow::bail!("latest.yml lists {} without a target", file.name),
+        }
         assets.push(Asset {
             name: file.name,
             url: file.url,
@@ -231,6 +278,7 @@ pub fn parse_feed(yaml: &[u8]) -> Result<Release> {
         notes_url: feed.notes,
         assets,
         checksums,
+        packages,
     })
 }
 
@@ -270,6 +318,7 @@ pub fn parse_release_page(json: &[u8]) -> Result<(Vec<Release>, usize)> {
                 notes_url: r.html_url,
                 assets: r.assets,
                 checksums: Default::default(),
+                packages: Vec::new(),
             })
         })
         .collect();
@@ -296,12 +345,32 @@ pub fn select_update<'a>(
 pub const fn target() -> Option<&'static str> {
     if cfg!(all(windows, target_arch = "x86_64", target_env = "msvc")) {
         Some("x86_64-pc-windows-msvc")
+    } else if cfg!(all(windows, target_arch = "aarch64", target_env = "msvc")) {
+        Some("aarch64-pc-windows-msvc")
     } else if cfg!(all(
         target_os = "linux",
         target_arch = "x86_64",
         target_env = "gnu"
     )) {
         Some("x86_64-unknown-linux-gnu")
+    } else if cfg!(all(
+        target_os = "linux",
+        target_arch = "aarch64",
+        target_env = "gnu"
+    )) {
+        Some("aarch64-unknown-linux-gnu")
+    } else if cfg!(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "musl"
+    )) {
+        Some("x86_64-unknown-linux-musl")
+    } else if cfg!(all(
+        target_os = "linux",
+        target_arch = "aarch64",
+        target_env = "musl"
+    )) {
+        Some("aarch64-unknown-linux-musl")
     } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         Some("aarch64-apple-darwin")
     } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {

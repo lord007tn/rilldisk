@@ -38,7 +38,12 @@ pub async fn run(args: Args) -> Result<ExitCode> {
     tokio::task::spawn_blocking(move || run_blocking(args)).await?
 }
 
-fn unavailable(args: &Args, reason: &str, command: Option<&str>) -> Result<ExitCode> {
+fn unavailable(
+    args: &Args,
+    reason: &str,
+    command: Option<&str>,
+    download: Option<&str>,
+) -> Result<ExitCode> {
     if args.json {
         println!(
             "{}",
@@ -47,12 +52,16 @@ fn unavailable(args: &Args, reason: &str, command: Option<&str>) -> Result<ExitC
                 "update_available": null,
                 "unavailable": reason,
                 "update_command": command,
+                "download_url": download,
             })
         );
     } else {
         eprintln!("{reason}");
         if let Some(command) = command {
             eprintln!("Update with: {command}");
+        }
+        if let Some(url) = download {
+            eprintln!("Download:    {url}");
         }
     }
     Ok(ExitCode::from(UNAVAILABLE))
@@ -67,12 +76,14 @@ fn run_blocking(args: Args) -> Result<ExitCode> {
             &args,
             &format!("Update checks are disabled by {DISABLE_ENV}."),
             None,
+            None,
         );
     }
     let Some(target) = target() else {
         return unavailable(
             &args,
             "No prebuilt RillDisk release exists for this platform; build from source.",
+            None,
             None,
         );
     };
@@ -94,9 +105,21 @@ fn run_blocking(args: Args) -> Result<ExitCode> {
         &current,
     )?;
     let check = rilldisk_update::check(channel)?;
-    let managed = match source {
-        InstallSource::Managed { manager, command } => Some((manager, command)),
-        InstallSource::Standalone => None,
+    let (managed, package) = match source {
+        InstallSource::Managed {
+            manager,
+            command,
+            package,
+        } => (Some((manager, command)), package),
+        InstallSource::Standalone => (None, None),
+    };
+    // A copy installed by an MSI, .deb, .rpm, AppImage or .dmg is offered the
+    // same kind of package from the new release.
+    let download = match (&check.update, package) {
+        (Some(release), Some(package)) => release
+            .package_asset(package.kind(), target)
+            .map(|asset| asset.url.clone()),
+        _ => None,
     };
 
     if args.check {
@@ -106,7 +129,13 @@ fn run_blocking(args: Args) -> Result<ExitCode> {
             _ => None,
         };
         let blocked = (managed.is_some() || manual.is_some()) && check.update.is_some();
-        report(&check, managed, manual.as_deref(), args.json)?;
+        report(
+            &check,
+            managed,
+            manual.as_deref(),
+            download.as_deref(),
+            args.json,
+        )?;
         // Same codes as `rilldisk update`: a copy that cannot update itself gets 11.
         return Ok(ExitCode::from(if blocked {
             UNAVAILABLE
@@ -132,6 +161,7 @@ fn run_blocking(args: Args) -> Result<ExitCode> {
                 release.version
             ),
             Some(command),
+            download.as_deref().or(Some(release.notes_url.as_str())),
         );
     }
     let plan = plan?;
@@ -174,6 +204,7 @@ fn report(
     check: &Check,
     managed: Option<(&str, &str)>,
     manual: Option<&str>,
+    download: Option<&str>,
     json: bool,
 ) -> Result<()> {
     let latest = check.update.as_ref();
@@ -194,6 +225,7 @@ fn report(
                 "notes_url": latest.map(|r| r.notes_url.clone()),
                 "managed_by": managed.map(|(m, _)| m),
                 "update_command": latest.and(command),
+                "download_url": download,
                 "cannot_self_update": manual,
             })
         );
@@ -206,7 +238,12 @@ fn report(
             println!("Latest:  {}", release.version);
             println!("Notes:   {}", release.notes_url);
             match (command, manual) {
-                (Some(command), _) => println!("Update with: {command}"),
+                (Some(command), _) => {
+                    println!("Update with: {command}");
+                    if let Some(url) = download {
+                        println!("Download:    {url}");
+                    }
+                }
                 (None, Some(reason)) => {
                     println!("This copy cannot update itself: {reason}");
                     println!("Download:    {}", release.notes_url);

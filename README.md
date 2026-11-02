@@ -68,24 +68,42 @@ MCP server so your AI assistant sees exactly what you see.
 
 ## Get started
 
-Download the archive for your system from
-[Releases](https://github.com/lord007tn/rilldisk/releases): Windows x64, Linux x64,
-or macOS (Apple Silicon and Intel). Extract it anywhere. It contains two programs:
+Grab the package for your system from the
+[latest release](https://github.com/lord007tn/rilldisk/releases/latest):
 
-* **`rilldisk-desktop`** — the desktop app. Pick a drive, a place or any folder.
-* **`rilldisk`** — the CLI and MCP server.
+| System | Install | Get |
+| --- | --- | --- |
+| **Windows 10/11** (x64, ARM64) | Installer: Start menu entry, `rilldisk` on PATH, clean uninstall | `RillDisk-<version>-x64.msi` / `-arm64.msi` |
+| | Portable, no admin rights | `rilldisk-<tag>-<arch>-pc-windows-msvc.zip` |
+| **macOS 11+** (Apple silicon, Intel) | Drag RillDisk.app to Applications | `RillDisk-<version>-arm64.dmg` / `-x64.dmg` |
+| **Debian, Ubuntu, Mint, Pop!_OS** | `sudo apt install ./rilldisk_<version>_amd64.deb` | `.deb` (amd64, arm64) |
+| **Fedora, RHEL, Rocky, Alma, openSUSE** | `sudo dnf install ./rilldisk-<version>-1.x86_64.rpm` | `.rpm` (x86_64, aarch64) |
+| **Any Linux desktop** (Arch, Manjaro, ...) | `chmod +x` and run; no install | `RillDisk-<version>-x86_64.AppImage` / `-aarch64` |
+| **Servers, containers, Alpine** | Static CLI and MCP server, zero dependencies | `rilldisk-<tag>-<arch>-unknown-linux-musl.tar.gz` |
 
-No installer, no admin rights, no account. Protected system folders are listed under
-**Unread** and the result is clearly marked partial. Builds are not code-signed
-yet, so Windows SmartScreen and macOS Gatekeeper may warn; every release ships
-`SHA256SUMS` and GitHub build attestations.
+Linux builds run on glibc 2.28 and newer (Debian 10+, Ubuntu 20.04+, RHEL 8+).
+Every release carries `SHA256SUMS` and GitHub build attestations. Builds are not
+code-signed or notarized yet, so Windows SmartScreen and macOS Gatekeeper may ask
+you to confirm the first launch; [docs/INSTALL.md](docs/INSTALL.md) has the steps
+for each system, verification and uninstalling.
+
+Each package holds two programs:
+
+* **`rilldisk-desktop`** (RillDisk in your app menu): the desktop app. Pick a drive,
+  a place or any folder.
+* **`rilldisk`**: the CLI and MCP server.
+
+No account, no admin rights to scan. Protected system folders are listed under
+**Issues** and the result is clearly marked partial.
 
 **Updates.** The desktop checks GitHub once a day for a newer release and offers
 it; nothing is installed until you click **Install and restart**. From a terminal,
 `rilldisk update --check` reports whether a newer release exists and
 `rilldisk update` downloads it, verifies its SHA-256 and replaces both programs
-after you confirm. Both read the small `latest.yml` feed published with every
-release. Set `RILLDISK_NO_UPDATE_CHECK=1` to turn update checks off entirely
+after you confirm. Installed with the MSI, a `.deb`, an `.rpm`, the AppImage or the
+`.dmg`? Then RillDisk never touches its own files: it offers the matching new
+package to download instead. Both read the small `latest.yml` feed published with
+every release. Set `RILLDISK_NO_UPDATE_CHECK=1` to turn update checks off entirely
 ([details](docs/proposals/updates.md)).
 
 | Shortcut | Action |
@@ -242,8 +260,9 @@ snapshots.
 
 ## Build from source
 
-Windows x64 with [Rust stable](https://rustup.rs/), Visual Studio C++ Build Tools and
-the Windows SDK:
+Windows (x64 or ARM64) with [Rust stable](https://rustup.rs/), Visual Studio C++
+Build Tools and the Windows SDK (its `rc.exe` embeds the icon, version details and
+manifest; set `RC_PATH` if the build cannot find it):
 
 ```powershell
 cargo build --release --locked
@@ -276,6 +295,12 @@ python scripts/test_mcp.py target/release/rilldisk.exe
 python scripts/make_demo_fixture.py "C:\RillDisk Demo"       # synthetic demo disk
 target\release\rilldisk-desktop.exe "C:\RillDisk Demo" --capture shots   # screenshots + frames
 ```
+
+Release archives and installers (MSI, `.deb`, `.rpm`, AppImage, `.dmg`) are built by
+`scripts/package_release.py` and `scripts/package_installers.py`; the
+[release workflow](.github/workflows/release.yml) runs them for all eight targets
+and installs each package before publishing. See
+[docs/INSTALL.md](docs/INSTALL.md#building-the-packages).
 
 Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Security
 reports: [SECURITY.md](SECURITY.md).

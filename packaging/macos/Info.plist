@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleDisplayName</key>
+  <string>RillDisk</string>
+  <key>CFBundleExecutable</key>
+  <string>rilldisk-desktop</string>
+  <key>CFBundleIconFile</key>
+  <string>rilldisk.icns</string>
+  <key>CFBundleIdentifier</key>
+  <string>io.github.lord007tn.RillDisk</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>RillDisk</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>@SHORT_VERSION@</string>
+  <key>CFBundleVersion</key>
+  <string>@VERSION@</string>
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.utilities</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>@MIN_MACOS@</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+  <key>NSSupportsAutomaticGraphicsSwitching</key>
+  <true/>
+  <key>NSHumanReadableCopyright</key>
+  <string>AGPL-3.0-only. Copyright © RillDisk contributors.</string>
+  <!-- Shown when macOS asks before RillDisk reads a protected folder. RillDisk
+       reads names and sizes only, never file contents. -->
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>RillDisk measures the size of files on your Desktop. It reads names and sizes only, never contents.</string>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>RillDisk measures the size of files in Documents. It reads names and sizes only, never contents.</string>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>RillDisk measures the size of files in Downloads. It reads names and sizes only, never contents.</string>
+  <key>NSRemovableVolumesUsageDescription</key>
+  <string>RillDisk measures the size of files on removable drives. It reads names and sizes only, never contents.</string>
+  <key>NSNetworkVolumesUsageDescription</key>
+  <string>RillDisk measures the size of files on network drives. It reads names and sizes only, never contents.</string>
+</dict>
+</plist>

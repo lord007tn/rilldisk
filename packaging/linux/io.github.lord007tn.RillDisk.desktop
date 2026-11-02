@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=RillDisk
+GenericName=Disk Usage Analyzer
+Comment=See what fills your disks and what you can safely free
+Exec=rilldisk-desktop
+Icon=io.github.lord007tn.RillDisk
+Terminal=false
+Categories=System;Utility;Filesystem;
+Keywords=disk;space;usage;storage;treemap;cleanup;analyzer;
+StartupNotify=true
+StartupWMClass=io.github.lord007tn.RillDisk

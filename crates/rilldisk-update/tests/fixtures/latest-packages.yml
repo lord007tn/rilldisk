@@ -1,0 +1,25 @@
+# RillDisk update feed: read by `rilldisk update` and the desktop app.
+version: 0.1.1
+tag: v0.1.1
+prerelease: false
+releaseDate: '2026-11-03T18:00:00Z'
+notes: https://github.com/lord007tn/rilldisk/releases/tag/v0.1.1
+files:
+  - target: x86_64-pc-windows-msvc
+    kind: archive
+    name: rilldisk-v0.1.1-x86_64-pc-windows-msvc.zip
+    url: https://github.com/lord007tn/rilldisk/releases/download/v0.1.1/rilldisk-v0.1.1-x86_64-pc-windows-msvc.zip
+    sha256: 0f343b0931126a20f133d67c2b018a3b5c3a3ca7ff2b4f2e0f8a3e1b8e2c1d3a
+    size: 8898788
+  - target: x86_64-pc-windows-msvc
+    kind: msi
+    name: RillDisk-0.1.1-x64.msi
+    url: https://github.com/lord007tn/rilldisk/releases/download/v0.1.1/RillDisk-0.1.1-x64.msi
+    sha256: 2f343b0931126a20f133d67c2b018a3b5c3a3ca7ff2b4f2e0f8a3e1b8e2c1d3a
+    size: 9100000
+  - target: aarch64-unknown-linux-gnu
+    kind: deb
+    name: rilldisk_0.1.1_arm64.deb
+    url: https://github.com/lord007tn/rilldisk/releases/download/v0.1.1/rilldisk_0.1.1_arm64.deb
+    sha256: 3f343b0931126a20f133d67c2b018a3b5c3a3ca7ff2b4f2e0f8a3e1b8e2c1d3a
+    size: 7000000

@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  RillDisk Windows Installer package (WiX Toolset v5). Built by
+  `python scripts/package_installers.py msi`, which passes:
+
+    Version     numeric product version, e.g. 0.1.1 (pre-release suffix dropped)
+    Stage       folder holding rilldisk.exe, rilldisk-desktop.exe, the notices
+                and the `installed-by` marker
+    PackagingDir  this folder's parent (icons, license.rtf)
+
+  Per-machine install to "Program Files\RillDisk": Start menu shortcut, the
+  CLI on the system PATH, an Apps & features entry with icon and links. A
+  newer MSI upgrades in place; uninstalling removes everything it added.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <!-- UpgradeCode never changes: it ties every RillDisk MSI together. -->
+  <Package Name="RillDisk"
+           Manufacturer="RillDisk contributors"
+           Version="$(Version)"
+           UpgradeCode="{5B0E7C3A-4F7E-4C1B-9A55-2D7C1E0B9F41}"
+           Scope="perMachine"
+           Compressed="yes"
+           Language="1033"
+           InstallerVersion="500">
+    <SummaryInformation Description="RillDisk disk usage analyzer" Manufacturer="RillDisk contributors" />
+
+    <!-- Same-version upgrades let 0.2.0 replace 0.2.0-beta.1 (both are 0.2.0 to
+         MSI). Validation reports this as ICE61, a warning, on purpose. -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of RillDisk is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Icon Id="RillDiskIcon" SourceFile="$(PackagingDir)\icons\rilldisk.ico" />
+    <Property Id="ARPPRODUCTICON" Value="RillDiskIcon" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/lord007tn/rilldisk" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/lord007tn/rilldisk/issues" />
+    <Property Id="ARPURLUPDATEINFO" Value="https://github.com/lord007tn/rilldisk/releases" />
+    <Property Id="ARPCOMMENTS" Value="Fast, read-only disk usage analyzer with a CLI and MCP server" />
+    <!-- Remember a custom install folder so upgrades go to the same place. -->
+    <Property Id="INSTALLFOLDER">
+      <RegistrySearch Id="InstallFolderSearch" Root="HKLM" Key="Software\RillDisk" Name="InstallFolder" Type="raw" />
+    </Property>
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="RillDisk" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="Programs" Directory="INSTALLFOLDER">
+      <Component Id="DesktopApp">
+        <File Id="DesktopExe" Source="$(Stage)\rilldisk-desktop.exe" KeyPath="yes" />
+      </Component>
+      <!-- Start menu entry; the icon comes from the program itself. HKMU is
+           HKLM for this per-machine package, which ICE57 cannot tell
+           statically, so validation suppresses ICE57 (see package_installers.py). -->
+      <Component Id="StartMenu" Directory="ProgramMenuFolder">
+        <Shortcut Id="StartMenuShortcut"
+                  Name="RillDisk"
+                  Description="See what fills your disks and what you can safely free"
+                  Target="[INSTALLFOLDER]rilldisk-desktop.exe"
+                  WorkingDirectory="INSTALLFOLDER" />
+        <RegistryValue Root="HKMU" Key="Software\RillDisk" Name="StartMenuShortcut"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+      <Component Id="Cli">
+        <File Id="CliExe" Source="$(Stage)\rilldisk.exe" KeyPath="yes" />
+        <!-- `rilldisk` in every new terminal. -->
+        <Environment Id="PathEntry" Name="PATH" Value="[INSTALLFOLDER]" Part="last"
+                     Action="set" System="yes" Permanent="no" />
+      </Component>
+      <Component Id="InstallRecord">
+        <!-- Tells `rilldisk update` this copy is updated by a newer MSI. -->
+        <File Id="InstalledBy" Source="$(Stage)\installed-by" KeyPath="yes" />
+        <RegistryValue Root="HKLM" Key="Software\RillDisk" Name="InstallFolder" Type="string" Value="[INSTALLFOLDER]" />
+      </Component>
+      <!-- LICENSE, README, BUILD-MANIFEST.json, the Rust toolchain notices and
+           every dependency's license text, harvested from the staged archive. -->
+      <Files Include="$(Stage)\**">
+        <Exclude Files="$(Stage)\rilldisk.exe" />
+        <Exclude Files="$(Stage)\rilldisk-desktop.exe" />
+        <Exclude Files="$(Stage)\installed-by" />
+        <Exclude Files="$(Stage)\START-HERE.md" />
+      </Files>
+    </ComponentGroup>
+
+    <Feature Id="Main" Title="RillDisk" Level="1" AllowAbsent="no">
+      <ComponentGroupRef Id="Programs" />
+    </Feature>
+
+    <!-- Offer to start RillDisk on the last page. -->
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch RillDisk" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <Property Id="WixShellExecTarget" Value="[#DesktopExe]" />
+    <CustomAction Id="LaunchRillDisk" DllEntry="WixShellExec" Impersonate="yes"
+                  BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" />
+
+    <WixVariable Id="WixUILicenseRtf" Value="$(PackagingDir)\windows\license.rtf" />
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+    <UI>
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchRillDisk"
+               Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed" />
+    </UI>
+  </Package>
+</Wix>

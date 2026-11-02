@@ -61,15 +61,36 @@ those installs and leaves them alone.
    version`, so the binary reports the same version the updater compares. The
    tag must also point at a commit on `main`. A `-suffix` (`-alpha.N`,
    `-rc.N`) marks the release as a pre-release.
-2. **Build.** One job per target: `x86_64-pc-windows-msvc` (windows-2025),
-   `x86_64-unknown-linux-gnu` (ubuntu-22.04 for a glibc 2.35 baseline),
-   `aarch64-apple-darwin` and `x86_64-apple-darwin` (macos-15, x86_64
-   cross-compiled). Native targets run a smoke test: `--version`, the update
-   opt-out (exit 11) and the stdio MCP acceptance test.
-   `scripts/package_release.py package` builds the archive. Each archive holds
-   both binaries, LICENSE, README.md, START-HERE.md, BUILD-MANIFEST.json, the
-   Rust toolchain notices and the THIRD-PARTY-LICENSES folder and inventory for
-   that target's dependency graph.
+2. **Build.** One job per target, each on a runner of that architecture so
+   every build is tested where it runs:
+
+   | target | runner | ships |
+   | --- | --- | --- |
+   | `x86_64-pc-windows-msvc` | windows-2025 | .zip, .msi |
+   | `aarch64-pc-windows-msvc` | windows-11-arm | .zip, .msi |
+   | `x86_64-unknown-linux-gnu` | ubuntu-24.04 | .tar.gz, .deb, .rpm, .AppImage |
+   | `aarch64-unknown-linux-gnu` | ubuntu-24.04-arm | .tar.gz, .deb, .rpm, .AppImage |
+   | `x86_64-unknown-linux-musl` | ubuntu-24.04 | .tar.gz (CLI only, static) |
+   | `aarch64-unknown-linux-musl` | ubuntu-24.04-arm | .tar.gz (CLI only, static) |
+   | `aarch64-apple-darwin` | macos-15 | .tar.gz, .dmg |
+   | `x86_64-apple-darwin` | macos-15-intel | .tar.gz, .dmg |
+
+   Linux builds link with zig (`cargo zigbuild`, pinned) against glibc 2.28,
+   so one binary runs on Debian 10+, Ubuntu 20.04+ and RHEL 8+; a step fails
+   the build if any symbol needs a newer glibc. The desktop loads its window
+   and GPU libraries at run time, so the programs link nothing but glibc.
+   Every target runs a smoke test: `--version`, the update opt-out (exit 11)
+   and the stdio MCP acceptance test. `scripts/package_release.py package`
+   builds the archive. Each archive holds the programs, LICENSE, README.md,
+   START-HERE.md, BUILD-MANIFEST.json, the Rust toolchain notices and the
+   THIRD-PARTY-LICENSES folder and inventory for that target's dependency
+   graph. `scripts/package_installers.py` then builds the installers from the
+   archive's own files and the job installs each one: the MSI is installed,
+   run, checked for its Start menu entry and PATH entry, then uninstalled and
+   checked for leftovers; the .deb is installed with apt, its desktop entry and
+   AppStream data validated, then removed; the .rpm's metadata is listed; the
+   AppImage is started; the .dmg is mounted, its signature verified and the
+   app run from it. Each installed copy must report itself as package-managed.
 3. **Notes.** `npx changelogithub@15.0.5 --output` builds the notes from
    Conventional Commits since the previous tag. `changelogithub.config.json`
    shows Features, Bug Fixes, Performance, Documentation and Breaking Changes.
@@ -78,8 +99,8 @@ those installs and leaves them alone.
    release-wide `BUILD-MANIFEST.json` and the `latest.yml` update feed, then
    checks the sums with `sha256sum --check`.
 5. **Publish** (tag pushes only, `release` environment). Creates a Sigstore
-   build-provenance attestation for every archive (`gh attestation verify
-   <archive> --repo lord007tn/rilldisk`). Then `gh release create --verify-tag`
+   build-provenance attestation for every archive and installer
+   (`gh attestation verify <file> --repo lord007tn/rilldisk`). Then `gh release create --verify-tag`
    uploads every asset to a draft before publishing, so an updater never sees
    a release without `SHA256SUMS` or `latest.yml`.
 
@@ -89,19 +110,31 @@ Every release carries `latest.yml`, in the spirit of electron-updater's feed:
 
 ```yaml
 # RillDisk update feed: read by `rilldisk update` and the desktop app.
-version: 0.1.0
-tag: v0.1.0
+version: 0.1.1
+tag: v0.1.1
 prerelease: false
-releaseDate: '2026-11-01T18:00:00Z'
-notes: https://github.com/lord007tn/rilldisk/releases/tag/v0.1.0
+releaseDate: '2026-11-03T18:00:00Z'
+notes: https://github.com/lord007tn/rilldisk/releases/tag/v0.1.1
 files:
   - target: x86_64-pc-windows-msvc
-    name: rilldisk-v0.1.0-x86_64-pc-windows-msvc.zip
-    url: https://github.com/lord007tn/rilldisk/releases/download/v0.1.0/rilldisk-v0.1.0-x86_64-pc-windows-msvc.zip
+    kind: archive
+    name: rilldisk-v0.1.1-x86_64-pc-windows-msvc.zip
+    url: https://github.com/lord007tn/rilldisk/releases/download/v0.1.1/rilldisk-v0.1.1-x86_64-pc-windows-msvc.zip
     sha256: <64 hex digits>
     size: 8898788
-  # ... one entry per target
+  - target: x86_64-pc-windows-msvc
+    kind: msi
+    name: RillDisk-0.1.1-x64.msi
+    url: https://github.com/lord007tn/rilldisk/releases/download/v0.1.1/RillDisk-0.1.1-x64.msi
+    sha256: <64 hex digits>
+    size: 8401720
+  # ... one archive per target, plus each installer (msi, deb, rpm, appimage, dmg)
 ```
+
+`kind` is `archive` (what `rilldisk update` installs) or the installer type a
+package-installed copy is pointed at. Feeds written before 0.1.1 have no
+`kind`; their entries are archives. Older clients ignore `kind` and still find
+their archive, so adding installers to the feed changes nothing for them.
 
 The stable channel reads it through GitHub's fixed link to the newest stable
 release, `https://github.com/lord007tn/rilldisk/releases/latest/download/latest.yml`:
@@ -231,6 +264,14 @@ and Apple notarization follow once certificates exist.
   `brew upgrade rilldisk`, ...). Packagers can set `RILLDISK_PACKAGE_MANAGER`
   (and optionally `RILLDISK_UPDATE_COMMAND`) at build time to switch
   self-update off.
+* **RillDisk's own packages.** The MSI, .deb, .rpm and AppImage install a
+  one-word `installed-by` marker (next to the programs for the MSI, in
+  `usr/share/rilldisk/` otherwise); `RillDisk.app` is recognized by its
+  bundle path. Such copies are never modified either. The CLI prints and the
+  desktop offers a **Download** link to the same kind of package for the same
+  target from the new release (listed in `latest.yml` with `kind:` and
+  `target:`), plus the command that installs it. Opening that link is the
+  user's choice; RillDisk never downloads or runs an installer itself.
 * **No elevation.** If the folder is not writable (for example
   `Program Files`), the update fails with a message and changes nothing.
 * **Notices.** Only the executables are replaced. LICENSE and the third-party
@@ -268,9 +309,39 @@ background threads:
 
 ## Not included
 
-Silent or background installs, delta updates, rollback to older versions, an
-update tool in MCP, elevation, analytics of any kind, and installer packages.
-Each would need its own proposal.
+Silent or background installs, running an installer from the updater, delta
+updates (the AppImage's `.zsync` file serves external tools such as
+AppImageUpdate, not RillDisk), rollback to older versions, an update tool in
+MCP, elevation, and analytics of any kind. Each would need its own proposal.
+
+## Installer packages
+
+Scope of the packages added in 0.1.1, all built and tested in the release
+workflow:
+
+* **MSI** (WiX Toolset 5, pinned). Per-machine install to
+  `Program Files\RillDisk`: Start menu entry, the CLI on the system PATH, an
+  Apps & features entry with icon and links, `installed-by`. Installing asks
+  for administrator approval through Windows Installer, as every per-machine
+  installer does; RillDisk itself still never elevates. A newer MSI upgrades
+  in place (same UpgradeCode), an older one refuses to downgrade, and
+  uninstalling removes every file, the shortcut and the PATH entry. The
+  portable .zip stays available for installs without admin rights.
+* **.deb / .rpm.** `/usr/bin/rilldisk` and `/usr/bin/rilldisk-desktop`, the
+  desktop entry, hicolor icons, AppStream metadata, licenses and notices. The
+  only hard dependency is glibc; the window and GPU libraries are recommended
+  (weak) dependencies because the CLI needs none of them. No maintainer
+  scripts run at install time.
+* **AppImage** (appimagetool and the type 2 runtime, pinned by SHA-256). The
+  desktop app and the CLI in one file, with zsync update information for
+  external tools.
+* **.dmg.** `RillDisk.app` (ad-hoc signed, not notarized) with the CLI inside
+  at `Contents/MacOS/rilldisk`, an Applications link and a note on adding the
+  CLI to PATH. The Info.plist carries usage descriptions for the folders
+  macOS protects, stating that RillDisk reads names and sizes only.
+
+Windows executables also embed an icon, version information and a manifest
+(`asInvoker`, per-monitor DPI awareness, long paths).
 
 ## Tests
 
@@ -285,5 +356,6 @@ No test touches the network. They cover:
 * checksum mismatch, a missing sibling binary and path-traversal entries;
 * zip and tar.gz swaps, including the executable bit;
 * `.old` cleanup;
-* package-manager path detection;
+* package-manager path detection and `installed-by` markers;
+* package entries in `latest.yml` (`kind`, `target`) and old feeds without them;
 * the daily throttle and the env opt-out parsing.

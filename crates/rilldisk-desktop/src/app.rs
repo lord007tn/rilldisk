@@ -127,7 +127,7 @@ enum Action {
     Theme(bool),
     Identity(Identity),
     /// The user agreed to install this update.
-    Install(update::Release),
+    Install(Box<update::Release>),
     CheckUpdates,
 }
 
@@ -519,7 +519,7 @@ impl RillApp {
                 }
                 Action::Install(release) => {
                     self.update_error = None;
-                    self.installing = Some(update::install_and_restart(ctx, release));
+                    self.installing = Some(update::install_and_restart(ctx, *release));
                 }
                 Action::CheckUpdates => {
                     self.update_error = None;
@@ -2918,12 +2918,29 @@ impl RillApp {
                     return;
                 }
                 if let Some(command) = &release.update_command {
+                    let owner = release.managed_by.as_deref().unwrap_or("a package manager");
                     ui.label(
-                        RichText::new("Installed by a package manager. Update with:")
+                        RichText::new(format!("Installed with {owner}. To update, {command}."))
                             .font(style::regular(11.5))
                             .color(th.dim),
                     );
-                    ui.label(RichText::new(command).font(style::mono(11.5)));
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        if let Some(url) = &release.download_url {
+                            let file = url.rsplit('/').next().unwrap_or(url);
+                            if w::button(ui, Kind::Primary, None, "Download")
+                                .on_hover_text(file)
+                                .clicked()
+                            {
+                                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                            }
+                        }
+                        if w::button(ui, Kind::Ghost, None, "What's new").clicked() {
+                            ui.ctx()
+                                .open_url(egui::OpenUrl::new_tab(&release.notes_url));
+                        }
+                    });
                     return;
                 }
                 ui.add_space(4.0);
@@ -2935,7 +2952,7 @@ impl RillApp {
                         )
                         .clicked()
                     {
-                        action = Some(Action::Install(release.clone()));
+                        action = Some(Action::Install(Box::new(release.clone())));
                     }
                     if w::button(ui, Kind::Ghost, None, "What's new").clicked() {
                         ui.ctx()

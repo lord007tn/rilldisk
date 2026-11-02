@@ -12,6 +12,9 @@ authors.workspace = true
 name = "rilldisk-desktop"
 path = "src/main.rs"
 
+[build-dependencies]
+winresource = "0.1"
+
 [dependencies]
 rilldisk-core = { path = "../rilldisk-core", version = "0.1.0" }
 rilldisk-update = { path = "../rilldisk-update", version = "0.1.0" }
