@@ -1344,7 +1344,7 @@ mod tests {
         for c in &wof_name {
             named.extend_from_slice(&c.to_le_bytes());
         }
-        while named.len() % 8 != 0 {
+        while !named.len().is_multiple_of(8) {
             named.push(0);
         }
         let runs_at = named.len();
