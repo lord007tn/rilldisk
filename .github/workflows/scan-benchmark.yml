@@ -44,7 +44,18 @@ jobs:
             --files "${{ github.event.inputs.files || '300000' }}" --runs 3 \
             --flush --verify-allocation --require-identical --json bench.json | tee bench.md
           cat bench.md >> "$GITHUB_STEP_SUMMARY"
+      # Where `auto` uses the MFT: a whole NTFS volume. The runner's own system
+      # drive (a public image), counts and timings only. Files change while it
+      # runs and the walk cannot read every system folder, so totals are shown,
+      # not gated.
+      - name: Whole system drive (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          python scripts/benchmark.py target/release/examples --path 'C:\' --runs 2 \
+            --backends directory mft --json bench-volume.json | tee bench-volume.md
+          cat bench-volume.md >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
           name: scan-benchmark-${{ matrix.os }}
-          path: bench.json
+          path: bench*.json
