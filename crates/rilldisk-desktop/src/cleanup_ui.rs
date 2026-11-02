@@ -154,6 +154,15 @@ pub fn toolbar(app: &mut RillApp, ui: &mut Ui, data: &Arc<Data>) {
 /// Buttons added to the selection bar (right to left): the remove button and
 /// a menu with permanent deletion. Shift-click also deletes permanently.
 pub fn bar_buttons(app: &mut RillApp, bar: &mut Ui, data: &Arc<Data>) {
+    if app.elevate.removal_blocked() {
+        bar.add_enabled_ui(false, |ui| {
+            w::button(ui, Kind::Primary, Some(Icon::Trash), "Removal off as administrator")
+                .on_disabled_hover_text(
+                    "RillDisk is running as administrator, where it only lists. Copy the plan, or restart RillDisk normally to remove folders.",
+                );
+        });
+        return;
+    }
     let busy = app.cleanup.job.is_some();
     let menu = w::icon_button(bar, Icon::Chevron, "More removal options");
     egui::Popup::menu(&menu).show(|ui| {
@@ -194,6 +203,9 @@ pub fn bar_buttons(app: &mut RillApp, bar: &mut Ui, data: &Arc<Data>) {
 }
 
 fn open_confirm(app: &mut RillApp, data: &Arc<Data>, mode: CleanupMode) {
+    if app.elevate.removal_blocked() {
+        return;
+    }
     let mut ids: Vec<usize> = app
         .picked
         .iter()

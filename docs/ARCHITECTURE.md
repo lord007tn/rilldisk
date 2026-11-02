@@ -31,8 +31,17 @@ balances uneven folders without a per-group barrier dominating. The Win32 backen
 for read/write/delete and `FILE_FLAG_OPEN_REPARSE_POINT`, checks its attributes,
 then requests `FileIdBothDirectoryInfo` records in a reusable 64 KiB aligned buffer.
 Native buffer offsets and UTF-16 lengths are checked before records are decoded.
-Handles use Rust RAII. No content reads, subprocesses or elevation are used by the
-production scanner.
+Handles use Rust RAII. No content reads or subprocesses are used by the
+production scanner, and it never elevates. When the process is already elevated,
+`enable_backup_privilege` (called by the CLI scan commands and the desktop, never
+by MCP) enables `SeBackupPrivilege`, so the same `FILE_FLAG_BACKUP_SEMANTICS` open
+lists ACL-protected folders read-only. `elevation()` reports the token state for
+any backend that needs administrator rights. Every issue carries a `kind`
+(`access_denied`, `not_found`, `in_use`, `stalled`, `entry_limit`, `other`). Issues
+from an OS error take their kind from the raw OS error and keep it as `os_error`.
+Issues the scanner raises itself (stalled folders, the entry limit, volume
+warnings) set `kind` directly and have no `os_error`. See
+[the elevation proposal](proposals/elevation.md).
 
 File identity uses the volume serial plus file ID, and zero IDs are treated as
 unknown rather than collapsing every such file together. Logical bytes describe
@@ -177,6 +186,10 @@ progress counters and swaps in a finished `Arc<Snapshot>`.
   Clean up (virtualized, grouped by category; tick folders or "Select all safe",
   then copy a plan or move them to the Recycle Bin / Trash after a confirmation
   dialog, see `cleanup_ui.rs`), Largest files, File types, Issues and Search.
+* **Elevation** (`elevation.rs`): the Issues view grouped by kind, the
+  Administrator badge and the restart offer (Windows `ShellExecuteExW` "runas" on
+  the same executable and scan root; Linux `pkexec`; macOS Full Disk Access
+  settings). The window closes only after the elevated instance started.
 
 `--capture-cleanup DIR` captures the selection bar and cleanup dialogs; it only
 removes folders from a synthetic fixture (a scan with

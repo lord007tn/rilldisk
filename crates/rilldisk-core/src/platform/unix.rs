@@ -10,7 +10,7 @@
 //! in `skipped_mounts`. Virtual filesystems (`/proc`, `/sys`, `/dev`, `/run`, tmpfs,
 //! overlay and snap images on Linux; `/dev`, `/Volumes` and `/System/Volumes` on
 //! macOS) are skipped even when crossing filesystems is allowed.
-use crate::{Batch, EntryKind, RawEntry, ScanControl, ScanIssue, ScanOptions};
+use crate::{Batch, EntryKind, IssueKind, RawEntry, ScanControl, ScanIssue, ScanOptions};
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsStr,
@@ -153,10 +153,7 @@ pub(crate) fn read_directory(path: &Path, control: &ScanControl, volume: &Volume
     let mut batch = Batch::default();
     match enumerate(path, control, volume, &mut batch) {
         Ok(complete) => batch.complete = complete,
-        Err(error) => batch.issues.push(ScanIssue {
-            path: path.into(),
-            message: error.to_string(),
-        }),
+        Err(error) => batch.issues.push(ScanIssue::from_error(path, &error)),
     }
     batch
 }
@@ -167,6 +164,20 @@ fn enumerate(
     volume: &VolumeInfo,
     batch: &mut Batch,
 ) -> io::Result<bool> {
+    // A listable folder without search permission refuses `lstat` on every entry.
+    // That is one protected folder, so it is reported once, on the folder.
+    let mut denied = false;
+    let mut entry_error = |batch: &mut Batch, name: &OsStr, error: io::Error| {
+        if IssueKind::of(&error) != IssueKind::AccessDenied {
+            batch
+                .issues
+                .push(ScanIssue::from_error(path.join(name), &error));
+        } else if !std::mem::replace(&mut denied, true) {
+            let mut issue = ScanIssue::from_error(path, &error);
+            issue.message = format!("entries could not be examined: {error}");
+            batch.issues.push(issue);
+        }
+    };
     for item in fs::read_dir(path)? {
         if control.should_stop() {
             return Ok(false);
@@ -178,10 +189,7 @@ fn enumerate(
         let listed = match item.file_type() {
             Ok(value) => value,
             Err(error) => {
-                batch.issues.push(ScanIssue {
-                    path: path.join(&name),
-                    message: error.to_string(),
-                });
+                entry_error(batch, &name, error);
                 continue;
             }
         };
@@ -202,10 +210,7 @@ fn enumerate(
             let metadata = match item.metadata() {
                 Ok(value) => value,
                 Err(error) => {
-                    batch.issues.push(ScanIssue {
-                        path: path.join(&*entry.name),
-                        message: error.to_string(),
-                    });
+                    entry_error(batch, &entry.name, error);
                     continue;
                 }
             };
@@ -577,6 +582,43 @@ pub fn volumes() -> Vec<crate::Volume> {
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
 pub fn volumes() -> Vec<crate::Volume> {
     Vec::new()
+}
+
+/// Root (effective UID 0) is elevated.
+pub(crate) fn is_elevated() -> bool {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// `sudo` or `pkexec` on `PATH` is a way to get to root.
+pub(crate) fn elevation() -> crate::Elevation {
+    let is_elevated = is_elevated();
+    crate::Elevation {
+        is_elevated,
+        can_elevate: !is_elevated && (executable_on_path("sudo") || executable_on_path("pkexec")),
+        backup_privilege_enabled: false,
+    }
+}
+
+/// Unix has no backup privilege: root already lists every folder except macOS
+/// privacy-protected ones, which need Full Disk Access instead.
+pub(crate) fn enable_backup_privilege() -> bool {
+    false
+}
+
+/// Whether a regular file named `program` in a `PATH` directory is executable by
+/// this user (real UID and groups, as `access(X_OK)` checks).
+pub(crate) fn executable_on_path(program: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| {
+            let candidate = dir.join(program);
+            fs::metadata(&candidate).is_ok_and(|m| m.is_file())
+                && std::ffi::CString::new(candidate.as_os_str().as_bytes()).is_ok_and(|c| {
+                    // SAFETY: `c` is a NUL-terminated path that outlives the call.
+                    unsafe { libc::access(c.as_ptr(), libc::X_OK) == 0 }
+                })
+        })
+    })
 }
 
 #[cfg(test)]

@@ -346,11 +346,47 @@ fn unix_reports_block_allocation_times_and_unreadable_folders() {
         assert!(!snapshot.summary.complete);
         assert_eq!(snapshot.summary.issue_count, 1);
         assert!(snapshot.summary.issues[0].path.ends_with("locked"));
+        assert_eq!(
+            snapshot.summary.issues[0].kind,
+            rilldisk_core::IssueKind::AccessDenied
+        );
+        assert_eq!(snapshot.summary.access_denied_count, 1);
         assert!(!folder.fully_listed);
     } else {
         assert!(snapshot.summary.complete);
     }
     assert_eq!(snapshot.summary.skipped_mounts, 0);
+}
+
+/// A folder that can be listed but not searched (`r--`) refuses `lstat` on every
+/// entry. That is one protected folder: one `access_denied` issue on the folder,
+/// not one per file.
+#[cfg(unix)]
+#[test]
+fn unsearchable_folder_is_one_access_denied_issue() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let folder = root.path().join("listable");
+    fs::create_dir(&folder).unwrap();
+    for name in ["a.bin", "b.bin", "c.bin"] {
+        fs::write(folder.join(name), [1_u8; 64]).unwrap();
+    }
+    fs::set_permissions(&folder, fs::Permissions::from_mode(0o644)).unwrap();
+    // Root can still examine the entries; then there is nothing to check.
+    let refused = fs::symlink_metadata(folder.join("a.bin")).is_err();
+    let snapshot = scan(root.path(), ScanOptions::default(), Arc::default());
+    fs::set_permissions(&folder, fs::Permissions::from_mode(0o755)).unwrap();
+    let summary = snapshot.unwrap().summary;
+    if refused {
+        assert_eq!(summary.issue_count, 1, "{:?}", summary.issues);
+        assert_eq!(summary.access_denied_count, 1);
+        let issue = &summary.issues[0];
+        assert!(issue.path.ends_with("listable"), "{issue:?}");
+        assert_eq!(issue.kind, rilldisk_core::IssueKind::AccessDenied);
+        assert!(issue.message.starts_with("entries could not be examined"));
+    } else {
+        assert_eq!(summary.issue_count, 0);
+    }
 }
 
 /// Scanning `/` must record, but never enter, virtual filesystems or other disks.

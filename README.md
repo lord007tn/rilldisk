@@ -36,7 +36,7 @@ MCP server so your AI assistant sees exactly what you see.
 | **Fast and lean** | Batched Win32 metadata enumeration on Windows and a no-follow `readdir` backend on Linux and macOS, on one barrier-free, work-stealing pipeline. A 3.1-million-file workspace scans in **5–9 s** using ~560 MB ([numbers](#performance)). |
 | **Built for agents too** | The same engine powers a CLI with JSON output and a local **MCP server**. Claude Code, Codex, Cursor or any MCP client can scan, query and explain your disk. |
 | **Yours to style** | Three color identities (**Tide**, **Moss**, **Aurora**), each in light and dark. RillDisk remembers your choice. |
-| **Local and careful** | Metadata only. Never opens or uploads files, and never deletes on its own: only the reclaim folders you tick and confirm, to the Recycle Bin / Trash by default ([scope](docs/proposals/cleanup.md)). No telemetry, no network listener, no elevation. The only network request is an [opt-out-able update check](docs/proposals/updates.md) that sends nothing about you. |
+| **Local and careful** | Metadata only. Never opens or uploads files, and never deletes on its own: only the reclaim folders you tick and confirm, to the Recycle Bin / Trash by default ([scope](docs/proposals/cleanup.md)). No telemetry, no network listener, and it never elevates on its own ([how protected folders are read](docs/proposals/elevation.md)). The only network request is an [opt-out-able update check](docs/proposals/updates.md) that sends nothing about you. |
 | **Open source** | AGPL-3.0-only, pure Rust: no Electron, no Tauri, no webview, no JavaScript. Windows, Linux and macOS. |
 
 <table>
@@ -95,6 +95,16 @@ Each package holds two programs:
 
 No account, no admin rights to scan. Protected system folders are listed under
 **Issues** and the result is clearly marked partial.
+
+**Protected folders.** A normal account cannot list some system folders (on
+Windows `System Volume Information`, `ProgramData\Microsoft\Windows\WER`, other
+users' profiles). For full coverage, click **Restart as administrator** in the
+desktop (Issues tab or header) and accept the UAC prompt; a new window rescans the
+same folder. Or run the CLI from an elevated terminal. On Windows, elevated RillDisk
+enables the read-only backup privilege to list ACL-protected folders. It never changes
+permissions or files. On Linux use `sudo` (the desktop offers `pkexec`); on macOS
+grant **Full Disk Access**. Issues carry a `kind` (`access_denied`, `in_use`,
+`not_found`, ...) and the summary an `access_denied_count`.
 
 **Updates.** The desktop checks GitHub once a day for a newer release and offers
 it; nothing is installed until you click **Install and restart**. From a terminal,

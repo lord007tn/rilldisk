@@ -3,7 +3,8 @@
 Every release on the [releases page](https://github.com/lord007tn/rilldisk/releases/latest)
 has a package for each system below. Each holds the same two programs:
 **RillDisk** (`rilldisk-desktop`, the desktop app) and `rilldisk` (the CLI and
-local MCP server). Scanning never needs administrator rights.
+local MCP server). Scanning never needs administrator rights, but some protected
+system folders can only be read with them (see below).
 
 | System | Package | Architectures |
 | --- | --- | --- |
@@ -36,6 +37,16 @@ No installation and no admin rights. Delete the folder to remove it.
 The builds are not code-signed yet, so SmartScreen may say "Windows protected
 your PC". Choose **More info**, then **Run anyway**.
 
+**Full coverage (administrator).** As a normal user, folders such as
+`System Volume Information`, `ProgramData\Microsoft\Windows\WER` and other
+users' profiles are refused and listed under **Issues** as *Access denied*. In
+the desktop, click **Restart as administrator** and accept the UAC prompt: a new
+window rescans the same folder and shows an **Administrator** badge. From a
+terminal, right-click Windows Terminal and choose **Run as administrator**, then
+run `rilldisk scan C:\`. Elevated, RillDisk enables the backup privilege, which
+lets it list ACL-protected folders read-only; it never changes permissions,
+takes ownership or opens files. The MCP server never uses it.
+
 ## macOS
 
 Download `RillDisk-<version>-arm64.dmg` (Apple silicon) or `-x64.dmg` (Intel),
@@ -52,7 +63,11 @@ xattr -dr com.apple.quarantine /Applications/RillDisk.app
 macOS asks before RillDisk reads Desktop, Documents, Downloads or external
 drives. To scan your whole disk without prompts, add RillDisk under **Privacy &
 Security > Full Disk Access**. RillDisk reads names and sizes only, never file
-contents.
+contents. When a scan hits privacy-protected folders, the Issues tab offers
+**Grant Full Disk Access**, which opens that settings page; quit and reopen
+RillDisk afterwards and rescan. For the CLI, give your terminal app Full Disk
+Access; `sudo rilldisk scan /` additionally reads other users' folders, but root
+alone does not lift privacy protection.
 
 The CLI is inside the app. To use it from a terminal:
 

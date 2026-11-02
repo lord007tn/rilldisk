@@ -2,12 +2,14 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use rilldisk_core::{
-    ReclaimReport, Safety, ScanControl, ScanOptions, Snapshot, find_reclaimable, scan, volumes,
+    ReclaimReport, Safety, ScanControl, ScanOptions, Snapshot, Summary, find_reclaimable, scan,
+    volumes,
 };
 use std::{
+    ffi::OsString,
     fs::OpenOptions,
     io::{self, BufWriter, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::ExitCode,
     sync::{
         Arc,
@@ -291,7 +293,12 @@ async fn main() -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Scan { args, format, top } => {
-            run(args, |writer, snapshot| {
+            let hint = if matches!(format, Format::Table) {
+                Hint::Output
+            } else {
+                Hint::Stderr
+            };
+            run(args, hint, |writer, snapshot| {
                 write_scan(writer, snapshot, format, top as usize)
             })
             .await
@@ -306,7 +313,8 @@ async fn main() -> Result<ExitCode> {
             yes,
         } if delete => {
             let code = std::cell::Cell::new(None);
-            let scan_code = run(args, |writer, snapshot| {
+            // No elevation hint: it would suggest removing folders as root.
+            let scan_code = run(args, Hint::Off, |writer, snapshot| {
                 let safety = safety.unwrap_or(vec![SafetyArg::Regenerable, SafetyArg::Cache]);
                 let mut report = find_reclaimable(snapshot, now_ms());
                 report.retain(|c| {
@@ -334,7 +342,12 @@ async fn main() -> Result<ExitCode> {
             safety,
             ..
         } => {
-            run(args, |writer, snapshot| {
+            let hint = if matches!(format, ReportFormat::Table) {
+                Hint::Output
+            } else {
+                Hint::Stderr
+            };
+            run(args, hint, |writer, snapshot| {
                 let mut report = find_reclaimable(snapshot, now_ms());
                 report.retain(|c| {
                     c.logical_bytes >= min_size
@@ -356,10 +369,22 @@ async fn main() -> Result<ExitCode> {
     }
 }
 
+/// Where the elevation hint goes, if anywhere.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Hint {
+    /// At the end of table output.
+    Output,
+    /// On stderr, so JSON stays parseable.
+    Stderr,
+    /// Not at all (`reclaim --delete`).
+    Off,
+}
+
 /// Scan with progress, Ctrl+C cancellation and safe output, then hand the
-/// snapshot to `write`.
+/// snapshot to `write`, followed by the elevation hint where `hint` says.
 async fn run(
     args: ScanArgs,
+    hint_to: Hint,
     write: impl FnOnce(&mut dyn Write, &Snapshot) -> Result<()>,
 ) -> Result<ExitCode> {
     let control = Arc::new(ScanControl::default());
@@ -398,6 +423,8 @@ async fn run(
         cross_filesystems,
     } = args;
     let options = options(threads, max_entries, cross_filesystems);
+    // Only takes effect in an elevated terminal; never asks for elevation itself.
+    let backup_privilege = rilldisk_core::enable_backup_privilege();
     let snapshot = tokio::task::spawn_blocking(move || scan(&path, options, control)).await;
     progress.abort();
     let snapshot = snapshot??;
@@ -409,6 +436,12 @@ async fn run(
     } else {
         2
     });
+    let hint = elevation_hint(
+        &snapshot.summary,
+        backup_privilege,
+        &std::env::args_os().collect::<Vec<_>>(),
+        output.as_deref(),
+    );
     let mut writer: Box<dyn Write> = match output {
         Some(path) => Box::new(BufWriter::new(
             OpenOptions::new()
@@ -419,7 +452,14 @@ async fn run(
         )),
         None => Box::new(BufWriter::new(io::stdout().lock())),
     };
-    let result = write(&mut writer, &snapshot).and_then(|()| Ok(writer.flush()?));
+    let result = write(&mut writer, &snapshot).and_then(|()| {
+        if hint_to == Hint::Output
+            && let Some(hint) = &hint
+        {
+            writeln!(writer, "\n{hint}")?;
+        }
+        Ok(writer.flush()?)
+    });
     if let Err(error) = result {
         if error
             .downcast_ref::<io::Error>()
@@ -439,6 +479,11 @@ async fn run(
         );
         for issue in &snapshot.summary.issues {
             eprintln!("{}: {}", issue.path.display(), issue.message);
+        }
+        if hint_to == Hint::Stderr
+            && let Some(hint) = &hint
+        {
+            eprintln!("{hint}");
         }
     }
     signal.abort();
@@ -473,11 +518,116 @@ fn write_summary(writer: &mut dyn Write, snapshot: &Snapshot) -> Result<()> {
     if !summary.complete {
         writeln!(
             writer,
-            "PARTIAL: {} issues; cancelled={}",
-            summary.issue_count, summary.cancelled
+            "PARTIAL: {} issues ({} access denied); cancelled={}",
+            summary.issue_count, summary.access_denied_count, summary.cancelled
         )?;
     }
     Ok(())
+}
+
+/// How to read the folders that were refused, when more rights would help, or why
+/// they stayed unreadable although the scan ran elevated. Never elevates by itself.
+/// `argv` is the command line as run (program first); `output` is `--output`.
+fn elevation_hint(
+    summary: &Summary,
+    backup_privilege: bool,
+    argv: &[OsString],
+    output: Option<&Path>,
+) -> Option<String> {
+    let count = summary.access_denied_count;
+    if count == 0 {
+        return None;
+    }
+    let privacy = summary.privacy_denied_count;
+    if summary.elevated {
+        return if cfg!(windows) && !backup_privilege {
+            Some(format!(
+                "Note: running as administrator, but the backup privilege (SeBackupPrivilege) could not be enabled, so {} stayed unreadable. The account may lack the \"Back up files and directories\" right.",
+                folders(count)
+            ))
+        } else if privacy > 0 {
+            Some(format!(
+                "Hint: {} could not be read even as root. {FULL_DISK_ACCESS}",
+                folders(privacy)
+            ))
+        } else {
+            None
+        };
+    }
+    // Arguments that are not valid UTF-8 cannot be shown exactly, so then the
+    // command is left out rather than printed with replacement characters.
+    let command = argv
+        .iter()
+        .map(|arg| arg.to_str())
+        .collect::<Option<Vec<_>>>()
+        .and_then(|args| rerun_command(&args));
+    Some(hint_text(count, privacy, command.as_deref(), output))
+}
+
+const FULL_DISK_ACCESS: &str = "macOS privacy protection needs Full Disk Access for your terminal instead (System Settings > Privacy & Security > Full Disk Access), then a new terminal.";
+
+fn folders(count: u64) -> String {
+    if count == 1 {
+        "1 protected folder".to_string()
+    } else {
+        format!("{count} protected folders")
+    }
+}
+
+/// The unelevated route for `count` refused folders, `privacy` of which only Full
+/// Disk Access lifts (macOS).
+fn hint_text(count: u64, privacy: u64, command: Option<&str>, output: Option<&Path>) -> String {
+    let plain = count.saturating_sub(privacy);
+    let mut hint = String::from("Hint:");
+    if plain > 0 {
+        let route = if cfg!(windows) {
+            "run from an elevated terminal (Run as administrator)".to_string()
+        } else if let Some(command) = command {
+            format!("run `sudo {command}`")
+        } else {
+            "rerun this command with `sudo`".to_string()
+        };
+        hint.push_str(&format!(" {route} to read {}.", folders(plain)));
+        if let Some(output) = output {
+            hint.push_str(&format!(
+                " Remove or rename {} first: --output never overwrites a file.",
+                output.display()
+            ));
+        }
+    }
+    if privacy > 0 {
+        hint.push_str(&format!(" For {}, {FULL_DISK_ACCESS}", folders(privacy)));
+    }
+    hint
+}
+
+/// The command line as run, quoted for a POSIX shell. The program is the path it
+/// was started with, so `./rilldisk` stays runnable under `sudo`.
+fn rerun_command(argv: &[&str]) -> Option<String> {
+    let (program, args) = argv.split_first()?;
+    let program = if program.is_empty() {
+        "rilldisk"
+    } else {
+        program
+    };
+    let mut command = shell_quote(program);
+    for arg in args {
+        command.push(' ');
+        command.push_str(&shell_quote(arg));
+    }
+    Some(command)
+}
+
+fn shell_quote(arg: &str) -> String {
+    if !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./=:,@+%".contains(c))
+    {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', r"'\''"))
+    }
 }
 
 fn write_scan(
@@ -625,4 +775,100 @@ pub(crate) fn human(bytes: u64) -> String {
         unit += 1;
     }
     format!("{size:.1} {}", UNITS[unit])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rerun_command_quotes_for_a_shell() {
+        assert_eq!(
+            rerun_command(&["rilldisk", "scan", "/", "--format", "table"]).unwrap(),
+            "rilldisk scan / --format table"
+        );
+        // The program as it was started, so a binary outside PATH still runs.
+        assert_eq!(
+            rerun_command(&["./rilldisk", "scan", "/Volumes/My Disk", "it's"]).unwrap(),
+            r"./rilldisk scan '/Volumes/My Disk' 'it'\''s'"
+        );
+        assert_eq!(rerun_command(&["", "scan"]).unwrap(), "rilldisk scan");
+        assert_eq!(rerun_command(&[]), None);
+    }
+
+    #[test]
+    fn hint_names_the_platform_route() {
+        let hint = hint_text(211, 0, Some("rilldisk scan /"), None);
+        assert!(hint.contains("211 protected folders"), "{hint}");
+        if cfg!(windows) {
+            assert!(hint.contains("Run as administrator"), "{hint}");
+        } else {
+            assert!(hint.contains("sudo rilldisk scan /"), "{hint}");
+        }
+        assert!(hint_text(1, 0, Some("x"), None).contains("1 protected folder"));
+        // Not valid UTF-8: the folder count stays, the exact command is left out.
+        let generic = hint_text(3, 0, None, None);
+        assert!(generic.contains("3 protected folders"), "{generic}");
+        // The first run created --output; the rerun must not reuse it as is.
+        let output = hint_text(3, 0, Some("x"), Some(Path::new("report.json")));
+        assert!(output.contains("Remove or rename report.json"), "{output}");
+        // Only Full Disk Access helps: no sudo advice.
+        let privacy = hint_text(2, 2, Some("x"), None);
+        assert!(privacy.contains("Full Disk Access") && !privacy.contains("sudo"));
+    }
+
+    fn partial(access_denied_count: u64, privacy_denied_count: u64, elevated: bool) -> Summary {
+        Summary {
+            schema_version: 2,
+            root: "/".into(),
+            backend: "test",
+            started_unix_ms: 0,
+            elapsed_ms: 0,
+            files: 0,
+            directories: 0,
+            skipped_links: 0,
+            skipped_mounts: 0,
+            hard_link_duplicates: 0,
+            logical_bytes: 0,
+            unique_logical_bytes: 0,
+            allocated_bytes: None,
+            issue_count: access_denied_count,
+            access_denied_count,
+            privacy_denied_count,
+            issues: Vec::new(),
+            cancelled: false,
+            complete: false,
+            elevated,
+        }
+    }
+
+    #[test]
+    fn elevation_hint_gates_on_denials_and_rights() {
+        let argv = ["rilldisk", "scan", "/"].map(OsString::from);
+        let hint =
+            |summary: &Summary, privilege: bool| elevation_hint(summary, privilege, &argv, None);
+        assert!(hint(&partial(3, 0, false), false).is_some());
+        assert!(hint(&partial(0, 0, false), false).is_none());
+        // Elevated with the privilege: nothing more to suggest.
+        assert!(hint(&partial(3, 0, true), true).is_none());
+        // Elevated without it: Windows says why the folders stayed unreadable.
+        let missing = hint(&partial(3, 0, true), false);
+        assert_eq!(missing.is_some(), cfg!(windows));
+        // Privacy protection outlasts root (only counted on macOS).
+        let privacy = hint(&partial(2, 2, true), true).unwrap();
+        assert!(privacy.contains("Full Disk Access"), "{privacy}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_arguments_leave_out_the_command() {
+        use std::os::unix::ffi::OsStringExt;
+        let argv = [
+            OsString::from("rilldisk"),
+            OsString::from("scan"),
+            OsString::from_vec(vec![b'/', 0xff]),
+        ];
+        let hint = elevation_hint(&partial(1, 0, false), false, &argv, None).unwrap();
+        assert!(hint.contains("rerun this command with `sudo`"), "{hint}");
+    }
 }
