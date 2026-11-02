@@ -1,5 +1,46 @@
 # Proposal: automated releases and opt-in updates
 
+## In-app installer extension, November 2, 2026
+
+The owner requested T3 Code's visible bottom update control and an in-app
+download/progress/install flow. This extends the older restrictions below only
+for RillDisk's own Windows MSI installation. Other package managers retain their
+existing ownership and manual update instructions. MCP remains read-only.
+
+After an explicit **Update and restart** click, the native updater may download
+the matching MSI from this repository's selected release, verify SHA-256 against
+the release feed/checksum asset, and stage it in per-user RillDisk update storage.
+An unelevated copy of this application's executable acts as a temporary helper.
+It verifies the staged package again, invokes only the Windows system
+`msiexec.exe` with fixed install/progress/no-reboot options via the OS `runas`
+consent flow, waits for completion, records the real result and relaunches the
+desktop with its original arguments. No shell or downloaded script runs. The
+helper keeps the package read-locked through installer launch. Consent denial
+leaves the existing window open; installer failure relaunches the existing app
+with an error. A reboot-required result is shown explicitly. Only updater-owned
+staging/receipt files may be created or cleaned up by this flow.
+
+The app must not restart during a scan or cleanup. Download progress is based
+on received bytes; verification and installer handoff are named phases rather
+than invented percentages. Windows Installer shows installation progress after
+the application closes. The helper stays at the application's original privilege
+level; only the installer requests elevation. Existing records, credentials,
+scan accounting and MCP capabilities are unchanged.
+
+Update availability/progress/error/retry controls live in a persistent bottom
+bar, including the welcome screen. Automatic checks remain opt-out and throttled
+to once a day, also while the app stays open; manual checks remain available
+without entering Settings. No update installs automatically.
+
+Reference: [T3 Code updating](https://github.com/pingdotgg/t3code/blob/main/docs/user/updating.md)
+describes a bottom-sidebar update button that expands with progress and restart
+controls. RillDisk uses its native Rust UI and Windows Installer rather than an
+Electron runtime. Microsoft documents the fixed
+[installer options](https://learn.microsoft.com/en-us/windows/win32/msi/standard-installer-command-line-options)
+and [ShellExecuteExW process handoff](https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shellexecuteexw).
+This extension supersedes the earlier "never runs an installer" and "no elevation"
+statements only for this explicit MSI update action.
+
 Status: implemented, November 1, 2026, in the CLI (`rilldisk update`) and the desktop
 (update card with Install and restart; daily check toggled from the sidebar).
 

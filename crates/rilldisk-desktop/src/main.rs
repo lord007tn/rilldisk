@@ -32,6 +32,21 @@ enum Capture {
 }
 
 fn main() -> eframe::Result {
+    #[cfg(windows)]
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new(rilldisk_update::msi::HELPER_ARG))
+    {
+        let result = std::env::args_os()
+            .nth(2)
+            .map(PathBuf::from)
+            .ok_or_else(|| "Installer request is missing".to_string())
+            .and_then(|path| rilldisk_update::msi::run_helper(&path).map_err(|e| format!("{e:#}")));
+        if let Err(error) = result {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     let mut path = None;
     let mut capture = None;
     let mut tour_name = None;
@@ -74,7 +89,7 @@ fn main() -> eframe::Result {
             "--help" | "-h" => {
                 attach_console();
                 println!(
-                    "rilldisk-desktop [PATH] [--theme light|dark] [--palette tide|moss|aurora] [--size WIDTHxHEIGHT] [--capture DIR [--tour issues]] [--capture-cleanup DIR]\n\nOpens the RillDisk desktop app. PATH starts a scan immediately.\n--capture runs a scripted tour and saves screenshots to DIR (development).\n--capture-cleanup captures the cleanup dialogs; it only removes folders from a synthetic fixture.\n--version prints the version."
+                    "rilldisk-desktop [PATH] [--theme light|dark] [--palette tide|moss|aurora] [--size WIDTHxHEIGHT] [--capture DIR [--tour issues|navigation|updates]] [--capture-cleanup DIR]\n\nOpens the RillDisk desktop app. PATH starts a scan immediately.\n--capture runs a scripted tour and saves screenshots to DIR (development).\n--capture-cleanup captures the cleanup dialogs; it only removes folders from a synthetic fixture.\n--version prints the version."
                 );
                 return Ok(());
             }
@@ -87,8 +102,10 @@ fn main() -> eframe::Result {
         }
     }
     let navigation_tour = tour_name.as_deref() == Some("navigation");
+    let updates_tour = tour_name.as_deref() == Some("updates");
     let issues_tour = match tour_name.as_deref() {
         None => false,
+        Some("updates") if matches!(capture, Some((_, Capture::Tour))) => false,
         Some("navigation") if path.is_some() && matches!(capture, Some((_, Capture::Tour))) => {
             false
         }
@@ -111,12 +128,15 @@ fn main() -> eframe::Result {
         Some(other) => {
             attach_console();
             eprintln!(
-                "invalid --tour {other}; use `issues` or `navigation` with PATH --capture DIR."
+                "invalid --tour {other}; use `issues` or `navigation` with PATH --capture DIR, or `updates` with --capture DIR."
             );
             return Ok(());
         }
     };
     let tour = capture.map(|(dir, mode)| {
+        if updates_tour {
+            return capture::Tour::updates(dir);
+        }
         let kind = match (path.is_none(), mode) {
             (false, Capture::Tour) if navigation_tour => return capture::Tour::navigation(dir),
             (_, Capture::Cleanup) => return capture::Tour::cleanup(dir),

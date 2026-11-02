@@ -15,9 +15,9 @@
 //! }
 //!
 //! // Only after the user clicked "Install and restart":
-//! if release.update_command.is_none() {
+//! if release.update_command.is_none() || release.msi {
 //!     self.install = Some(update::install_and_restart(ctx, release.clone()));
-//! } // else show release.update_command (package-managed install)
+//! } // other package-managed installs keep their own update command
 //! // Each frame: install.progress() for a bar, install.poll() for errors.
 //! // On success the app relaunches and this window receives a Close command.
 //! ```
@@ -25,6 +25,7 @@
 use eframe::egui;
 use rilldisk_update::{self as up, Channel, InstallSource, Plan, State};
 use std::{
+    cell::Cell,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -43,14 +44,13 @@ pub struct Release {
     /// Set when a package manager owns this install: show this command
     /// instead of an install button. `install_and_restart` refuses then.
     pub update_command: Option<String>,
-    /// Who owns this install, e.g. "the RillDisk installer (MSI)".
-    pub managed_by: Option<String>,
     /// Direct download of the matching new package (MSI, .deb, .rpm,
     /// AppImage or .dmg) when one of RillDisk's own packages installed this.
     pub download_url: Option<String>,
     /// Set when this copy cannot replace itself (for example a renamed program):
     /// show this instead of an install button.
     pub blocked: Option<String>,
+    pub msi: bool,
     inner: up::Release,
 }
 
@@ -75,22 +75,73 @@ impl<T> Pending<T> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    Downloading,
+    Verifying,
+    WaitingPermission,
+    Installing,
+    Restarting,
+    Stopped,
+}
+impl Phase {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Downloading => "Downloading update",
+            Self::Verifying => "Verifying and applying update",
+            Self::WaitingPermission => "Waiting for Windows permission",
+            Self::Installing => "Installing with Windows Installer",
+            Self::Restarting => "Restarting RillDisk",
+            Self::Stopped => "Update worker stopped",
+        }
+    }
+}
+
 /// A running install with download progress.
 pub struct Install {
     pub result: Pending<Result<(), String>>,
     done: Arc<AtomicU64>,
     total: Arc<AtomicU64>,
+    phase: Arc<std::sync::Mutex<Phase>>,
+    finished: Cell<bool>,
 }
 
 impl Install {
     /// Download progress in `0.0..=1.0`, if the size is known.
     pub fn progress(&self) -> Option<f32> {
         let total = self.total.load(Ordering::Relaxed);
-        (total > 0).then(|| self.done.load(Ordering::Relaxed) as f32 / total as f32)
+        (total > 0 && self.phase() == Phase::Downloading)
+            .then(|| (self.done.load(Ordering::Relaxed) as f32 / total as f32).clamp(0.0, 1.0))
+    }
+
+    pub fn phase(&self) -> Phase {
+        self.phase.lock().map(|p| *p).unwrap_or(Phase::Stopped)
+    }
+
+    pub fn bytes(&self) -> (u64, u64) {
+        (
+            self.done.load(Ordering::Relaxed),
+            self.total.load(Ordering::Relaxed),
+        )
     }
 
     pub fn poll(&self) -> Option<Result<(), String>> {
-        self.result.poll()
+        if self.finished.get() {
+            return None;
+        }
+        match self.result.rx.try_recv() {
+            Ok(result) => {
+                self.finished.set(true);
+                Some(result)
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.finished.set(true);
+                Some(Err(
+                    "The update worker stopped unexpectedly. Try again.".into()
+                ))
+            }
+        }
     }
 }
 
@@ -147,15 +198,13 @@ fn check_now(trigger: Trigger) -> Result<Option<Release>, String> {
         let _ = state.save();
     }
     let mut blocked = None;
-    let mut managed_by = None;
     let mut package = None;
     let update_command = match install_source() {
         InstallSource::Managed {
-            manager,
             command,
             package: kind,
+            ..
         } => {
-            managed_by = Some(manager.to_owned());
             package = kind;
             Some(command.to_owned())
         }
@@ -181,8 +230,12 @@ fn check_now(trigger: Trigger) -> Result<Option<Release>, String> {
             .zip(up::target())
             .and_then(|(package, target)| inner.package_asset(package.kind(), target))
             .map(|asset| asset.url.clone()),
+        msi: cfg!(windows)
+            && package == Some(up::Package::Msi)
+            && package
+                .zip(up::target())
+                .is_some_and(|(p, target)| inner.package_asset(p.kind(), target).is_some()),
         update_command,
-        managed_by,
         blocked,
         inner,
     }))
@@ -195,8 +248,42 @@ fn check_now(trigger: Trigger) -> Result<Option<Release>, String> {
 pub fn install_and_restart(ctx: &egui::Context, release: Release) -> Install {
     let done = Arc::new(AtomicU64::new(0));
     let total = Arc::new(AtomicU64::new(0));
-    let (job_done, job_total, job_ctx) = (done.clone(), total.clone(), ctx.clone());
+    let phase = Arc::new(std::sync::Mutex::new(Phase::Downloading));
+    let (job_done, job_total, job_ctx, job_phase) =
+        (done.clone(), total.clone(), ctx.clone(), phase.clone());
     let result = spawn(ctx, move || {
+        let set_phase = |value: Phase| {
+            if let Ok(mut phase) = job_phase.lock() {
+                *phase = value;
+            }
+            job_ctx.request_repaint();
+        };
+        #[cfg(windows)]
+        if release.msi {
+            let prepared = up::msi::prepare(&release.inner, &mut |received, size| {
+                job_done.store(received, Ordering::Relaxed);
+                job_total.store(size.unwrap_or(0), Ordering::Relaxed);
+                if size.is_some_and(|total| received >= total) {
+                    set_phase(Phase::Verifying);
+                }
+                job_ctx.request_repaint();
+            })
+            .map_err(|e| format!("{e:#}"))?;
+            set_phase(Phase::WaitingPermission);
+            let mut handoff = prepared.start().map_err(|e| format!("{e:#}"))?;
+            loop {
+                match handoff.status().map_err(|e| format!("{e:#}"))? {
+                    up::msi::Status::AwaitingConsent => {}
+                    up::msi::Status::InstallerStarted | up::msi::Status::Finished { .. } => {
+                        set_phase(Phase::Installing);
+                        job_ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        return Ok(());
+                    }
+                    up::msi::Status::Failed(error) => return Err(error),
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
         if let Some(command) = release.update_command {
             return Err(format!(
                 "This copy is managed by a package manager. Update with: {command}"
@@ -210,18 +297,24 @@ pub fn install_and_restart(ctx: &egui::Context, release: Release) -> Install {
         up::install(&release.inner, &plan, &mut |received, size| {
             job_done.store(received, Ordering::Relaxed);
             job_total.store(size.unwrap_or(0), Ordering::Relaxed);
-            if received - last_repaint >= 1 << 20 {
+            if size.is_some_and(|total| received >= total) {
+                set_phase(Phase::Verifying);
+            }
+            if received.saturating_sub(last_repaint) >= 1 << 20 {
                 last_repaint = received;
                 job_ctx.request_repaint();
             }
         })
         .map_err(|e| format!("{e:#}"))?;
+        set_phase(Phase::Restarting);
         restart(&job_ctx, &plan)
     });
     Install {
         result,
         done,
         total,
+        phase,
+        finished: Cell::new(false),
     }
 }
 
@@ -253,4 +346,100 @@ pub fn set_automatic_checks(enabled: bool) -> Result<(), String> {
     let mut state = State::load();
     state.automatic_checks = enabled;
     state.save().map_err(|e| format!("{e:#}"))
+}
+
+/// Installer receipts are displayed by the desktop, never fabricated from a launch.
+pub fn installer_notice() -> Option<Result<String, String>> {
+    #[cfg(windows)]
+    match up::msi::take_result() {
+        Ok(Some(up::msi::Status::Finished {
+            version,
+            reboot_required,
+        })) => {
+            return Some(Ok(if reboot_required {
+                format!("Restart Windows to finish updating to {version}")
+            } else {
+                format!("Updated to RillDisk {version}")
+            }));
+        }
+        Ok(Some(up::msi::Status::Failed(error))) => return Some(Err(error)),
+        Err(error) => {
+            return Some(Err(format!(
+                "Could not read the installer result: {error:#}"
+            )));
+        }
+        _ => {}
+    }
+    None
+}
+
+#[derive(Clone, Copy)]
+pub enum Preview {
+    Available,
+    Downloading,
+    UnknownLength,
+    Verifying,
+    Permission,
+    Declined,
+    BadChecksum,
+}
+
+/// Scripted evidence uses fictional release metadata and a controlled worker;
+/// it does not contact GitHub or execute an installer.
+pub fn preview_release() -> Release {
+    let feed = include_bytes!("../../rilldisk-update/tests/fixtures/latest-packages.yml");
+    let feed = String::from_utf8_lossy(feed).replace("0.1.1", "0.1.3");
+    let inner = up::parse_feed(feed.as_bytes()).expect("valid update preview fixture");
+    Release {
+        version: "0.1.3 (preview)".into(),
+        notes_url: inner.notes_url.clone(),
+        update_command: None,
+        download_url: None,
+        blocked: None,
+        msi: true,
+        inner,
+    }
+}
+
+pub fn preview_install(
+    phase: Phase,
+    done: u64,
+    total: u64,
+) -> (Install, mpsc::Sender<Result<(), String>>) {
+    let (tx, rx) = mpsc::channel();
+    (
+        Install {
+            result: Pending { rx },
+            done: Arc::new(AtomicU64::new(done)),
+            total: Arc::new(AtomicU64::new(total)),
+            phase: Arc::new(std::sync::Mutex::new(phase)),
+            finished: Cell::new(false),
+        },
+        tx,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn percentages_represent_only_known_download_bytes() {
+        let (known, _tx) = preview_install(Phase::Downloading, 50, 100);
+        assert_eq!(known.progress(), Some(0.5));
+        let (unknown, _tx) = preview_install(Phase::Downloading, 50, 0);
+        assert_eq!(unknown.progress(), None);
+        let (installing, _tx) = preview_install(Phase::Installing, 100, 100);
+        assert_eq!(installing.progress(), None);
+    }
+    #[test]
+    fn failed_or_disconnected_worker_reports_once_and_can_be_retried() {
+        let (failed, tx) = preview_install(Phase::Downloading, 0, 0);
+        tx.send(Err("interrupted".into())).unwrap();
+        assert_eq!(failed.poll(), Some(Err("interrupted".into())));
+        assert_eq!(failed.poll(), None);
+        let (disconnected, tx) = preview_install(Phase::Downloading, 0, 0);
+        drop(tx);
+        assert!(disconnected.poll().unwrap().is_err());
+        assert_eq!(disconnected.poll(), None);
+    }
 }

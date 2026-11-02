@@ -10,7 +10,8 @@
 //! * an archive is used only after its SHA-256 matches `SHA256SUMS`;
 //! * binaries are replaced only when the caller asks (after user consent);
 //! * `RILLDISK_NO_UPDATE_CHECK=1` turns every network path here into an error;
-//! * package-manager installs are never modified.
+//! * package managers keep ownership; the desktop can explicitly launch our own
+//!   verified Windows MSI (see `msi` and the scoped proposal).
 //!
 //! Pure logic (version selection, checksum parsing, archive extraction, file
 //! swapping) is public and tested without network access.
@@ -23,6 +24,8 @@ use std::{collections::HashMap, fmt, str::FromStr};
 
 mod archive;
 mod install;
+#[cfg(windows)]
+pub mod msi;
 mod net;
 mod state;
 

@@ -121,7 +121,7 @@ every release. Set `RILLDISK_NO_UPDATE_CHECK=1` to turn update checks off entire
 | `1`–`5` | Overview, Explore, Clean up, Largest files, File types |
 | `F5` / `Esc` | Rescan / stop and keep partial results |
 | `Ctrl+O` / `Ctrl+F` | Scan a folder / find files by name |
-| `↑ ↓` / `Enter` / `Backspace` | Move through the folder list / open / go up (mouse back too) |
+| `↑ ↓` / `Enter` / `Backspace` or `←` | Move through the folder list / open / go up (mouse back too) |
 | `Ctrl+C` | Copy the selected path |
 
 **Size** shows logical file length; **On disk** shows allocated clusters with hard

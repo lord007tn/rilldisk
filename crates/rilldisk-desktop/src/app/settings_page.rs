@@ -84,7 +84,7 @@ impl RillApp {
                 row(
                     ui,
                     "Check automatically",
-                    "Once a day on startup, RillDisk asks GitHub for the latest version. Nothing about you or your files is sent.",
+                    "Once a day, including while the app stays open, RillDisk asks GitHub for the latest version. Nothing about you or your files is sent.",
                     |ui| {
                         let mut automatic = update::automatic_checks();
                         if toggle(ui, &mut automatic, !rilldisk_update::disabled_by_env()) {
@@ -115,9 +115,7 @@ impl RillApp {
                         });
                     },
                 );
-                if let Some(action) = self.update_card(ui) {
-                    actions.push(action);
-                }
+                ui.label("Update availability and progress appear in the bottom bar.");
             });
 
             // ------------------------------------------------------- privacy

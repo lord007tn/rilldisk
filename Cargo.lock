@@ -3280,7 +3280,7 @@ dependencies = [
 
 [[package]]
 name = "rilldisk"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -3297,7 +3297,7 @@ dependencies = [
 
 [[package]]
 name = "rilldisk-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "flate2",
@@ -3312,7 +3312,7 @@ dependencies = [
 
 [[package]]
 name = "rilldisk-desktop"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "eframe",
  "image",
@@ -3326,7 +3326,7 @@ dependencies = [
 
 [[package]]
 name = "rilldisk-mcp-setup"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "jsonc-parser",
@@ -3338,7 +3338,7 @@ dependencies = [
 
 [[package]]
 name = "rilldisk-update"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "flate2",
@@ -3350,6 +3350,7 @@ dependencies = [
  "tar",
  "tempfile",
  "ureq",
+ "windows-sys 0.61.2",
  "zip",
 ]
 
