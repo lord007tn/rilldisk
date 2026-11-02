@@ -305,6 +305,18 @@ fn launch(msi: &Path) -> Result<Handle> {
     Ok(Handle(info.hProcess))
 }
 
+/// Publish the close signal only after Windows successfully launches the installer.
+fn start_installer(
+    request: &Path,
+    msi: &Path,
+    launcher: impl FnOnce(&Path) -> Result<Handle>,
+) -> Result<Handle> {
+    let handle = launcher(msi)?;
+    fs::write(request.with_file_name("installer-started"), [])?;
+    write_status(request, &Status::InstallerStarted)?;
+    Ok(handle)
+}
+
 fn verified_install(request: &Path, data: &Request) -> Result<bool> {
     if !matches!(
         detect_install(&data.desktop),
@@ -334,9 +346,7 @@ fn verified_install(request: &Path, data: &Request) -> Result<bool> {
     } else {
         Some(Handle(parent))
     };
-    let installer = launch(&msi)?;
-    fs::write(request.with_file_name("installer-started"), [])?;
-    write_status(request, &Status::InstallerStarted)?;
+    let installer = start_installer(request, &msi, launch)?;
     if let Some(parent) = parent {
         // SAFETY: parent owns the valid synchronization handle.
         unsafe {
@@ -516,6 +526,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn launch_publishes_the_handoff_only_after_success() {
+        use std::os::windows::io::IntoRawHandle;
+        let dir = tempfile::tempdir().unwrap();
+        let request = dir.path().join("request.json");
+        write_status(&request, &Status::AwaitingConsent).unwrap();
+        let msi = dir.path().join("installer.msi");
+        let failed = start_installer(&request, &msi, |_| bail!("launch declined"));
+        assert!(failed.is_err());
+        assert!(!dir.path().join("installer-started").exists());
+        assert_eq!(read_status(&request).unwrap(), Status::AwaitingConsent);
+        let handle = start_installer(&request, &msi, |path| {
+            assert_eq!(path, msi);
+            assert!(!dir.path().join("installer-started").exists());
+            assert_eq!(read_status(&request).unwrap(), Status::AwaitingConsent);
+            let mut child = Command::new(std::env::current_exe()?)
+                .args(["--exact", "nonexistent_test"])
+                .stdout(std::process::Stdio::null())
+                .spawn()?;
+            assert!(child.wait()?.success());
+            Ok(Handle(child.into_raw_handle()))
+        })
+        .unwrap();
+        assert!(dir.path().join("installer-started").exists());
+        assert_eq!(read_status(&request).unwrap(), Status::InstallerStarted);
+        drop(handle);
+    }
+
+    #[test]
     fn receipts_preserve_multiple_handoffs_and_recover_a_dead_helper() {
         let root = tempfile::tempdir().unwrap();
         let first = root.path().join("first").join("request.json");
@@ -642,8 +680,29 @@ mod tests {
                 .to_string()
                 .contains("version")
         );
-        fs::write(dir.path().join("BUILD-MANIFEST.json"), br#"{"version":"0.1.3","executables_sha256":{"rilldisk.exe":"0000000000000000000000000000000000000000000000000000000000000000"}}"#).unwrap();
-        fs::write(dir.path().join("rilldisk.exe"), b"modified").unwrap();
-        assert!(verify_installed(&data).is_err());
+        let original = b"original";
+        let expected = "0682c5f2076f099c34cfdd15a9e063849ed437a49677e6fcc5b4198c76575be5";
+        let manifest = serde_json::json!({"version": "0.1.3", "executables_sha256": {
+            "rilldisk.exe": expected, "rilldisk-desktop.exe": expected,
+        }});
+        fs::write(
+            dir.path().join("BUILD-MANIFEST.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        for name in ["rilldisk.exe", "rilldisk-desktop.exe"] {
+            fs::write(dir.path().join(name), original).unwrap();
+        }
+        verify_installed(&data).unwrap();
+        for name in ["rilldisk.exe", "rilldisk-desktop.exe"] {
+            fs::write(dir.path().join(name), b"modified").unwrap();
+            assert!(
+                verify_installed(&data)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("does not match")
+            );
+            fs::write(dir.path().join(name), original).unwrap();
+        }
     }
 }

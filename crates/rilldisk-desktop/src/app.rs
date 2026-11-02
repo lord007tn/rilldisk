@@ -913,15 +913,23 @@ impl RillApp {
 
     // ------------------------------------------------------------- sidebar
 
+    /// The folder actually displayed, including results retained during a rescan.
+    fn viewing_path(&self) -> String {
+        if let Some(data) = &self.data
+            && (self.running.is_none() || self.rescanning())
+        {
+            return data.snapshot.path(self.zoom).display().to_string();
+        }
+        self.running
+            .as_ref()
+            .map_or_else(String::new, |running| running.root.clone())
+    }
+
     fn sidebar(&mut self, ui: &mut Ui) -> Vec<Action> {
         let mut actions = Vec::new();
         let th = t();
         // What the main area shows: the closest drive or place containing it is lit.
-        let viewing = match (&self.data, &self.running) {
-            (_, Some(running)) => running.root.clone(),
-            (Some(data), None) => data.snapshot.path(self.zoom).display().to_string(),
-            (None, None) => String::new(),
-        };
+        let viewing = self.viewing_path();
         let located = self
             .volumes
             .iter()
@@ -4442,6 +4450,22 @@ mod tests {
         d.click_hit(nav::PANEL_HITS, 1);
         d.click_hit(nav::CRUMB_HITS, 0);
         assert_eq!(shown(&d), "");
+    }
+
+    #[test]
+    fn sidebar_follows_the_retained_folder_during_a_same_root_rescan() {
+        let mut d = Driver::new("rescan-sidebar");
+        d.click_row("Projects");
+        let shown = d.root.join("Projects").display().to_string();
+        let root = d.root.display().to_string();
+        let _scan = d.app.preview_scan(&root, crate::capture::preview_views());
+        assert!(d.app.rescanning());
+        assert_eq!(d.app.viewing_path(), shown);
+        d.app.stop_scan_preview();
+        let _new_scan = d
+            .app
+            .preview_scan("another-root", crate::capture::preview_views());
+        assert_eq!(d.app.viewing_path(), "another-root");
     }
 
     #[test]
