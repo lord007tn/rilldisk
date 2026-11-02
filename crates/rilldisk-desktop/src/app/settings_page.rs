@@ -125,7 +125,8 @@ impl RillApp {
                 for (icon, text) in [
                     (Icon::Eye, "Reads file names, sizes and dates only. File contents are never opened."),
                     (Icon::Check, "Nothing is uploaded. The only network request is the optional update check."),
-                    (Icon::Terminal, "The CLI and the MCP server for AI assistants are read-only."),
+                    (Icon::Trash, "Nothing is deleted unless you select it and confirm; it goes to the Recycle Bin or Trash by default."),
+                    (Icon::Terminal, "The MCP server for AI assistants is read-only: it can never delete anything."),
                 ] {
                     ui.horizontal(|ui| {
                         let (rect, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());

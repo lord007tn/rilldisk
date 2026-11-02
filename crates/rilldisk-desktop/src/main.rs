@@ -45,7 +45,9 @@ fn main() -> eframe::Result {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--capture" => capture = value(&mut args).map(|d| (PathBuf::from(d), Capture::Tour)),
-            "--capture-live" => capture = value(&mut args).map(|d| (PathBuf::from(d), Capture::Live)),
+            "--capture-live" => {
+                capture = value(&mut args).map(|d| (PathBuf::from(d), Capture::Live))
+            }
             "--capture-cleanup" => {
                 capture = value(&mut args).map(|d| (PathBuf::from(d), Capture::Cleanup))
             }
