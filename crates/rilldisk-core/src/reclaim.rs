@@ -119,7 +119,8 @@ pub struct ReclaimReport {
     pub scan_complete: bool,
     /// Copied from the scan summary so a report alone shows what was left out.
     pub issue_count: u64,
-    /// Folders the OS refused to list; their contents are not considered.
+    /// Folders the OS refused to list or whose entries could not be examined
+    /// (`Summary::access_denied_count`); their contents are not considered.
     pub access_denied_count: u64,
     /// The scanning process was elevated (administrator or root).
     pub elevated: bool,

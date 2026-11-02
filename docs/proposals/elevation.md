@@ -78,8 +78,14 @@ app has Full Disk Access.
    * **macOS:** when a folder fails with `EPERM` (privacy protection), offer
      **Grant Full Disk Access**, which opens
      `x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles`
-     and explains to quit, reopen and rescan. RillDisk does not relaunch itself as
-     root on macOS.
+     and explains to quit, reopen and rescan. `EPERM` can also come from the
+     sandbox of a sandboxed parent app, which Full Disk Access does not lift, so
+     the text says Full Disk Access usually helps rather than always. When other
+     folders failed with `EACCES` too, the `sudo` command follows the Full Disk
+     Access button for those. RillDisk does not relaunch itself as root on macOS.
+   * **Root not openable:** when the scan root itself (or a parent) refuses
+     access, there is no partial scan to show; the error names the denial and the
+     same route (administrator rights, or Full Disk Access for macOS `EPERM`).
    An elevated app shows an **Administrator** badge in the header.
 6. **Issues view.** Issues are grouped by kind, access denied first, with the
    offer at the top.

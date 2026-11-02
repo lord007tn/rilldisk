@@ -26,6 +26,9 @@ pub enum Target {
 #[derive(Clone)]
 pub enum Step {
     WaitData,
+    /// Stop the tour, saving nothing more, unless the scan reported access-denied
+    /// folders (the frames that follow show the guidance for them).
+    ExpectDenied,
     Wait(u32),
     Shot(&'static str),
     Record(bool),
@@ -134,6 +137,7 @@ impl Tour {
             vec![
                 Theme(false),
                 WaitData,
+                ExpectDenied,
                 Tab(View::Issues),
                 Wait(24),
                 Shot("issues"),
@@ -374,6 +378,21 @@ pub fn advance(app: &mut RillApp, ctx: &egui::Context) {
     match step {
         Step::WaitData => {
             if app.data.is_none() {
+                app.tour = Some(tour);
+                return;
+            }
+        }
+        Step::ExpectDenied => {
+            let denied = app
+                .data
+                .as_ref()
+                .map_or(0, |d| d.snapshot.summary.access_denied_count);
+            if denied == 0 {
+                eprintln!(
+                    "--tour issues: the scan reported no access-denied folders, so the frames would lack the guidance; stopping. Scan a folder with unreadable subfolders."
+                );
+                tour.steps.clear();
+                tour.steps.push_back(Step::Quit);
                 app.tour = Some(tour);
                 return;
             }

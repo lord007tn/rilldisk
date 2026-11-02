@@ -88,6 +88,15 @@ fn main() -> eframe::Result {
     }
     let issues_tour = match tour_name.as_deref() {
         None => false,
+        // Named tours replace the --capture tour only; --capture-live and
+        // --capture-cleanup run their own steps.
+        Some("issues") if !matches!(capture, Some((_, Capture::Tour))) => {
+            attach_console();
+            eprintln!(
+                "--tour issues runs with --capture DIR, not alone or with --capture-live or --capture-cleanup."
+            );
+            return Ok(());
+        }
         Some("issues") if path.is_some() => true,
         Some("issues") => {
             // The issues tour waits for scan data, so without a PATH it would never end.

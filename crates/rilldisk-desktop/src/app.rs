@@ -3189,6 +3189,7 @@ impl eframe::App for RillApp {
             self.applied = Some((self.identity, self.dark));
         }
         self.poll(&ctx);
+        self.elevate.poll(&ctx);
         let title = match (&self.running, &self.data) {
             (Some(running), _) => format!("Scanning {} · RillDisk", running.root),
             (None, Some(data)) => format!("{} · RillDisk", data.snapshot.path(self.zoom).display()),

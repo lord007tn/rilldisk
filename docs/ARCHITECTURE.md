@@ -189,7 +189,9 @@ progress counters and swaps in a finished `Arc<Snapshot>`.
 * **Elevation** (`elevation.rs`): the Issues view grouped by kind, the
   Administrator badge and the restart offer (Windows `ShellExecuteExW` "runas" on
   the same executable and scan root; Linux `pkexec`; macOS Full Disk Access
-  settings). The window closes only after the elevated instance started.
+  settings). On Windows the window closes only after the elevated instance
+  started; on Linux it stays open while `pkexec` runs, and the user closes it
+  once the administrator window appears.
 
 `--capture-cleanup DIR` captures the selection bar and cleanup dialogs; it only
 removes folders from a synthetic fixture (a scan with
