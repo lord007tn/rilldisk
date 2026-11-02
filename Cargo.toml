@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/rilldisk-core", "crates/rilldisk-update", "crates/rilldisk", "crates/rilldisk-desktop"]
+members = ["crates/rilldisk-core", "crates/rilldisk-update", "crates/rilldisk-mcp-setup", "crates/rilldisk", "crates/rilldisk-desktop"]
 resolver = "3"
 
 [workspace.package]

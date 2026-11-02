@@ -2068,6 +2068,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsonc-parser"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ecded084f9b9a718d39668a42657c32253663d1f6afb3fbb9134f0305f73f48"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "khronos-egl"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3276,6 +3285,7 @@ dependencies = [
  "anyhow",
  "clap",
  "rilldisk-core",
+ "rilldisk-mcp-setup",
  "rilldisk-update",
  "rmcp",
  "serde",
@@ -3307,9 +3317,22 @@ dependencies = [
  "image",
  "rfd",
  "rilldisk-core",
+ "rilldisk-mcp-setup",
  "rilldisk-update",
  "windows-sys 0.61.2",
  "winresource",
+]
+
+[[package]]
+name = "rilldisk-mcp-setup"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "jsonc-parser",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml_edit",
 ]
 
 [[package]]
@@ -4124,6 +4147,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 
