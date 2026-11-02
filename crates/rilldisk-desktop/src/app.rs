@@ -1144,7 +1144,13 @@ impl RillApp {
         ui.horizontal(|ui| {
             ui.set_height(34.0);
             let (rect, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
-            icons::paint(ui.painter(), rect, Icon::Drive, th.dim);
+            // A drive root gets the drive icon, any other folder a folder.
+            let is_drive = self
+                .volumes
+                .iter()
+                .any(|v| same_path(&v.root.display().to_string(), &root));
+            let icon = if is_drive { Icon::Drive } else { Icon::Folder };
+            icons::paint(ui.painter(), rect, icon, th.dim);
             ui.add_space(4.0);
             ui.label(RichText::new(&root).font(style::semibold(16.0)));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
