@@ -6,9 +6,10 @@ use rilldisk_core::{
     volumes,
 };
 use std::{
+    ffi::OsString,
     fs::OpenOptions,
     io::{self, BufWriter, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::ExitCode,
     sync::{
         Arc,
@@ -404,7 +405,7 @@ async fn run(
     } = args;
     let options = options(threads, max_entries, cross_filesystems);
     // Only takes effect in an elevated terminal; never asks for elevation itself.
-    rilldisk_core::enable_backup_privilege();
+    let backup_privilege = rilldisk_core::enable_backup_privilege();
     let snapshot = tokio::task::spawn_blocking(move || scan(&path, options, control)).await;
     progress.abort();
     let snapshot = snapshot??;
@@ -416,6 +417,12 @@ async fn run(
     } else {
         2
     });
+    let hint = elevation_hint(
+        &snapshot.summary,
+        backup_privilege,
+        &std::env::args_os().collect::<Vec<_>>(),
+        output.as_deref(),
+    );
     let mut writer: Box<dyn Write> = match output {
         Some(path) => Box::new(BufWriter::new(
             OpenOptions::new()
@@ -426,7 +433,12 @@ async fn run(
         )),
         None => Box::new(BufWriter::new(io::stdout().lock())),
     };
-    let result = write(&mut writer, &snapshot).and_then(|()| Ok(writer.flush()?));
+    let result = write(&mut writer, &snapshot).and_then(|()| {
+        if table && let Some(hint) = &hint {
+            writeln!(writer, "\n{hint}")?;
+        }
+        Ok(writer.flush()?)
+    });
     if let Err(error) = result {
         if error
             .downcast_ref::<io::Error>()
@@ -447,7 +459,7 @@ async fn run(
         for issue in &snapshot.summary.issues {
             eprintln!("{}: {}", issue.path.display(), issue.message);
         }
-        if !table && let Some(hint) = elevation_hint(&snapshot.summary) {
+        if !table && let Some(hint) = &hint {
             eprintln!("{hint}");
         }
     }
@@ -490,60 +502,109 @@ fn write_summary(writer: &mut dyn Write, snapshot: &Snapshot) -> Result<()> {
     Ok(())
 }
 
-/// How to read the folders that were refused, when rerunning with more rights would
-/// help. Never elevates by itself.
-fn elevation_hint(summary: &Summary) -> Option<String> {
+/// How to read the folders that were refused, when more rights would help, or why
+/// they stayed unreadable although the scan ran elevated. Never elevates by itself.
+/// `argv` is the command line as run (program first); `output` is `--output`.
+fn elevation_hint(
+    summary: &Summary,
+    backup_privilege: bool,
+    argv: &[OsString],
+    output: Option<&Path>,
+) -> Option<String> {
     let count = summary.access_denied_count;
-    let macos = cfg!(target_os = "macos");
-    // Elevated already: only macOS privacy protection can still be in the way.
-    if count == 0 || (summary.elevated && !macos) {
+    if count == 0 {
         return None;
     }
-    Some(hint_text(
-        count,
-        summary.elevated,
-        &rerun_command(std::env::args().skip(1)),
-    ))
+    let privacy = summary.privacy_denied_count;
+    if summary.elevated {
+        return if cfg!(windows) && !backup_privilege {
+            Some(format!(
+                "Note: running as administrator, but the backup privilege (SeBackupPrivilege) could not be enabled, so {} stayed unreadable. The account may lack the \"Back up files and directories\" right.",
+                folders(count)
+            ))
+        } else if privacy > 0 {
+            Some(format!(
+                "Hint: {} could not be read even as root. {FULL_DISK_ACCESS}",
+                folders(privacy)
+            ))
+        } else {
+            None
+        };
+    }
+    // Arguments that are not valid UTF-8 cannot be shown exactly, so then the
+    // command is left out rather than printed with replacement characters.
+    let command = argv
+        .iter()
+        .map(|arg| arg.to_str())
+        .collect::<Option<Vec<_>>>()
+        .and_then(|args| rerun_command(&args));
+    Some(hint_text(count, privacy, command.as_deref(), output))
 }
 
-fn hint_text(count: u64, elevated: bool, command: &str) -> String {
-    let folders = if count == 1 {
+const FULL_DISK_ACCESS: &str = "macOS privacy protection needs Full Disk Access for your terminal instead (System Settings > Privacy & Security > Full Disk Access), then a new terminal.";
+
+fn folders(count: u64) -> String {
+    if count == 1 {
         "1 protected folder".to_string()
     } else {
         format!("{count} protected folders")
-    };
-    if cfg!(windows) {
-        format!("Hint: run from an elevated terminal (Run as administrator) to read {folders}.")
-    } else if cfg!(target_os = "macos") {
-        let disk_access = "folders protected by macOS privacy controls also need Full Disk Access for your terminal (System Settings > Privacy & Security > Full Disk Access), then a new terminal";
-        if elevated {
-            format!("Hint: {folders} could not be read even as root; {disk_access}.")
-        } else {
-            format!("Hint: run `sudo {command}` to read {folders}; {disk_access}.")
-        }
-    } else {
-        format!("Hint: run `sudo {command}` to read {folders}.")
     }
 }
 
-/// `rilldisk` and the given arguments, quoted for a POSIX shell.
-fn rerun_command(args: impl Iterator<Item = String>) -> String {
-    let mut command = String::from("rilldisk");
-    for arg in args {
-        command.push(' ');
-        if !arg.is_empty()
-            && arg
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || "-_./=:,@+%".contains(c))
-        {
-            command.push_str(&arg);
+/// The unelevated route for `count` refused folders, `privacy` of which only Full
+/// Disk Access lifts (macOS).
+fn hint_text(count: u64, privacy: u64, command: Option<&str>, output: Option<&Path>) -> String {
+    let plain = count.saturating_sub(privacy);
+    let mut hint = String::from("Hint:");
+    if plain > 0 {
+        let route = if cfg!(windows) {
+            "run from an elevated terminal (Run as administrator)".to_string()
+        } else if let Some(command) = command {
+            format!("run `sudo {command}`")
         } else {
-            command.push('\'');
-            command.push_str(&arg.replace('\'', r"'\''"));
-            command.push('\'');
+            "rerun this command with `sudo`".to_string()
+        };
+        hint.push_str(&format!(" {route} to read {}.", folders(plain)));
+        if let Some(output) = output {
+            hint.push_str(&format!(
+                " Remove or rename {} first: --output never overwrites a file.",
+                output.display()
+            ));
         }
     }
-    command
+    if privacy > 0 {
+        hint.push_str(&format!(" For {}, {FULL_DISK_ACCESS}", folders(privacy)));
+    }
+    hint
+}
+
+/// The command line as run, quoted for a POSIX shell. The program is the path it
+/// was started with, so `./rilldisk` stays runnable under `sudo`.
+fn rerun_command(argv: &[&str]) -> Option<String> {
+    let (program, args) = argv.split_first()?;
+    let program = if program.is_empty() {
+        "rilldisk"
+    } else {
+        program
+    };
+    let mut command = shell_quote(program);
+    for arg in args {
+        command.push(' ');
+        command.push_str(&shell_quote(arg));
+    }
+    Some(command)
+}
+
+fn shell_quote(arg: &str) -> String {
+    if !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./=:,@+%".contains(c))
+    {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', r"'\''"))
+    }
 }
 
 fn write_scan(
@@ -598,9 +659,6 @@ fn write_scan(
                     report.candidate_count
                 )?;
             }
-            if let Some(hint) = elevation_hint(&snapshot.summary) {
-                writeln!(writer, "\n{hint}")?;
-            }
         }
     }
     Ok(())
@@ -647,9 +705,6 @@ fn write_reclaim(
             }
         )?;
         writeln!(writer, "{:>22}  -> {}", "", c.suggested_action)?;
-    }
-    if let Some(hint) = elevation_hint(&snapshot.summary) {
-        writeln!(writer, "\n{hint}")?;
     }
     Ok(())
 }
@@ -705,30 +760,92 @@ mod tests {
 
     #[test]
     fn rerun_command_quotes_for_a_shell() {
-        let args = ["scan", "/", "--format", "table"].map(String::from);
         assert_eq!(
-            rerun_command(args.into_iter()),
+            rerun_command(&["rilldisk", "scan", "/", "--format", "table"]).unwrap(),
             "rilldisk scan / --format table"
         );
-        let args = ["scan", "/Volumes/My Disk", "it's"].map(String::from);
+        // The program as it was started, so a binary outside PATH still runs.
         assert_eq!(
-            rerun_command(args.into_iter()),
-            r"rilldisk scan '/Volumes/My Disk' 'it'\''s'"
+            rerun_command(&["./rilldisk", "scan", "/Volumes/My Disk", "it's"]).unwrap(),
+            r"./rilldisk scan '/Volumes/My Disk' 'it'\''s'"
         );
+        assert_eq!(rerun_command(&["", "scan"]).unwrap(), "rilldisk scan");
+        assert_eq!(rerun_command(&[]), None);
     }
 
     #[test]
     fn hint_names_the_platform_route() {
-        let hint = hint_text(211, false, "rilldisk scan /");
+        let hint = hint_text(211, 0, Some("rilldisk scan /"), None);
         assert!(hint.contains("211 protected folders"), "{hint}");
         if cfg!(windows) {
             assert!(hint.contains("Run as administrator"), "{hint}");
         } else {
             assert!(hint.contains("sudo rilldisk scan /"), "{hint}");
         }
-        if cfg!(target_os = "macos") {
-            assert!(hint_text(1, true, "x").contains("Full Disk Access"));
+        assert!(hint_text(1, 0, Some("x"), None).contains("1 protected folder"));
+        // Not valid UTF-8: the folder count stays, the exact command is left out.
+        let generic = hint_text(3, 0, None, None);
+        assert!(generic.contains("3 protected folders"), "{generic}");
+        // The first run created --output; the rerun must not reuse it as is.
+        let output = hint_text(3, 0, Some("x"), Some(Path::new("report.json")));
+        assert!(output.contains("Remove or rename report.json"), "{output}");
+        // Only Full Disk Access helps: no sudo advice.
+        let privacy = hint_text(2, 2, Some("x"), None);
+        assert!(privacy.contains("Full Disk Access") && !privacy.contains("sudo"));
+    }
+
+    fn partial(access_denied_count: u64, privacy_denied_count: u64, elevated: bool) -> Summary {
+        Summary {
+            schema_version: 2,
+            root: "/".into(),
+            backend: "test",
+            started_unix_ms: 0,
+            elapsed_ms: 0,
+            files: 0,
+            directories: 0,
+            skipped_links: 0,
+            skipped_mounts: 0,
+            hard_link_duplicates: 0,
+            logical_bytes: 0,
+            unique_logical_bytes: 0,
+            allocated_bytes: None,
+            issue_count: access_denied_count,
+            access_denied_count,
+            privacy_denied_count,
+            issues: Vec::new(),
+            cancelled: false,
+            complete: false,
+            elevated,
         }
-        assert!(hint_text(1, false, "x").contains("1 protected folder"));
+    }
+
+    #[test]
+    fn elevation_hint_gates_on_denials_and_rights() {
+        let argv = ["rilldisk", "scan", "/"].map(OsString::from);
+        let hint =
+            |summary: &Summary, privilege: bool| elevation_hint(summary, privilege, &argv, None);
+        assert!(hint(&partial(3, 0, false), false).is_some());
+        assert!(hint(&partial(0, 0, false), false).is_none());
+        // Elevated with the privilege: nothing more to suggest.
+        assert!(hint(&partial(3, 0, true), true).is_none());
+        // Elevated without it: Windows says why the folders stayed unreadable.
+        let missing = hint(&partial(3, 0, true), false);
+        assert_eq!(missing.is_some(), cfg!(windows));
+        // Privacy protection outlasts root (only counted on macOS).
+        let privacy = hint(&partial(2, 2, true), true).unwrap();
+        assert!(privacy.contains("Full Disk Access"), "{privacy}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_arguments_leave_out_the_command() {
+        use std::os::unix::ffi::OsStringExt;
+        let argv = [
+            OsString::from("rilldisk"),
+            OsString::from("scan"),
+            OsString::from_vec(vec![b'/', 0xff]),
+        ];
+        let hint = elevation_hint(&partial(1, 0, false), false, &argv, None).unwrap();
+        assert!(hint.contains("rerun this command with `sudo`"), "{hint}");
     }
 }
