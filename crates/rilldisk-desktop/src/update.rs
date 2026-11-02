@@ -80,6 +80,7 @@ pub enum Phase {
     Downloading,
     Verifying,
     WaitingPermission,
+    #[cfg(windows)]
     Installing,
     Restarting,
     Stopped,
@@ -90,6 +91,7 @@ impl Phase {
             Self::Downloading => "Downloading update",
             Self::Verifying => "Verifying and applying update",
             Self::WaitingPermission => "Waiting for Windows permission",
+            #[cfg(windows)]
             Self::Installing => "Installing with Windows Installer",
             Self::Restarting => "Restarting RillDisk",
             Self::Stopped => "Update worker stopped",
@@ -428,8 +430,8 @@ mod tests {
         assert_eq!(known.progress(), Some(0.5));
         let (unknown, _tx) = preview_install(Phase::Downloading, 50, 0);
         assert_eq!(unknown.progress(), None);
-        let (installing, _tx) = preview_install(Phase::Installing, 100, 100);
-        assert_eq!(installing.progress(), None);
+        let (verifying, _tx) = preview_install(Phase::Verifying, 100, 100);
+        assert_eq!(verifying.progress(), None);
     }
     #[test]
     fn failed_or_disconnected_worker_reports_once_and_can_be_retried() {
