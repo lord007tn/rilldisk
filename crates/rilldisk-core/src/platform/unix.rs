@@ -179,7 +179,7 @@ fn is_virtual(fstype: &str) -> bool {
 pub(crate) enum Target {
     Path(PathBuf),
     Relative {
-        parent: Option<Arc<OwnedFd>>,
+        parent: Option<Arc<DirFd>>,
         name: CString,
         path: PathBuf,
     },
@@ -341,7 +341,7 @@ fn apply(entry: &mut RawEntry, facts: &Facts, parent: &Path, volume: &VolumeInfo
 }
 
 /// `lstat` of `name` inside the open directory `dir`.
-fn stat_at(dir: &OwnedFd, name: &CStr) -> io::Result<Facts> {
+fn stat_at(dir: &DirFd, name: &CStr) -> io::Result<Facts> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: name is terminated and stat is writable; the descriptor is open.
     if unsafe {
@@ -370,8 +370,45 @@ fn stat_at(dir: &OwnedFd, name: &CStr) -> io::Result<Facts> {
     })
 }
 
+/// Directory descriptors open right now: the folders being listed plus the
+/// parents that queued children keep open for their relative opens.
+static OPEN_DIRS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// An open directory, counted in `OPEN_DIRS`.
+pub(crate) struct DirFd(OwnedFd);
+
+impl Drop for DirFd {
+    fn drop(&mut self) {
+        OPEN_DIRS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl AsRawFd for DirFd {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
+/// How many directory descriptors queued children may keep open: half the
+/// soft descriptor limit (256 by default on macOS). Past it, children open by
+/// full path instead, so a deep tree cannot exhaust descriptors.
+fn descriptor_budget() -> usize {
+    static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        // SAFETY: zeroed rlimit is valid; getrlimit fills it.
+        let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+        // SAFETY: limit is writable.
+        let soft = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
+            limit.rlim_cur as u64
+        } else {
+            256
+        };
+        (soft.min(1 << 20) as usize / 2).max(32)
+    })
+}
+
 /// Open a folder for listing relative to its parent, never following a symlink.
-fn open_at(parent: Option<&OwnedFd>, name: &CStr) -> io::Result<OwnedFd> {
+fn open_at(parent: Option<&DirFd>, name: &CStr) -> io::Result<DirFd> {
     // SAFETY: name is terminated; the parent descriptor (if any) is open.
     let fd = unsafe {
         libc::openat(
@@ -389,14 +426,15 @@ fn open_at(parent: Option<&OwnedFd>, name: &CStr) -> io::Result<OwnedFd> {
         }
         return Err(error);
     }
+    OPEN_DIRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: openat returned a new descriptor that nothing else owns.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    Ok(DirFd(unsafe { OwnedFd::from_raw_fd(fd) }))
 }
 
 /// Names of one open directory, with their listed type (`DT_*`).
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn for_each_name(
-    dir: &OwnedFd,
+    dir: &DirFd,
     control: &ScanControl,
     mut visit: impl FnMut(&CStr, u8) -> bool,
 ) -> io::Result<bool> {
@@ -452,7 +490,7 @@ fn for_each_name(
 /// Names of one open directory, with their listed type (`DT_*`).
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn for_each_name(
-    dir: &OwnedFd,
+    dir: &DirFd,
     control: &ScanControl,
     mut visit: impl FnMut(&CStr, u8) -> bool,
 ) -> io::Result<bool> {
@@ -514,7 +552,7 @@ const LIST_BUFFER: usize = 64 << 10;
 /// `getdents64` (Linux) or `readdir`, and `fstatat` each file and folder relative
 /// to the open directory. No path is built per entry.
 fn fd_enumerate(
-    parent: Option<Arc<OwnedFd>>,
+    parent: Option<Arc<DirFd>>,
     name: &CStr,
     path: &Path,
     control: &ScanControl,
@@ -546,15 +584,26 @@ fn fd_enumerate(
         listing.batch.entries.push(entry);
         if enter {
             let index = listing.batch.entries.len() - 1;
-            match CString::new(name.to_bytes()) {
-                Ok(child) => listing.children.push((
-                    index,
-                    Target::Relative {
-                        parent: Some(dir.clone()),
-                        name: child,
-                        path: path.join(os),
-                    },
-                )),
+            let child = path.join(os);
+            // Under descriptor pressure the child opens by full path and does
+            // not keep this folder open.
+            let relative =
+                OPEN_DIRS.load(std::sync::atomic::Ordering::Relaxed) < descriptor_budget();
+            let target = if relative {
+                CString::new(name.to_bytes()).map(|name| Target::Relative {
+                    parent: Some(dir.clone()),
+                    name,
+                    path: child,
+                })
+            } else {
+                CString::new(child.as_os_str().as_bytes()).map(|name| Target::Relative {
+                    parent: None,
+                    name,
+                    path: child,
+                })
+            };
+            match target {
+                Ok(target) => listing.children.push((index, target)),
                 Err(error) => result = Err(io::Error::other(error)),
             }
         }

@@ -88,7 +88,9 @@ const ID_BOTH: Layout = Layout {
     name: offset_of!(FILE_ID_BOTH_DIR_INFO, FileName),
     id: offset_of!(FILE_ID_BOTH_DIR_INFO, FileId),
     id_len: 8,
-    min: size_of::<FILE_ID_BOTH_DIR_INFO>(),
+    // A record ends after its name: the last one need not be padded to the
+    // structure's full size.
+    min: offset_of!(FILE_ID_BOTH_DIR_INFO, FileName),
 };
 
 const ID_EXTD: Layout = Layout {
@@ -206,7 +208,8 @@ fn nt_open(parent: Option<&Handle>, name: &[u16]) -> io::Result<Handle> {
     let status = unsafe {
         NtCreateFile(
             &mut handle,
-            FILE_LIST_DIRECTORY | SYNCHRONIZE,
+            // FILE_READ_ATTRIBUTES: to recheck a folder whose listing has no ".".
+            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
             &attributes,
             &mut status_block,
             std::ptr::null(),
@@ -372,8 +375,11 @@ fn nt_enumerate(
     listing: &mut Listing,
 ) -> io::Result<()> {
     let handle = Arc::new(nt_open(parent.as_deref(), name)?);
+    // The scan root was resolved (and is not a link) before the walk started.
+    let root = parent.is_none();
     // The parent stays open only until its last child has opened.
     drop(parent);
+    let mut first = true;
     with_buffer(|buffer| {
         while !control.should_stop() {
             let filled = nt_list(&handle, buffer, volume.layout.class, false).map_err(nt_error)?;
@@ -383,6 +389,12 @@ fn nt_enumerate(
             }
             // SAFETY: the kernel initialized the first `filled` bytes.
             let bytes = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), filled) };
+            // A folder's own "." record (always first when present) carries its
+            // attributes, so a folder that became a reparse point after it was
+            // listed shows up there. Without one, ask the handle.
+            if std::mem::take(&mut first) && !root && !starts_with_dot(bytes, volume.layout) {
+                check_not_reparse(&handle)?;
+            }
             if !add_records(bytes, volume, control, listing, |listing, index, wide| {
                 listing
                     .children
@@ -393,6 +405,38 @@ fn nt_enumerate(
         }
         Ok(())
     })
+}
+
+fn starts_with_dot(bytes: &[u8], layout: Layout) -> bool {
+    bytes.len() >= layout.name + 2
+        && bytes[60..64] == 2_u32.to_le_bytes()
+        && bytes[layout.name..layout.name + 2] == [46, 0]
+}
+
+fn check_not_reparse(handle: &Handle) -> io::Result<()> {
+    let mut info = FILE_ATTRIBUTE_TAG_INFO {
+        FileAttributes: 0,
+        ReparseTag: 0,
+    };
+    // SAFETY: info is the documented structure for this class; the handle is open
+    // with FILE_READ_ATTRIBUTES.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle.0,
+            FileAttributeTagInfo,
+            (&mut info as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+            size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::other(
+            "directory became a reparse point; skipped",
+        ));
+    }
+    Ok(())
 }
 
 /// Parse one buffer of records into the listing. Returns false when the entry

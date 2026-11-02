@@ -411,11 +411,16 @@ impl LinkTable {
                     self.dense.resize(len, (0, 0));
                 }
                 let slot = &mut self.dense[record];
-                if slot.0 != 0 && slot.1 == sequence {
+                if slot.0 == 0 {
+                    *slot = (id as u32 + 1, sequence);
+                    return None;
+                }
+                if slot.1 == sequence {
                     return Some(slot.0 as usize - 1);
                 }
-                *slot = (id as u32 + 1, sequence);
-                return None;
+                // The record was reused while the scan ran (a batch listed
+                // before the deletion can still arrive later): the slot keeps
+                // the first file, any other sequence number uses the map.
             }
         }
         let first = match self.map.entry(identity) {
@@ -440,14 +445,13 @@ impl LinkTable {
         *table = vec![(0, 0); self.max_record as usize + 1];
         self.map
             .retain(|&identity, &mut id| match Self::dense_key(identity, id) {
-                Some((record, sequence)) => {
-                    // A record reused during the scan: keep the newer file. The
-                    // deleted one has no names left to meet.
-                    if table[record].0 == 0 || table[record].1 < sequence {
-                        table[record] = (id as u32 + 1, sequence);
-                    }
+                // One file per record moves to the table; a second sequence
+                // number of a reused record stays in the map.
+                Some((record, sequence)) if table[record].0 == 0 => {
+                    table[record] = (id as u32 + 1, sequence);
                     false
                 }
+                Some(_) => true,
                 None => true,
             });
         self.map.shrink_to_fit();
@@ -473,8 +477,15 @@ mod link_table_tests {
         }
         assert!(table.dense_active);
         assert!(table.map.len() <= 2);
+        // Both files of the reused record are still known, whichever went where.
+        assert_eq!(table.first(ntfs(40, 1), 99), Some(0));
         assert_eq!(table.first(ntfs(40, 2), 99), Some(6));
         assert_eq!(table.first(ntfs(1000, 1), 99), Some(10));
+        // Reuse after the switch (record 2000 holds sequence 1 in the table): the
+        // new file, a late name of the old one, then the new one again.
+        assert_eq!(table.first(ntfs(2000, 2), 200), None);
+        assert_eq!(table.first(ntfs(2000, 1), 201), Some(1010));
+        assert_eq!(table.first(ntfs(2000, 2), 202), Some(200));
         assert_eq!(table.first((7, 40), 99), Some(7));
         assert_eq!(table.first(ntfs(1 << 26, 1), 3), None, "grows on demand");
         assert_eq!(table.first(ntfs(1 << 26, 1), 4), Some(3));
@@ -731,7 +742,7 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
             collector.summary.backend = platform::BACKEND_MFT;
             pool.install(|| platform::scan_mft(source, &verbatim, &control, &mut collector))
                 .context("cannot read the NTFS Master File Table")?;
-            return Ok(finish(collector, &options, &control, start));
+            return Ok(pool.install(|| finish(collector, &options, &control, start)));
         }
         Backend::Auto => {
             if let Ok(source) = platform::mft_source(&verbatim, false) {
@@ -740,7 +751,9 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
                     .install(|| platform::scan_mft(source, &verbatim, &control, &mut collector));
                 // Anything that fails before entries are produced falls back to the walk.
                 match result {
-                    Ok(()) => return Ok(finish(collector, &options, &control, start)),
+                    Ok(()) => {
+                        return Ok(pool.install(|| finish(collector, &options, &control, start)));
+                    }
                     Err(_) if !control.is_cancelled() => {
                         collector = fresh()?;
                         reset();
@@ -767,7 +780,7 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
         });
     }
     walk(&pool, verbatim, volume, &control, &mut collector);
-    Ok(finish(collector, &options, &control, start))
+    Ok(pool.install(|| finish(collector, &options, &control, start)))
 }
 
 /// Scan an NTFS volume image (a file holding a raw NTFS filesystem) with the
@@ -786,10 +799,10 @@ pub fn scan_ntfs_image(
     reset_progress(&control, &options);
     let mut collector = Collector::new(image.to_path_buf(), None)?;
     collector.summary.backend = platform::BACKEND_MFT;
-    thread_pool(&options)?
-        .install(|| platform::scan_ntfs_image(file, &control, &mut collector))
+    let pool = thread_pool(&options)?;
+    pool.install(|| platform::scan_ntfs_image(file, &control, &mut collector))
         .context("cannot read the image's Master File Table")?;
-    Ok(finish(collector, &options, &control, start))
+    Ok(pool.install(|| finish(collector, &options, &control, start)))
 }
 
 /// Parallel directory walk. Workers queue subfolders the moment they read them,
