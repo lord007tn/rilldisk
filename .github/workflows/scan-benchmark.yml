@@ -1,0 +1,50 @@
+# Scanner benchmark on a synthetic fixture: every backend, identical totals.
+#
+# GitHub's Windows runners are administrators, so this is where the NTFS MFT
+# backend is measured on a real volume next to the directory walks. Linux and
+# macOS compare their new walk with RillDisk 0.1's. Runner hardware is shared
+# and varies; compare backends within one run, not across runs. Results are in
+# the job summary. Only synthetic data is scanned. No Docker images are built.
+name: Scan benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      files:
+        description: Files in the synthetic fixture
+        default: '300000'
+  pull_request:
+    paths:
+      - 'crates/rilldisk-core/**'
+      - 'scripts/benchmark.py'
+      - '.github/workflows/scan-benchmark.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p rilldisk-core --examples
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Benchmark
+        shell: bash
+        run: |
+          python scripts/benchmark.py target/release/examples \
+            --files "${{ github.event.inputs.files || '300000' }}" --runs 3 \
+            --flush --require-identical --json bench.json | tee bench.md
+          cat bench.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scan-benchmark-${{ matrix.os }}
+          path: bench.json
