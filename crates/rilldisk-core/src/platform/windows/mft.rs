@@ -631,11 +631,6 @@ fn parse_record(record: &mut [u8], index: u64, slot: &mut Slot, chunk: &mut Chun
                 else {
                     continue;
                 };
-                // A reparse point's tag is duplicated here (offset 0x3C), in case
-                // `$REPARSE_POINT` itself is not resident.
-                if slot.flags & SLOT_REPARSE != 0 && slot.reparse_tag == 0 {
-                    slot.reparse_tag = u32_at(value, 0x3C).unwrap_or(0);
-                }
                 // 8.3 aliases name the same link again.
                 if namespace == NAMESPACE_DOS {
                     continue;
@@ -802,8 +797,10 @@ impl Mft {
             names.extend_from_slice(&chunk.names);
             texts.push(chunk.text);
         }
-        // Extension records carry overflow names and, for very fragmented files,
-        // the first `$DATA` fragment. Fold them into their base record.
+        // Extension records carry what did not fit in the base record: overflow
+        // names (heavily hard-linked files), the first `$DATA` fragment of very
+        // fragmented files, a WOF file's compressed stream, `$REPARSE_POINT`.
+        // Fold them into their base record.
         for index in 0..slots.len() {
             let slot = slots[index];
             if slot.flags & SLOT_EXTENSION == 0 || slot.flags & SLOT_IN_USE == 0 {
@@ -815,11 +812,17 @@ impl Mft {
             if !base.in_use() || base.sequence != slot.base_sequence {
                 continue;
             }
-            if slot.flags & SLOT_HAS_DATA != 0 && base.flags & SLOT_HAS_DATA == 0 {
-                let target = &mut slots[slot.base as usize];
+            let target = &mut slots[slot.base as usize];
+            if slot.flags & SLOT_HAS_DATA != 0 && target.flags & SLOT_HAS_DATA == 0 {
                 target.flags |= SLOT_HAS_DATA;
                 target.logical = slot.logical;
-                target.allocated += slot.allocated;
+            }
+            // Allocation of the unnamed stream's first fragment and of a WOF
+            // stream, whichever this record holds (each is counted once: only the
+            // fragment that starts at VCN 0 reports sizes).
+            target.allocated += slot.allocated;
+            if target.reparse_tag == 0 {
+                target.reparse_tag = slot.reparse_tag;
             }
         }
         for name in &mut names {
@@ -1398,6 +1401,53 @@ mod tests {
             );
             assert_eq!(parse(&mut r, 61).0.is_link(), link, "{tag:#x}");
         }
+    }
+
+    #[test]
+    fn extension_records_bring_the_reparse_tag_and_wof_allocation() {
+        let mut v = vec![0_u8; 8];
+        v[0..4].copy_from_slice(&TAG_WOF.to_le_bytes());
+        let reparse = resident(ATTR_REPARSE_POINT, &v, &[]);
+        let base = record(
+            1024,
+            RECORD_IN_USE,
+            3,
+            0,
+            &[
+                standard(FILE_ATTRIBUTE_REPARSE_POINT, 0),
+                file_name(5, 5, 1, "hardlinked.dll"),
+                nonresident(
+                    ATTR_FLAG_SPARSE,
+                    0,
+                    900_000,
+                    900_000,
+                    0,
+                    &[0x01, 0xDC, 0x00],
+                ),
+            ],
+        );
+        // The extension record (base reference: record 70, sequence 3) holds the
+        // reparse point, as for files whose names fill the base record.
+        let extension = record(1024, RECORD_IN_USE, 1, (3_u64 << 48) | 70, &[reparse]);
+        let (base_slot, _) = parse(&mut base.clone(), 70);
+        assert_eq!(base_slot.reparse_tag, 0);
+        assert!(base_slot.is_link(), "unknown tag on its own: a link");
+        let (extension_slot, _) = parse(&mut extension.clone(), 71);
+        assert_eq!(extension_slot.reparse_tag, TAG_WOF);
+        // Fold as Mft::read does.
+        let mut slots = vec![Slot::default(); 72];
+        slots[70] = base_slot;
+        slots[71] = extension_slot;
+        let slot = slots[71];
+        let target = &mut slots[slot.base as usize];
+        target.allocated += slot.allocated;
+        if target.reparse_tag == 0 {
+            target.reparse_tag = slot.reparse_tag;
+        }
+        assert!(
+            !slots[70].is_link(),
+            "a WOF file once its extension is folded in"
+        );
     }
 
     #[test]

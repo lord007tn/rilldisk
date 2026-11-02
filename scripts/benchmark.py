@@ -119,7 +119,7 @@ def true_allocation(root):
     handle (Windows) or lstat (Unix), each file identity counted once, links and
     reparse points not followed, data smaller than a cluster (inside the MFT
     record) counted as zero. Returns (bytes, unreadable folders)."""
-    seen, total, unreadable = set(), 0, 0
+    seen, total, unreadable = set(), 0, []
     query = cluster = None
     if os.name == "nt":
         import ctypes
@@ -155,16 +155,18 @@ def true_allocation(root):
             if not ok:
                 raise OSError(ctypes.get_last_error(), path)
             return info.allocation if info.allocation >= cluster else 0
-    stack = [plain(root)]
+    # Windows: walk verbatim (`\\?\`) paths throughout. Normalizing them again
+    # (os.path.abspath) would strip trailing dots and spaces from folder names.
+    stack = [verbatim(root) if os.name == "nt" else os.path.abspath(root)]
     while stack:
         folder = stack.pop()
         try:
-            entries = list(os.scandir(verbatim(folder) if os.name == "nt" else folder))
+            entries = list(os.scandir(folder))
         except OSError:
-            unreadable += 1
+            unreadable.append(folder)
             continue
         for entry in entries:
-            path = os.path.join(folder, entry.name)
+            path = entry.path
             info = os.stat(entry.path, follow_symlinks=False)
             if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
                 continue
@@ -269,7 +271,8 @@ def main():
         if args.verify_allocation:
             start = time.perf_counter()
             allocated, unreadable = true_allocation(target)
-            report["truth"] = {"allocated_bytes": allocated, "unreadable_folders": unreadable}
+            report["truth"] = {"allocated_bytes": allocated, "unreadable_folders": len(unreadable),
+                               "only_the_locked_folder": all(os.path.basename(p) == "locked" for p in unreadable)}
             print(f"true allocation measured in {time.perf_counter() - start:.0f} s", file=sys.stderr)
     finally:
         if created and not args.keep:
@@ -384,6 +387,10 @@ def summarize(report, args):
         locked = (manifest or {}).get("unreadable", {}).get("allocated_bytes")
         print(f"  (measured allocation {truth['allocated_bytes']:,} over readable folders; "
               f"{truth['unreadable_folders']} unreadable; locked folder per manifest: {locked})")
+        if not truth.get("only_the_locked_folder", True):
+            verdict("UNVERIFIED", "the allocation truth could not read some folders besides the locked one")
+            truth = None
+            expected.clear()
     stable_exact = True
     for backend, values in sorted(allocations.items()):
         listing = backend in LISTING_ALLOCATION
