@@ -131,7 +131,8 @@ fn sparse_file_accounting_matches_legacy() {
         let entry = snapshot
             .entries
             .iter()
-            .find(|e| snapshot.path(e.id) == sparse)
+            // The scan reports the canonical root (/private/var/... on macOS).
+            .find(|e| snapshot.name(e.id) == "sparse-ملف")
             .unwrap();
         (
             entry.kind,
