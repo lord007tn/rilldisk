@@ -300,9 +300,14 @@ What changed since the first prototype:
 `find -xdev`. macOS is built and tested in CI but not yet measured. Details:
 [docs/PERFORMANCE.md](docs/PERFORMANCE.md#linux-wsl2-observation).
 
-RillDisk is **not yet** an MFT reader, so it does not claim WizTree-level
-whole-volume speed; a qualified NTFS fast path is [on the roadmap](ROADMAP.md).
-Method and earlier comparisons: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+**Whole NTFS drives as administrator** are read straight from the Master File
+Table (`--backend auto`, the default; `--backend mft` / `dir` to choose). On
+GitHub's Windows runner the whole system drive (1.2M files) took 4–5 s that way,
+against 310–403 s for a first directory walk (4–6 s once its cache was warm),
+with identical counts.
+Without administrator rights, or for a folder, the directory walk opens each
+folder relative to its parent's handle (6–16 % faster than 0.1 warm). Method,
+tables and the correctness gate: [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
 ## Accuracy you can trust
 
