@@ -32,11 +32,11 @@ MCP server so your AI assistant sees exactly what you see.
 | --- | --- |
 | **See it at a glance** | An overview that answers the real questions first: how full the drive is, how much you can safely get back, which AI agents left worktrees behind, and the biggest file, next to a live map of the scan. |
 | **Two ways to explore** | A rounded, nested treemap and a sunburst **Rings** view, both GPU-rendered (wgpu). Click to drill in, hover for details, color by folder or by file type, and light up everything that can be cleaned. |
-| **Reclaim, explained** | Finds Git worktrees (including forgotten **AI-agent worktrees**, labeled Claude Code, Codex, T3 Code, Cursor or Conductor), `node_modules`, `target`, `.next`, `.venv`, Unity `Library`, package caches and temp folders. Each comes with a safety level, the reason, idle time, the exact command, and how much space it **really** frees once hard links are counted. Tick folders to build a commented **cleanup plan** you review and run yourself. |
+| **Reclaim, explained** | Finds Git worktrees (including forgotten **AI-agent worktrees**, labeled Claude Code, Codex, T3 Code, Cursor or Conductor), `node_modules`, `target`, `.next`, `.venv`, Unity `Library`, package caches and temp folders. Each comes with a safety level, the reason, idle time, the exact command, and how much space it **really** frees once hard links are counted. Tick folders (or **Select all safe**) and move them to the Recycle Bin / Trash after you confirm, or copy a commented cleanup plan to run yourself. |
 | **Fast and lean** | Batched Win32 metadata enumeration on Windows and a no-follow `readdir` backend on Linux and macOS, on one barrier-free, work-stealing pipeline. A 3.1-million-file workspace scans in **5–9 s** using ~560 MB ([numbers](#performance)). |
 | **Built for agents too** | The same engine powers a CLI with JSON output and a local **MCP server**. Claude Code, Codex, Cursor or any MCP client can scan, query and explain your disk. |
 | **Yours to style** | Three color identities (**Tide**, **Moss**, **Aurora**), each in light and dark. RillDisk remembers your choice. |
-| **Read-only by design** | Metadata only. Never opens, uploads or deletes files. No telemetry, no network listener, no elevation. The only network request is an [opt-out-able update check](docs/proposals/updates.md) that sends nothing about you. |
+| **Local and careful** | Metadata only. Never opens or uploads files, and never deletes on its own: only the reclaim folders you tick and confirm, to the Recycle Bin / Trash by default ([scope](docs/proposals/cleanup.md)). No telemetry, no network listener, no elevation. The only network request is an [opt-out-able update check](docs/proposals/updates.md) that sends nothing about you. |
 | **Open source** | AGPL-3.0-only, pure Rust: no Electron, no Tauri, no webview, no JavaScript. Windows, Linux and macOS. |
 
 <table>
@@ -49,7 +49,7 @@ MCP server so your AI assistant sees exactly what you see.
 <td><b>Rings</b> — one ring per folder level; hover any slice to see what is inside.</td>
 </tr>
 <tr>
-<td><img src="docs/media/cleanup.png" alt="Clean up view: build output, dependencies, Git worktrees and caches with safety levels, three selected and a Copy cleanup plan bar"></td>
+<td><img src="docs/media/cleanup-selection.png" alt="Clean up view after Select all safe: twelve rebuildable and cache folders ticked, with a selection bar offering Copy plan and Move to Recycle Bin"></td>
 <td><img src="docs/media/cleanable.png" alt="Treemap with every cleanable folder lit up in its safety color"></td>
 </tr>
 <tr>
@@ -122,7 +122,9 @@ links counted once. Switch at the top right.
 RillDisk recognizes folders that are rebuilt by tools, re-downloaded on demand, or
 left behind by Git and AI coding agents. It decides from names, kinds and marker
 files (`target` next to `Cargo.toml`, `.git` *file* in a folder, `pyvenv.cfg` in
-`.venv`) — never by reading file contents — and **it never deletes anything**.
+`.venv`) — never by reading file contents — and **it never deletes anything on its
+own**: only the folders you select and confirm, moved to the Recycle Bin / Trash
+unless you explicitly choose permanent deletion.
 
 | Safety | Meaning | Examples |
 | --- | --- | --- |
@@ -162,6 +164,39 @@ with their owner. Folders left in an agent's `worktrees` directory **without** a
 `.git` are flagged as *orphaned*: Git no longer knows them, so `git worktree remove`
 cannot help and they silently keep their full `node_modules`. Totals never double
 count nested candidates.
+
+### Remove what you selected
+
+In the desktop's **Clean up** view, tick folders or press **Select all safe**
+(every Regenerable and Cache folder; *Review first* items are never ticked for
+you). The selection bar shows how much you picked. **Move to Recycle Bin** opens
+a confirmation listing every path and the total, with Cancel as the default. The
+removal runs in the background with progress, then shows what was freed, what
+failed and why (for example a file in use), and updates every view without a
+rescan. Shift-click, or the menu next to the button, deletes permanently after
+an extra confirmation.
+
+<img src="docs/media/cleanup-confirm.png" alt="Confirmation dialog listing every folder to move to the Recycle Bin with its size, the total, and Cancel next to Move to Recycle Bin" width="720">
+
+```text
+> rilldisk reclaim D:\Projects --delete
+Move to the Recycle Bin:
+    18.8 MiB  Regenerable   Rust build output         D:\Projects\ferrite-engine\target
+   152.2 MiB  Regenerable   Node.js dependencies      D:\Projects\atlas-web\node_modules
+...
+12 folders, 3462 files, frees at least 280.0 MiB once the Recycle Bin is emptied.
+Continue? [y/N]
+```
+
+`--safety regenerable,cache` (the default) picks what is removed; add `review`
+to include worktrees. `--permanent` skips the Trash, `--yes` skips the question
+(required when stdin is not a terminal) and `--format json` prints a per-item
+report. Every folder is re-checked right before removal: links, junctions, drive
+roots, your home folder, system folders and anything that changed since the scan
+are refused. Removing a linked Git worktree leaves an entry for `git worktree
+prune`; RillDisk tells you rather than running Git. The rules and threat model
+are in [docs/proposals/cleanup.md](docs/proposals/cleanup.md). The MCP server
+cannot delete anything.
 
 ## Give your AI assistant the same view
 

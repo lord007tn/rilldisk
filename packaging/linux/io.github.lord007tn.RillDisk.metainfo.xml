@@ -11,13 +11,14 @@
   </developer>
   <description>
     <p>
-      RillDisk is a fast, read-only disk usage analyzer. It scans a drive or folder,
+      RillDisk is a fast, local disk usage analyzer. It scans a drive or folder,
       shows where the space went as a treemap or rings chart, and points out build
       output, caches, old worktrees and other things you can safely remove, each
       with an explanation and a command you can run yourself.
     </p>
     <p>
-      It never deletes, moves or uploads anything. Partial scans and unreadable
+      It never uploads anything and never deletes on its own: only the folders you
+      select and confirm, moved to the Trash by default. Partial scans and unreadable
       folders stay visible, and logical, unique and allocated sizes are kept apart.
       The same scanner powers the rilldisk command line and a local MCP server for
       AI assistants.

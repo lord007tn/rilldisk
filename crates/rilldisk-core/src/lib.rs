@@ -14,11 +14,13 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::{Serialize, Serializer, ser::SerializeStruct};
 
+pub mod cleanup;
 mod live;
 mod platform;
 mod reclaim;
 mod stats;
 
+pub use cleanup::{CleanupMode, CleanupPlan, CleanupReport};
 pub use live::{LiveFolder, LiveView};
 pub use platform::{Volume, volumes};
 pub use reclaim::{Candidate, Category, ReclaimReport, Safety, find_reclaimable};
@@ -703,6 +705,88 @@ fn add_issue(summary: &mut Summary, mut issue: ScanIssue) {
 }
 
 impl Snapshot {
+    /// A copy without the subtrees rooted at `removed` (for example after a
+    /// cleanup), with their sizes and counts subtracted from every ancestor so
+    /// views stay correct without a rescan. Entry IDs are renumbered; the root
+    /// (ID 0) is never removed. Hard-link flags of remaining entries are kept, so
+    /// a file whose other name was removed still counts as shared until the next
+    /// scan: figures err on the side of reporting less space.
+    pub fn without(&self, removed: &[usize]) -> Snapshot {
+        let count = self.entries.len();
+        let mut gone = vec![false; count];
+        for &id in removed {
+            if id != 0 && id < count {
+                gone[id] = true;
+            }
+        }
+        let tops: Vec<usize> = (1..count)
+            .filter(|&id| gone[id] && !self.entries[id].parent_id.is_some_and(|p| gone[p]))
+            .collect();
+        // Parents precede children, so one forward pass marks whole subtrees.
+        for id in 1..count {
+            if let Some(parent) = self.entries[id].parent_id
+                && gone[parent]
+            {
+                gone[id] = true;
+            }
+        }
+        let mut entries = self.entries.clone();
+        for &top in &tops {
+            let removed = self.entries[top].clone();
+            let mut cursor = removed.parent_id;
+            while let Some(parent) = cursor {
+                let entry = &mut entries[parent];
+                entry.logical_bytes = entry.logical_bytes.saturating_sub(removed.logical_bytes);
+                entry.unique_logical_bytes = entry
+                    .unique_logical_bytes
+                    .saturating_sub(removed.unique_logical_bytes);
+                entry.allocated_bytes = entry
+                    .allocated_bytes
+                    .zip(removed.allocated_bytes)
+                    .map(|(a, b)| a.saturating_sub(b));
+                entry.file_count = entry.file_count.saturating_sub(removed.file_count);
+                cursor = entry.parent_id;
+            }
+        }
+        let mut summary = self.summary.clone();
+        let mut new_id = vec![usize::MAX; count];
+        let mut kept = Vec::with_capacity(count);
+        for (id, mut entry) in entries.into_iter().enumerate() {
+            if gone[id] {
+                match entry.kind {
+                    EntryKind::File => {
+                        summary.files = summary.files.saturating_sub(1);
+                        if entry.hard_link_duplicate {
+                            summary.hard_link_duplicates =
+                                summary.hard_link_duplicates.saturating_sub(1);
+                        }
+                    }
+                    EntryKind::Directory => {
+                        summary.directories = summary.directories.saturating_sub(1);
+                    }
+                    EntryKind::Link => {
+                        summary.skipped_links = summary.skipped_links.saturating_sub(1)
+                    }
+                    EntryKind::Other => {}
+                }
+                continue;
+            }
+            new_id[id] = kept.len();
+            entry.id = kept.len();
+            entry.parent_id = entry.parent_id.map(|p| new_id[p]);
+            kept.push(entry);
+        }
+        summary.logical_bytes = kept[0].logical_bytes;
+        summary.unique_logical_bytes = kept[0].unique_logical_bytes;
+        summary.allocated_bytes = kept[0].allocated_bytes;
+        let children = ChildIndex::build(&kept);
+        Snapshot {
+            summary,
+            entries: kept,
+            children,
+        }
+    }
+
     /// Immediate children of `id`, largest logical size first. Unknown IDs have none.
     pub fn children(&self, id: usize) -> &[u32] {
         match (

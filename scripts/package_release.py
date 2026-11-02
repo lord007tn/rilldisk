@@ -187,8 +187,9 @@ def start_here(version, target, commit):
     pre = "-" in version
     title = f"# RillDisk {version}" + (" (pre-release)" if pre else "")
     common_tail = f"""
-RillDisk reads file metadata only. It never deletes, moves or uploads anything;
-reclaim results are suggestions with a command for you to run. Reports never
+RillDisk reads file metadata only and never uploads anything. It never deletes
+on its own: `rilldisk reclaim --delete` and the desktop's Clean up view remove
+only the candidates you confirm, to the Recycle Bin / Trash by default. Reports never
 overwrite existing files. Exit 0 means complete, 2 partial, 130 cancelled, 1 failure.
 
 Updates: `rilldisk update --check` shows whether a newer release exists and

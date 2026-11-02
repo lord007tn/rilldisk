@@ -1,6 +1,6 @@
 [package]
 name = "rilldisk-core"
-description = "Read-only disk metadata scanning and query engine"
+description = "Disk metadata scanning, query and confirmed-cleanup engine"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,7 @@ repository.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 rayon = "1.11"
+trash = { version = "5.2", default-features = false, features = ["coinit_apartmentthreaded"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

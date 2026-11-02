@@ -133,6 +133,24 @@ dropped; candidates inside a worktree are kept with `nested_in` and excluded fro
 totals. Idle days come from the newest modification time in the subtree. No file
 contents are read and nothing is modified.
 
+## Cleanup
+
+`rilldisk-core::cleanup` is the only code that changes the filesystem
+([scope and threat model](proposals/cleanup.md)). `plan` turns selected entry
+IDs into the outermost reclaim candidates of the current report and refuses
+anything else (non-candidates, the scan root, Trash folders, volume roots, the
+home, temp and system folders and their ancestors, folders holding the running
+executable). `execute` rebuilds the plan, then for each item re-checks the live
+path (exists, still a directory, no link or reparse point at or above it, same
+canonical path, not a mount point) and moves it to the Recycle Bin / Trash
+(`trash` crate; NSFileManager on macOS, so no `osascript`) or, when asked,
+deletes it with `std::fs::remove_dir_all`, which never follows links. It keeps
+going on errors, reports each item, and checks a `CleanupControl` for
+cancellation between items. `Snapshot::without` subtracts removed subtrees from
+their ancestors and renumbers entries so the desktop can re-analyze without a
+rescan. The CLI (`reclaim --delete`) and the desktop (`cleanup_ui.rs`) both call
+it; MCP does not.
+
 ## Desktop
 
 `rilldisk-desktop` is a separate crate on eframe/egui with the wgpu renderer, so
@@ -156,8 +174,14 @@ progress counters and swaps in a finished `Arc<Snapshot>`.
   anti-aliased annular sectors (each a 4 × n vertex grid whose outer rows fade over
   one pixel) and hit-tested in polar coordinates.
 * **Views**: Overview, Explore (map or rings plus a virtualized folder list),
-  Clean up (virtualized, grouped by category, with a plan that is only ever copied
-  to the clipboard), Largest files, File types, Issues and Search.
+  Clean up (virtualized, grouped by category; tick folders or "Select all safe",
+  then copy a plan or move them to the Recycle Bin / Trash after a confirmation
+  dialog, see `cleanup_ui.rs`), Largest files, File types, Issues and Search.
+
+`--capture-cleanup DIR` captures the selection bar and cleanup dialogs; it only
+removes folders from a synthetic fixture (a scan with
+`.rilldisk-synthetic-fixture` at its root, written by
+`scripts/make_demo_fixture.py`, or one inside the temp folder).
 
 `--capture DIR` runs a scripted tour that injects real pointer events and saves PNG
 frames for documentation, with invented drives in place of the real ones.

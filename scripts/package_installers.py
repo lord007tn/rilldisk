@@ -44,11 +44,12 @@ PACKAGING = REPO / "packaging"
 SOURCE = "https://github.com/lord007tn/rilldisk"
 APP_ID = "io.github.lord007tn.RillDisk"
 MAINTAINER = "Raed Bahri <lord007tn@users.noreply.github.com>"
-SUMMARY = "Fast, read-only disk usage analyzer with a desktop app, CLI and MCP server"
+SUMMARY = "Fast, local disk usage analyzer with a desktop app, CLI and MCP server"
 DESCRIPTION = """RillDisk scans a drive or folder, shows where the space went as a treemap
 or rings chart, and points out build output, caches, old worktrees and
-other things you can safely remove, each with a reason and a command you
-run yourself. It never deletes, moves or uploads anything. The rilldisk
+other things you can safely remove, each with a reason. It never deletes
+anything on its own: only the folders you select and confirm, moved to the
+Trash by default. It never uploads anything. The rilldisk
 command line and its local MCP server share the same scanner."""
 # Debian names; libraries the desktop app loads at run time for its window
 # and GPU. The CLI needs only libc.

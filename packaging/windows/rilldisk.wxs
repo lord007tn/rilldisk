@@ -37,7 +37,7 @@
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/lord007tn/rilldisk" />
     <Property Id="ARPHELPLINK" Value="https://github.com/lord007tn/rilldisk/issues" />
     <Property Id="ARPURLUPDATEINFO" Value="https://github.com/lord007tn/rilldisk/releases" />
-    <Property Id="ARPCOMMENTS" Value="Fast, read-only disk usage analyzer with a CLI and MCP server" />
+    <Property Id="ARPCOMMENTS" Value="Fast, local disk usage analyzer with a CLI and MCP server" />
     <!-- Remember a custom install folder so upgrades go to the same place. -->
     <Property Id="INSTALLFOLDER">
       <RegistrySearch Id="InstallFolderSearch" Root="HKLM" Key="Software\RillDisk" Name="InstallFolder" Type="raw" />

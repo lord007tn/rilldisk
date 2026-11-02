@@ -3,8 +3,9 @@
 //!
 //! Rules look at names, entry kinds and neighbouring marker files (for example a
 //! `target` directory next to `Cargo.toml`). No file contents are read, nothing is
-//! deleted, and every candidate carries a reason and a suggested action for a
-//! person or assistant to review.
+//! deleted here, and every candidate carries a reason and a suggested action for a
+//! person or assistant to review. Removing candidates the user selected and
+//! confirmed is the separate `cleanup` module's job.
 use crate::{EntryKind, Snapshot, serialize_path};
 use serde::Serialize;
 use std::{collections::HashMap, path::PathBuf};
@@ -128,7 +129,7 @@ pub struct ReclaimReport {
     pub notice: &'static str,
 }
 
-const NOTICE: &str = "Metadata-only suggestions. RillDisk never deletes files. Verify each path, \
+const NOTICE: &str = "Metadata-only suggestions. RillDisk never deletes anything on its own. Verify each path, \
 prefer the suggested tool command, and treat 'review' candidates as possibly unique work. \
 Freed-space figures count hard links found within this scan; scan the whole drive for the \
 most accurate numbers.";
@@ -1216,7 +1217,7 @@ fn is_volume_root(snapshot: &Snapshot) -> bool {
     volume_root_path(&snapshot.summary.root)
 }
 
-fn volume_root_path(root: &std::path::Path) -> bool {
+pub(crate) fn volume_root_path(root: &std::path::Path) -> bool {
     let parts: Vec<String> = root
         .components()
         .map(|c| c.as_os_str().to_string_lossy().to_lowercase())

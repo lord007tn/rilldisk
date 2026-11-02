@@ -167,6 +167,10 @@ def main():
     spread(local / "pip" / "Cache" / "http", [f"wheel-{i:03}" for i in range(80)], 0.7 * GiB, 30)
     spread(local / "NVIDIA" / "DXCache", [f"shader-{i:03}.bin" for i in range(90)], 0.6 * GiB, 4)
 
+    # Marks the tree as synthetic: `rilldisk-desktop --capture-cleanup` only
+    # removes folders from a scan that has this file at its root (or lives in temp).
+    (root / ".rilldisk-synthetic-fixture").write_text("Synthetic RillDisk demo data. Safe to delete.\n")
+
     # Directory times reflect their newest content (bottom-up), as on a lived-in disk.
     for directory, _, files in sorted(os.walk(root), key=lambda w: -len(w[0])):
         children = [os.path.join(directory, f) for f in files] + [

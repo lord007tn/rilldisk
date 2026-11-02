@@ -4,6 +4,7 @@
 
 mod app;
 mod capture;
+mod cleanup_ui;
 mod icons;
 mod live;
 mod settings;
@@ -20,6 +21,14 @@ use std::{path::PathBuf, sync::Arc};
 /// AppStream metadata in packaging/linux so docks show the right icon.
 const APP_ID: &str = "io.github.lord007tn.RillDisk";
 
+/// Which scripted capture `--capture*` runs (development only).
+#[derive(Clone, Copy)]
+enum Capture {
+    Tour,
+    Live,
+    Cleanup,
+}
+
 fn main() -> eframe::Result {
     let mut path = None;
     let mut capture = None;
@@ -35,8 +44,13 @@ fn main() -> eframe::Result {
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--capture" => capture = value(&mut args).map(|d| (PathBuf::from(d), false)),
-            "--capture-live" => capture = value(&mut args).map(|d| (PathBuf::from(d), true)),
+            "--capture" => capture = value(&mut args).map(|d| (PathBuf::from(d), Capture::Tour)),
+            "--capture-live" => {
+                capture = value(&mut args).map(|d| (PathBuf::from(d), Capture::Live))
+            }
+            "--capture-cleanup" => {
+                capture = value(&mut args).map(|d| (PathBuf::from(d), Capture::Cleanup))
+            }
             // Unknown values keep the saved or system theme.
             "--theme" => match value(&mut args).as_deref() {
                 Some("dark") => dark = Some(true),
@@ -56,7 +70,7 @@ fn main() -> eframe::Result {
             "--help" | "-h" => {
                 attach_console();
                 println!(
-                    "rilldisk-desktop [PATH] [--theme light|dark] [--palette tide|moss|aurora] [--size WIDTHxHEIGHT] [--capture DIR]\n\nOpens the RillDisk desktop app. PATH starts a scan immediately.\n--capture runs a scripted tour and saves screenshots to DIR (development).\n--version prints the version."
+                    "rilldisk-desktop [PATH] [--theme light|dark] [--palette tide|moss|aurora] [--size WIDTHxHEIGHT] [--capture DIR] [--capture-cleanup DIR]\n\nOpens the RillDisk desktop app. PATH starts a scan immediately.\n--capture runs a scripted tour and saves screenshots to DIR (development).\n--capture-cleanup captures the cleanup dialogs; it only removes folders from a synthetic fixture.\n--version prints the version."
                 );
                 return Ok(());
             }
@@ -68,11 +82,12 @@ fn main() -> eframe::Result {
             _ => path = Some(arg),
         }
     }
-    let tour = capture.map(|(dir, live)| {
-        let kind = match (path.is_none(), live) {
+    let tour = capture.map(|(dir, mode)| {
+        let kind = match (path.is_none(), mode) {
+            (_, Capture::Cleanup) => return capture::Tour::cleanup(dir),
             (true, _) => capture::TourKind::Welcome,
-            (false, true) => capture::TourKind::Live,
-            (false, false) => capture::TourKind::Full,
+            (false, Capture::Live) => capture::TourKind::Live,
+            (false, Capture::Tour) => capture::TourKind::Full,
         };
         capture::Tour::new(dir, kind)
     });

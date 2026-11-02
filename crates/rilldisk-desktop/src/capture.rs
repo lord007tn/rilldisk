@@ -5,7 +5,7 @@
 //! recording exercises the same code paths as a person using the app.
 use crate::app::{Chart, RillApp, Tab as View, pointer_for};
 use eframe::egui::{self, Pos2, pos2};
-use rilldisk_core::Category;
+use rilldisk_core::{Category, CleanupMode};
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
@@ -41,6 +41,14 @@ pub enum Step {
     /// Tick the largest candidates of a category in Clean up.
     Pick(Category, usize),
     Settings(bool),
+    /// Clean up: "Select all safe".
+    SelectSafe,
+    /// Clean up: open the confirmation dialog for the ticked folders.
+    Confirm(CleanupMode),
+    /// Clean up: confirm and wait for the result (temp-folder scans only).
+    RunCleanup,
+    /// Clean up: close any dialog.
+    Dismiss,
     Quit,
 }
 
@@ -69,6 +77,49 @@ pub struct Tour {
 }
 
 impl Tour {
+    /// Selection bar and dialogs of the Clean up view. Removes folders only when
+    /// the scanned folder is inside the temp folder (a synthetic fixture).
+    pub fn cleanup(dir: PathBuf) -> Self {
+        use Step::*;
+        let steps = vec![
+            Theme(false),
+            WaitData,
+            Tab(View::Cleanup),
+            Wait(20),
+            SelectSafe,
+            Wait(20),
+            Shot("cleanup-selection"),
+            Confirm(CleanupMode::Trash),
+            Wait(40),
+            Shot("cleanup-confirm"),
+            Dismiss,
+            Confirm(CleanupMode::Permanent),
+            Wait(40),
+            Shot("cleanup-confirm-permanent"),
+            Dismiss,
+            Theme(true),
+            Wait(20),
+            Shot("cleanup-selection-dark"),
+            Confirm(CleanupMode::Trash),
+            Wait(40),
+            Shot("cleanup-confirm-dark"),
+            Dismiss,
+            Confirm(CleanupMode::Permanent),
+            Wait(10),
+            RunCleanup,
+            Wait(30),
+            Shot("cleanup-result-dark"),
+            Theme(false),
+            Wait(20),
+            Shot("cleanup-result"),
+            Dismiss,
+            Wait(20),
+            Shot("cleanup-after"),
+            Quit,
+        ];
+        Self::with_steps(dir, steps)
+    }
+
     pub fn new(dir: PathBuf, kind: TourKind) -> Self {
         use Step::*;
         use Target::*;
@@ -176,6 +227,10 @@ impl Tour {
                 Quit,
             ]
         };
+        Self::with_steps(dir, steps)
+    }
+
+    fn with_steps(dir: PathBuf, steps: Vec<Step>) -> Self {
         std::fs::create_dir_all(dir.join("frames")).expect("create capture directory");
         Self {
             steps: steps.into(),
@@ -340,6 +395,21 @@ pub fn advance(app: &mut RillApp, ctx: &egui::Context) {
                 app.picked.extend(picks);
             }
         }
+        Step::SelectSafe => crate::cleanup_ui::tour::select_safe(app),
+        Step::Confirm(mode) => crate::cleanup_ui::tour::confirm(app, mode),
+        Step::RunCleanup => {
+            if crate::cleanup_ui::tour::busy(app) {
+                app.tour = Some(tour);
+                return;
+            }
+            crate::cleanup_ui::tour::run(app, ctx);
+            if crate::cleanup_ui::tour::busy(app) {
+                // Wait for the result on the following frames.
+                app.tour = Some(tour);
+                return;
+            }
+        }
+        Step::Dismiss => crate::cleanup_ui::tour::dismiss(app),
         Step::Quit => {
             if tour.pending.load(Ordering::SeqCst) == 0 {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
