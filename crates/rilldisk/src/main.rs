@@ -2,8 +2,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use rilldisk_core::{
-    ReclaimReport, Safety, ScanControl, ScanOptions, Snapshot, Summary, find_reclaimable, scan,
-    volumes,
+    Backend, ReclaimReport, Safety, ScanControl, ScanOptions, Snapshot, Summary, find_reclaimable,
+    scan, volumes,
 };
 use std::{
     ffi::OsString,
@@ -48,6 +48,39 @@ struct ScanArgs {
     /// filesystems such as /proc, /sys, /dev and /run are skipped either way.
     #[arg(long)]
     cross_filesystems: bool,
+    #[command(flatten)]
+    backend: BackendArgs,
+}
+
+#[derive(clap::Args)]
+struct BackendArgs {
+    /// How to enumerate. `auto` reads the NTFS Master File Table when scanning a
+    /// whole NTFS drive as administrator (Windows) and walks directories
+    /// otherwise; `mft` forces the MFT (administrator, NTFS; reads the whole
+    /// table even for a folder); `dir` always walks directories.
+    #[arg(long, value_enum, default_value = "auto")]
+    backend: BackendArg,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum BackendArg {
+    Auto,
+    Mft,
+    Dir,
+    /// RillDisk 0.1's directory walk, for comparisons.
+    #[value(hide = true)]
+    Legacy,
+}
+
+impl From<BackendArg> for Backend {
+    fn from(value: BackendArg) -> Self {
+        match value {
+            BackendArg::Auto => Backend::Auto,
+            BackendArg::Mft => Backend::Mft,
+            BackendArg::Dir => Backend::Directory,
+            BackendArg::Legacy => Backend::Legacy,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -110,6 +143,8 @@ enum Command {
         /// Linux/macOS: let scans enter other mounted filesystems below a root.
         #[arg(long)]
         cross_filesystems: bool,
+        #[command(flatten)]
+        backend: BackendArgs,
     },
     /// Check GitHub Releases for a newer RillDisk and install it after you
     /// confirm. Never runs on its own; RILLDISK_NO_UPDATE_CHECK=1 disables it.
@@ -253,8 +288,13 @@ async fn main() -> Result<ExitCode> {
             threads,
             max_entries,
             cross_filesystems,
+            backend,
         } => {
-            mcp::serve(root, options(threads, max_entries, cross_filesystems)).await?;
+            mcp::serve(
+                root,
+                options(threads, max_entries, cross_filesystems, backend.backend),
+            )
+            .await?;
             Ok(ExitCode::SUCCESS)
         }
         Command::Drives { format } => {
@@ -421,8 +461,9 @@ async fn run(
         threads,
         max_entries,
         cross_filesystems,
+        backend,
     } = args;
-    let options = options(threads, max_entries, cross_filesystems);
+    let options = options(threads, max_entries, cross_filesystems, backend.backend);
     // Only takes effect in an elevated terminal; never asks for elevation itself.
     let backup_privilege = rilldisk_core::enable_backup_privilege();
     let snapshot = tokio::task::spawn_blocking(move || scan(&path, options, control)).await;
@@ -746,11 +787,17 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-fn options(threads: Option<u8>, max_entries: usize, cross_filesystems: bool) -> ScanOptions {
+fn options(
+    threads: Option<u8>,
+    max_entries: usize,
+    cross_filesystems: bool,
+    backend: BackendArg,
+) -> ScanOptions {
     ScanOptions {
         threads: threads.map_or_else(|| ScanOptions::default().threads, usize::from),
         max_entries,
         cross_filesystems,
+        backend: backend.into(),
     }
 }
 

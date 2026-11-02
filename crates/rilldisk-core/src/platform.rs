@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Directory-metadata backends. Each one exports the same four items: `BACKEND`,
-//! `VolumeInfo` (per-scan facts), `volume_info` and `read_directory`, plus the public
-//! `volumes` listing. The parallel walk in `lib.rs` is shared by all of them.
+//! Directory-metadata backends. Each OS module exports the same items: `VolumeInfo`
+//! (per-scan facts, including which walk runs), `volume_info`, `Target` (how a
+//! worker opens one folder), `root_target`, `Listing` and `read_directory` for the
+//! parallel walk in `lib.rs`; `mft_source`, `scan_mft` and `BACKEND_MFT` for the
+//! NTFS Master File Table backend (unavailable outside Windows); and the public
+//! `volumes` listing.
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
 pub use windows::volumes;
 #[cfg(windows)]
 pub(crate) use windows::{
-    BACKEND, VolumeInfo, elevation, enable_backup_privilege, executable_on_path, is_elevated,
-    read_directory, volume_info,
+    BACKEND_MFT, Listing, Target, VolumeInfo, elevation, enable_backup_privilege,
+    executable_on_path, is_elevated, mft_source, read_directory, root_target, scan_mft,
+    scan_ntfs_image, volume_info,
 };
 
 #[cfg(unix)]
@@ -18,8 +22,9 @@ mod unix;
 pub use unix::volumes;
 #[cfg(unix)]
 pub(crate) use unix::{
-    BACKEND, VolumeInfo, elevation, enable_backup_privilege, executable_on_path, is_elevated,
-    read_directory, volume_info,
+    BACKEND_MFT, Listing, Target, VolumeInfo, elevation, enable_backup_privilege,
+    executable_on_path, is_elevated, mft_source, read_directory, root_target, scan_mft,
+    volume_info,
 };
 
 #[cfg(not(any(windows, unix)))]

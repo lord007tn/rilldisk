@@ -12,7 +12,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use rayon::prelude::*;
 use serde::{Serialize, Serializer, ser::SerializeStruct};
 
 pub mod cleanup;
@@ -306,15 +307,25 @@ impl ChildIndex {
                 cursor[parent] += 1;
             }
         }
+        // Sort each folder's children in parallel; the slices are disjoint.
+        let mut lists: Vec<&mut [u32]> = Vec::new();
+        let mut rest = &mut items[..];
         for id in 0..entries.len() {
-            let range = offsets[id] as usize..offsets[id + 1] as usize;
-            items[range].sort_unstable_by(|&a, &b| {
+            let len = (offsets[id + 1] - offsets[id]) as usize;
+            let (list, tail) = std::mem::take(&mut rest).split_at_mut(len);
+            rest = tail;
+            if len > 1 {
+                lists.push(list);
+            }
+        }
+        lists.par_iter_mut().for_each(|list| {
+            list.sort_unstable_by(|&a, &b| {
                 entries[b as usize]
                     .logical_bytes
                     .cmp(&entries[a as usize].logical_bytes)
                     .then(a.cmp(&b))
             });
-        }
+        });
         Self { offsets, items }
     }
 }
@@ -396,6 +407,30 @@ impl ScanControl {
     }
 }
 
+/// How a scan enumerates the tree. Every backend reports the same accounting
+/// (logical, unique and allocated bytes, hard links, links not followed,
+/// partial results); [`Summary::backend`] names the one that ran.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Backend {
+    /// Windows: read the NTFS Master File Table when the root is a whole NTFS
+    /// volume and the process may read the volume (administrator); otherwise, and
+    /// whenever that fails, the `Directory` walk. Linux and macOS: the `Legacy`
+    /// (`std::fs::read_dir`) walk, which measured as fast as `Directory` there.
+    #[default]
+    Auto,
+    /// Windows only: read the NTFS Master File Table directly. Needs administrator
+    /// rights and an NTFS volume, and reads the whole table even for a subfolder.
+    Mft,
+    /// Walk directories with the fastest listing calls this OS offers.
+    Directory,
+    /// The directory walk of RillDisk 0.1: full-path opens with
+    /// `GetFileInformationByHandleEx` on Windows (kept as a reference for
+    /// benchmarks and comparisons), `std::fs::read_dir` on Linux and macOS (the
+    /// default there).
+    Legacy,
+}
+
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
     pub threads: usize,
@@ -404,6 +439,7 @@ pub struct ScanOptions {
     /// Unix: also enter other mounted filesystems below the root (like `du` without
     /// `-x`). Virtual filesystems are skipped either way. Ignored on Windows.
     pub cross_filesystems: bool,
+    pub backend: Backend,
 }
 
 impl Default for ScanOptions {
@@ -413,6 +449,7 @@ impl Default for ScanOptions {
             threads: std::thread::available_parallelism().map_or(8, |n| n.get().clamp(8, 32)),
             max_entries: DEFAULT_MAX_ENTRIES,
             cross_filesystems: false,
+            backend: Backend::Auto,
         }
     }
 }
@@ -424,40 +461,28 @@ struct Walk {
     /// Tasks spawned but not yet sent back.
     pending: AtomicUsize,
     next_key: AtomicUsize,
-    in_flight: std::sync::Mutex<HashMap<usize, PathBuf>>,
 }
 
-fn read_task(walk: Arc<Walk>, key: usize, path: PathBuf) {
+fn read_task(walk: Arc<Walk>, key: usize, target: platform::Target) {
     let control = &walk.control;
-    let mut batch = if control.should_stop() {
-        Batch::default()
+    let mut listing = if control.should_stop() {
+        platform::Listing::default()
     } else {
-        platform::read_directory(&path, control, &walk.volume)
+        platform::read_directory(target, control, &walk.volume)
     };
-    for raw in &mut batch.entries {
+    for (index, child) in listing.children.drain(..) {
         // Once the entry budget has refused a record the result is partial anyway;
         // until then, children still get a chance (an empty folder costs nothing).
-        if raw.kind != EntryKind::Directory
-            || raw.skipped
-            || control.should_stop()
-            || control.limit_reached.load(Ordering::Relaxed)
-        {
-            continue;
+        if control.should_stop() || control.limit_reached.load(Ordering::Relaxed) {
+            break;
         }
-        let child = walk.next_key.fetch_add(1, Ordering::Relaxed);
-        let child_path = path.join(&*raw.name);
-        raw.key = Some(child);
+        let child_key = walk.next_key.fetch_add(1, Ordering::Relaxed);
+        listing.batch.entries[index].key = Some(child_key);
         walk.pending.fetch_add(1, Ordering::AcqRel);
-        if let Ok(mut map) = walk.in_flight.lock() {
-            map.insert(child, child_path.clone());
-        }
         let walk = walk.clone();
-        rayon::spawn(move || read_task(walk, child, child_path));
+        rayon::spawn(move || read_task(walk, child_key, child));
     }
-    let _ = walk.sender.send((key, batch));
-    if let Ok(mut map) = walk.in_flight.lock() {
-        map.remove(&key);
-    }
+    let _ = walk.sender.send((key, listing.batch));
     walk.pending.fetch_sub(1, Ordering::AcqRel);
 }
 
@@ -488,6 +513,131 @@ impl std::hash::Hasher for IdentityHash {
     fn write_u64(&mut self, value: u64) {
         self.0 = (self.0.rotate_left(29) ^ value).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     }
+    fn write_usize(&mut self, value: usize) {
+        self.write_u64(value as u64);
+    }
+}
+
+/// First entry seen for each file identity, to find hard-link duplicates.
+///
+/// NTFS file IDs are a 48-bit MFT record number plus a 16-bit sequence number,
+/// and record numbers are dense, so once a scan has seen many files a flat table
+/// indexed by record number is far smaller than a hash map (8 bytes per record
+/// instead of ~40 per file) and needs no hashing. Small scans keep the map: the
+/// table is sized by the highest record number on the volume, not by the scan.
+/// Identities that do not look like NTFS IDs (ReFS 128-bit IDs, Unix
+/// `(device, inode)` pairs, recorded only for files with several links) always
+/// use the map.
+#[derive(Default)]
+struct LinkTable {
+    /// Record number -> (first entry id + 1, sequence number); 0 is empty.
+    dense: Vec<(u32, u16)>,
+    dense_active: bool,
+    max_record: u64,
+    map: HashMap<(u64, u64), usize, IdentityHasher>,
+}
+
+/// Record numbers above this always go to the map.
+const DENSE_RECORDS: u64 = 1 << 27;
+const RECORD_MASK: u64 = 0xFFFF_FFFF_FFFF;
+
+impl LinkTable {
+    fn dense_key(identity: (u64, u64), id: usize) -> Option<(usize, u16)> {
+        let record = identity.1 & RECORD_MASK;
+        (identity.0 == 0 && record < DENSE_RECORDS && id < u32::MAX as usize)
+            .then_some((record as usize, (identity.1 >> 48) as u16))
+    }
+
+    /// The first entry with this identity, or None after recording `id` as first.
+    fn first(&mut self, identity: (u64, u64), id: usize) -> Option<usize> {
+        let dense = Self::dense_key(identity, id);
+        if let Some((record, sequence)) = dense {
+            self.max_record = self.max_record.max(record as u64);
+            if self.dense_active {
+                if self.dense.len() <= record {
+                    let len = (record + 1).next_power_of_two().min(DENSE_RECORDS as usize);
+                    self.dense.resize(len, (0, 0));
+                }
+                let slot = &mut self.dense[record];
+                if slot.0 == 0 {
+                    *slot = (id as u32 + 1, sequence);
+                    return None;
+                }
+                if slot.1 == sequence {
+                    return Some(slot.0 as usize - 1);
+                }
+                // The record was reused while the scan ran (a batch listed
+                // before the deletion can still arrive later): the slot keeps
+                // the first file, any other sequence number uses the map.
+            }
+        }
+        let first = match self.map.entry(identity) {
+            std::collections::hash_map::Entry::Occupied(first) => Some(*first.get()),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(id);
+                None
+            }
+        };
+        // Switch once the table would be smaller than the map (~40 B per entry).
+        if dense.is_some()
+            && !self.dense_active
+            && self.map.len() > (1 << 20).max(self.max_record as usize / 5)
+        {
+            self.densify();
+        }
+        first
+    }
+
+    fn densify(&mut self) {
+        let table = &mut self.dense;
+        *table = vec![(0, 0); self.max_record as usize + 1];
+        self.map
+            .retain(|&identity, &mut id| match Self::dense_key(identity, id) {
+                // One file per record moves to the table; a second sequence
+                // number of a reused record stays in the map.
+                Some((record, sequence)) if table[record].0 == 0 => {
+                    table[record] = (id as u32 + 1, sequence);
+                    false
+                }
+                Some(_) => true,
+                None => true,
+            });
+        self.map.shrink_to_fit();
+        self.dense_active = true;
+    }
+}
+
+#[cfg(test)]
+mod link_table_tests {
+    use super::LinkTable;
+
+    #[test]
+    fn finds_first_links_before_and_after_switching_to_the_dense_table() {
+        let mut table = LinkTable::default();
+        let ntfs = |record: u64, sequence: u64| (0, (sequence << 48) | record);
+        assert_eq!(table.first(ntfs(40, 1), 0), None);
+        assert_eq!(table.first(ntfs(40, 1), 5), Some(0));
+        // A reused record (new sequence number) is a different file.
+        assert_eq!(table.first(ntfs(40, 2), 6), None);
+        assert_eq!(table.first((7, 40), 7), None, "not an NTFS ID: the map");
+        for i in 0..(1_u64 << 20) + 2 {
+            table.first(ntfs(1000 + i, 1), 10 + i as usize);
+        }
+        assert!(table.dense_active);
+        assert!(table.map.len() <= 2);
+        // Both files of the reused record are still known, whichever went where.
+        assert_eq!(table.first(ntfs(40, 1), 99), Some(0));
+        assert_eq!(table.first(ntfs(40, 2), 99), Some(6));
+        assert_eq!(table.first(ntfs(1000, 1), 99), Some(10));
+        // Reuse after the switch (record 2000 holds sequence 1 in the table): the
+        // new file, a late name of the old one, then the new one again.
+        assert_eq!(table.first(ntfs(2000, 2), 200), None);
+        assert_eq!(table.first(ntfs(2000, 1), 201), Some(1010));
+        assert_eq!(table.first(ntfs(2000, 2), 202), Some(200));
+        assert_eq!(table.first((7, 40), 99), Some(7));
+        assert_eq!(table.first(ntfs(1 << 26, 1), 3), None, "grows on demand");
+        assert_eq!(table.first(ntfs(1 << 26, 1), 4), Some(3));
+    }
 }
 
 /// After cancellation, stop waiting on reads that have not returned by then.
@@ -509,15 +659,148 @@ pub(crate) struct RawEntry {
     key: Option<usize>,
 }
 
+/// One directory's listing, as a worker sends it to the collector.
 #[derive(Default)]
 pub(crate) struct Batch {
     entries: Vec<RawEntry>,
-    issues: Vec<ScanIssue>,
+    /// Errors for the directory itself (`None`) or for one named child.
+    errors: Vec<(Option<Box<OsStr>>, std::io::Error)>,
     /// The listing ran to its natural end.
     complete: bool,
 }
 
-pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Result<Snapshot> {
+/// Builds the entry list. Every retained entry passes through [`Collector::push`],
+/// parents before children, whatever the backend.
+pub(crate) struct Collector {
+    entries: Vec<Entry>,
+    summary: Summary,
+    links: LinkTable,
+    /// Running totals for [`ScanControl::live`], fed by every retained entry.
+    live: live::LiveTracker,
+}
+
+impl Collector {
+    /// Retain one entry below `parent`, resolving hard links, and return its id.
+    pub(crate) fn push(&mut self, parent: usize, raw: RawEntry) -> usize {
+        let id = self.entries.len();
+        let mut duplicate = false;
+        if raw.kind == EntryKind::File
+            && let Some(identity) = raw.identity
+            && let Some(first) = self.links.first(identity, id)
+        {
+            duplicate = true;
+            self.entries[first].multiple_links = true;
+        }
+        self.accept(
+            Entry {
+                id,
+                parent_id: Some(parent),
+                name: raw.name,
+                kind: raw.kind,
+                logical_bytes: raw.logical,
+                unique_logical_bytes: if duplicate { 0 } else { raw.logical },
+                allocated_bytes: if duplicate { Some(0) } else { raw.allocated },
+                modified_unix_ms: raw.modified,
+                file_count: u64::from(raw.kind == EntryKind::File),
+                hard_link_duplicate: duplicate,
+                multiple_links: duplicate,
+                fully_listed: raw.kind != EntryKind::Directory,
+            },
+            raw.skipped,
+        );
+        id
+    }
+
+    /// Append entries a backend built in parallel (ids already assigned in
+    /// order, parents first, hard links resolved).
+    #[cfg(windows)]
+    pub(crate) fn append(&mut self, entries: Vec<Entry>) {
+        self.entries.reserve(entries.len());
+        for entry in entries {
+            self.accept(entry, false);
+        }
+    }
+
+    /// The single place where every retained entry, of every backend, is
+    /// counted and stored, with its parent id, parents before children.
+    /// `skipped`: a folder that was deliberately not entered (a mount point).
+    fn accept(&mut self, entry: Entry, skipped: bool) {
+        debug_assert_eq!(entry.id, self.entries.len());
+        debug_assert!(entry.parent_id.is_some_and(|p| p < entry.id));
+        let summary = &mut self.summary;
+        match entry.kind {
+            EntryKind::Directory => {
+                summary.directories += 1;
+                // Never listed, so it stays `fully_listed: false`.
+                summary.skipped_mounts += u64::from(skipped);
+            }
+            EntryKind::File => {
+                summary.files += 1;
+                summary.hard_link_duplicates += u64::from(entry.hard_link_duplicate);
+            }
+            EntryKind::Link => summary.skipped_links += 1,
+            EntryKind::Other => {}
+        }
+        let parent = entry.parent_id.expect("only the root has no parent");
+        self.live.add(
+            entry.id,
+            parent,
+            entry.kind,
+            &entry.name,
+            entry.logical_bytes,
+            entry.allocated_bytes,
+        );
+        self.entries.push(entry);
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn mark_multiple_links(&mut self, id: usize) {
+        self.entries[id].multiple_links = true;
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn entries(&self) -> &[Entry] {
+        &self.entries
+    }
+
+    pub(crate) fn set_fully_listed(&mut self, id: usize, complete: bool) {
+        self.entries[id].fully_listed = complete;
+    }
+
+    pub(crate) fn issue(&mut self, issue: ScanIssue) {
+        add_issue(&mut self.summary, issue);
+    }
+
+    /// Report one folder's errors: for the folder itself (`None`) or a named
+    /// child. A listable folder without search permission refuses `lstat` on
+    /// every entry; that is one protected folder, so it is reported once, on the
+    /// folder.
+    fn errors(&mut self, id: usize, errors: &[(Option<Box<OsStr>>, std::io::Error)]) {
+        let mut denied = false;
+        for (name, error) in errors {
+            let mut path = entry_path(&self.entries, id);
+            match name {
+                Some(_) if IssueKind::of(error) == IssueKind::AccessDenied => {
+                    if !std::mem::replace(&mut denied, true) {
+                        let mut issue = ScanIssue::from_error(path, error);
+                        issue.message = format!("entries could not be examined: {error}");
+                        self.issue(issue);
+                    }
+                }
+                Some(name) => {
+                    path.push(&**name);
+                    self.issue(ScanIssue::from_error(path, error));
+                }
+                None => self.issue(ScanIssue::from_error(path, error)),
+            }
+        }
+    }
+}
+
+/// Check options and resolve the root: the canonical (verbatim `\\?\` on Windows)
+/// path to walk, so names ending in a dot or a space and reserved device names
+/// open exactly, and the familiar form to report.
+fn prepare(root: &Path, options: &ScanOptions) -> Result<(PathBuf, PathBuf)> {
     if !(1..=64).contains(&options.threads) {
         bail!("threads must be between 1 and 64");
     }
@@ -534,65 +817,59 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
     if !verbatim.is_dir() {
         bail!("scan root must be a directory");
     }
-    // Links are never traversed; each backend also keeps the scan on the root's
-    // filesystem (Windows: reparse points; Unix: device and mount checks).
-    let volume = platform::volume_info(&verbatim, &options)?;
-    let start = Instant::now();
-    let root_modified = std::fs::symlink_metadata(&verbatim)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(unix_ms);
-    let mut summary = Summary {
-        schema_version: 2,
-        root: root.clone(),
-        backend: platform::BACKEND,
-        started_unix_ms: SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
-        elapsed_ms: 0,
-        files: 0,
-        directories: 1,
-        skipped_links: 0,
-        skipped_mounts: 0,
-        hard_link_duplicates: 0,
-        logical_bytes: 0,
-        unique_logical_bytes: 0,
-        allocated_bytes: Some(0),
-        issue_count: 0,
-        access_denied_count: 0,
-        privacy_denied_count: 0,
-        issues: Vec::new(),
-        cancelled: false,
-        complete: true,
-        elevated: is_elevated(),
-    };
-    let mut entries = vec![Entry {
-        id: 0,
-        parent_id: None,
-        name: root.clone().into_os_string().into_boxed_os_str(),
-        kind: EntryKind::Directory,
-        logical_bytes: 0,
-        unique_logical_bytes: 0,
-        allocated_bytes: Some(0),
-        modified_unix_ms: root_modified,
-        file_count: 0,
-        hard_link_duplicate: false,
-        multiple_links: false,
-        fully_listed: false,
-    }];
-    if let Some(warning) = volume.warning() {
-        add_issue(
-            &mut summary,
-            ScanIssue::new(root.clone(), IssueKind::Other, warning),
-        );
+    Ok((verbatim, root))
+}
+
+impl Collector {
+    /// A collector holding only the root entry.
+    fn new(root: PathBuf, root_modified: Option<u64>) -> Result<Self> {
+        let summary = Summary {
+            schema_version: 2,
+            root: root.clone(),
+            backend: "",
+            started_unix_ms: SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis(),
+            elapsed_ms: 0,
+            files: 0,
+            directories: 1,
+            skipped_links: 0,
+            skipped_mounts: 0,
+            hard_link_duplicates: 0,
+            logical_bytes: 0,
+            unique_logical_bytes: 0,
+            allocated_bytes: Some(0),
+            issue_count: 0,
+            access_denied_count: 0,
+            privacy_denied_count: 0,
+            issues: Vec::new(),
+            cancelled: false,
+            complete: true,
+            elevated: is_elevated(),
+        };
+        let entry = Entry {
+            id: 0,
+            parent_id: None,
+            name: root.into_os_string().into_boxed_os_str(),
+            kind: EntryKind::Directory,
+            logical_bytes: 0,
+            unique_logical_bytes: 0,
+            allocated_bytes: Some(0),
+            modified_unix_ms: root_modified,
+            file_count: 0,
+            hard_link_duplicate: false,
+            multiple_links: false,
+            fully_listed: false,
+        };
+        Ok(Self {
+            entries: vec![entry],
+            summary,
+            links: LinkTable::default(),
+            live: live::LiveTracker::new(),
+        })
     }
-    let mut first_link: HashMap<(u64, u64), usize, IdentityHasher> = HashMap::default();
-    let mut live = live::LiveTracker::new();
-    if let Ok(mut slot) = control.live.lock() {
-        *slot = None;
-    }
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(options.threads)
-        .thread_name(|i| format!("rilldisk-scan-{i}"))
-        .build()?;
+}
+
+/// Zero the progress counters and refill the entry budget (the root is entry 1).
+fn reset_progress(control: &ScanControl, options: &ScanOptions) {
     control.directories.store(1, Ordering::Relaxed);
     control.files.store(0, Ordering::Relaxed);
     control.bytes.store(0, Ordering::Relaxed);
@@ -600,31 +877,141 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
         .remaining_entries
         .store(options.max_entries - 1, Ordering::Relaxed);
     control.limit_reached.store(false, Ordering::Relaxed);
-    // Workers queue subfolders the moment they read them, so the pool never waits on
-    // this thread or on a slow sibling. This thread only assigns IDs; a batch whose
-    // parent has no ID yet waits, so parents always precede children. All workers
-    // reserve from one shared budget before retaining an entry.
+}
+
+fn thread_pool(options: &ScanOptions) -> Result<rayon::ThreadPool> {
+    Ok(rayon::ThreadPoolBuilder::new()
+        .num_threads(options.threads)
+        .thread_name(|i| format!("rilldisk-scan-{i}"))
+        .build()?)
+}
+
+pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Result<Snapshot> {
+    let (verbatim, root) = prepare(root, &options)?;
+    let start = Instant::now();
+    let root_modified = std::fs::symlink_metadata(&verbatim)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(unix_ms);
+    let fresh = || Collector::new(root.clone(), root_modified);
+    let reset = || reset_progress(&control, &options);
+    reset();
+    if let Ok(mut slot) = control.live.lock() {
+        *slot = None;
+    }
+    let pool = thread_pool(&options)?;
+    let mut collector = fresh()?;
+    let mut walk_backend = Backend::Directory;
+    match options.backend {
+        Backend::Mft => {
+            let source = platform::mft_source(&verbatim, true)
+                .context("the MFT backend needs an NTFS volume and administrator rights")?;
+            collector.summary.backend = platform::BACKEND_MFT;
+            pool.install(|| platform::scan_mft(source, &verbatim, &control, &mut collector))
+                .context("cannot read the NTFS Master File Table")?;
+            return Ok(pool.install(|| finish(collector, &options, &control, start)));
+        }
+        Backend::Auto => {
+            if let Ok(source) = platform::mft_source(&verbatim, false) {
+                collector.summary.backend = platform::BACKEND_MFT;
+                let result = pool
+                    .install(|| platform::scan_mft(source, &verbatim, &control, &mut collector));
+                // Anything that fails before entries are produced falls back to the walk.
+                match result {
+                    Ok(()) => {
+                        return Ok(pool.install(|| finish(collector, &options, &control, start)));
+                    }
+                    Err(_) if !control.is_cancelled() => {
+                        collector = fresh()?;
+                        reset();
+                    }
+                    Err(_) => {
+                        collector.summary.backend = platform::BACKEND_MFT;
+                        return Ok(finish(collector, &options, &control, start));
+                    }
+                }
+            }
+            // Linux and macOS: the descriptor-relative walk measured no faster
+            // than `std::fs::read_dir` (docs/PERFORMANCE.md), so it stays opt-in.
+            if cfg!(unix) {
+                walk_backend = Backend::Legacy;
+            }
+        }
+        Backend::Directory => {}
+        Backend::Legacy => walk_backend = Backend::Legacy,
+    }
+    // Links are never traversed; each backend also keeps the scan on the root's
+    // filesystem (Windows: reparse points; Unix: device and mount checks).
+    let volume = platform::volume_info(&verbatim, &options, walk_backend)?;
+    collector.summary.backend = volume.backend();
+    if let Some(warning) = volume.warning() {
+        let path = collector.summary.root.clone();
+        collector.issue(ScanIssue::new(path, IssueKind::Other, warning));
+    }
+    walk(&pool, verbatim, volume, &control, &mut collector);
+    Ok(pool.install(|| finish(collector, &options, &control, start)))
+}
+
+/// Scan an NTFS volume image (a file holding a raw NTFS filesystem) with the
+/// MFT backend, as if it were mounted. Read-only; for tests and benchmarks of the
+/// MFT parser without administrator rights.
+#[doc(hidden)]
+#[cfg(windows)]
+pub fn scan_ntfs_image(
+    image: &Path,
+    options: ScanOptions,
+    control: Arc<ScanControl>,
+) -> Result<Snapshot> {
+    let start = Instant::now();
+    let file =
+        std::fs::File::open(image).with_context(|| format!("cannot open {}", image.display()))?;
+    reset_progress(&control, &options);
+    let mut collector = Collector::new(image.to_path_buf(), None)?;
+    collector.summary.backend = platform::BACKEND_MFT;
+    let pool = thread_pool(&options)?;
+    pool.install(|| platform::scan_ntfs_image(file, &control, &mut collector))
+        .context("cannot read the image's Master File Table")?;
+    Ok(pool.install(|| finish(collector, &options, &control, start)))
+}
+
+/// Parallel directory walk. Workers queue subfolders the moment they read them,
+/// so the pool never waits on this thread or on a slow sibling. This thread only
+/// assigns IDs; a batch whose parent has no ID yet waits, so parents always
+/// precede children. All workers reserve from one shared budget before
+/// retaining an entry.
+fn walk(
+    pool: &rayon::ThreadPool,
+    verbatim: PathBuf,
+    volume: platform::VolumeInfo,
+    control: &Arc<ScanControl>,
+    collector: &mut Collector,
+) {
     let (sender, results) = mpsc::channel();
     let walk = Arc::new(Walk {
         control: control.clone(),
-        volume,
         sender,
         pending: AtomicUsize::new(1),
         next_key: AtomicUsize::new(1),
-        in_flight: std::sync::Mutex::new(HashMap::from([(0, verbatim.clone())])),
+        volume,
     });
+    let target = platform::root_target(&verbatim, &walk.volume);
     {
         let walk = walk.clone();
-        pool.spawn(move || read_task(walk, 0, verbatim));
+        pool.spawn(move || read_task(walk, 0, target));
     }
+    // Task key -> entry id (usize::MAX until the parent's batch is collected).
     let mut ids: Vec<usize> = vec![0];
+    // Keys queued for reading whose batch has not been collected yet.
+    let mut outstanding = std::collections::HashSet::with_hasher(IdentityHasher);
+    outstanding.insert(0_usize);
     let mut waiting: HashMap<usize, Batch> = HashMap::new();
     let mut ready: Vec<(usize, Batch)> = Vec::new();
     let mut last_result = Instant::now();
     let mut last_budget = control.remaining_entries.load(Ordering::Relaxed);
     let mut cancel_seen: Option<Instant> = None;
-    let mut stop = false;
+    let mut stalled = false;
     loop {
+        let mut stop = false;
         if walk.pending.load(Ordering::Acquire) == 0 {
             ready.extend(results.try_iter());
             if ready.is_empty() {
@@ -636,6 +1023,7 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
             match results.recv_timeout(Duration::from_millis(5)) {
                 Ok(result) => {
                     ready.push(result);
+                    ready.extend(results.try_iter());
                     last_result = Instant::now();
                 }
                 Err(_) => {
@@ -653,31 +1041,7 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
                         // Everything still outstanding stopped responding (e.g. a hung
                         // network or cloud provider). Report it and keep what was found.
                         ready.extend(results.try_iter());
-                        let arrived: std::collections::HashSet<usize> =
-                            ready.iter().map(|(key, _)| *key).collect();
-                        let stalled: Vec<PathBuf> = walk
-                            .in_flight
-                            .lock()
-                            .map(|map| {
-                                map.iter()
-                                    .filter(|(key, _)| !arrived.contains(key))
-                                    .map(|(_, path)| path.clone())
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        for path in stalled {
-                            add_issue(
-                                &mut summary,
-                                ScanIssue::new(
-                                    path,
-                                    IssueKind::Stalled,
-                                    format!(
-                                        "not read: no progress for {} s (unresponsive folder or provider)",
-                                        STALL_TIMEOUT.as_secs()
-                                    ),
-                                ),
-                            );
-                        }
+                        stalled = true;
                         stop = true;
                     }
                     if !stop {
@@ -691,80 +1055,67 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
                 waiting.insert(key, batch);
                 continue;
             };
-            for issue in batch.issues {
-                add_issue(&mut summary, issue);
-            }
-            entries[parent].fully_listed = batch.complete;
+            outstanding.remove(&key);
+            collector.errors(parent, &batch.errors);
+            collector.set_fully_listed(parent, batch.complete);
             for raw in batch.entries {
-                let id = entries.len();
-                let mut duplicate = false;
-                let mut multiple_links = false;
-                if raw.kind == EntryKind::File
-                    && let Some(identity) = raw.identity
-                {
-                    match first_link.entry(identity) {
-                        std::collections::hash_map::Entry::Occupied(first) => {
-                            duplicate = true;
-                            multiple_links = true;
-                            entries[*first.get()].multiple_links = true;
-                        }
-                        std::collections::hash_map::Entry::Vacant(slot) => {
-                            slot.insert(id);
-                        }
+                let child = raw.key;
+                let id = collector.push(parent, raw);
+                if let Some(child) = child {
+                    if ids.len() <= child {
+                        ids.resize(child + 1, usize::MAX);
+                    }
+                    ids[child] = id;
+                    outstanding.insert(child);
+                    if let Some(early) = waiting.remove(&child) {
+                        ready.push((child, early));
                     }
                 }
-                let unique = if duplicate { 0 } else { raw.logical };
-                let allocated = if duplicate { Some(0) } else { raw.allocated };
-                match raw.kind {
-                    EntryKind::Directory => {
-                        summary.directories += 1;
-                        // Never listed, so it stays `fully_listed: false`.
-                        summary.skipped_mounts += u64::from(raw.skipped);
-                        if let Some(child) = raw.key {
-                            if ids.len() <= child {
-                                ids.resize(child + 1, usize::MAX);
-                            }
-                            ids[child] = id;
-                            if let Some(early) = waiting.remove(&child) {
-                                ready.push((child, early));
-                            }
-                        }
-                    }
-                    EntryKind::File => {
-                        summary.files += 1;
-                        if duplicate {
-                            summary.hard_link_duplicates += 1;
-                        }
-                    }
-                    EntryKind::Link => summary.skipped_links += 1,
-                    EntryKind::Other => {}
-                }
-                live.add(id, parent, raw.kind, &raw.name, raw.logical, allocated);
-                entries.push(Entry {
-                    id,
-                    parent_id: Some(parent),
-                    name: raw.name,
-                    kind: raw.kind,
-                    logical_bytes: raw.logical,
-                    unique_logical_bytes: unique,
-                    allocated_bytes: allocated,
-                    modified_unix_ms: raw.modified,
-                    file_count: u64::from(raw.kind == EntryKind::File),
-                    hard_link_duplicate: duplicate,
-                    multiple_links,
-                    fully_listed: raw.kind != EntryKind::Directory,
-                });
             }
         }
-        live.publish(&control.live, false);
+        collector.live.publish(&control.live, false);
         if stop {
             break;
         }
     }
-    live.publish(&control.live, true);
+    if stalled {
+        let mut keys: Vec<usize> = outstanding.into_iter().collect();
+        keys.sort_unstable();
+        for key in keys {
+            if let Some(&id) = ids.get(key).filter(|&&id| id != usize::MAX) {
+                let path = entry_path(&collector.entries, id);
+                collector.issue(ScanIssue::new(
+                    path,
+                    IssueKind::Stalled,
+                    format!(
+                        "not read: no progress for {} s (unresponsive folder or provider)",
+                        STALL_TIMEOUT.as_secs()
+                    ),
+                ));
+            }
+        }
+    }
     // Leftover workers (hung reads, cancelled tails) exit at their next check.
     control.abandoned.store(true, Ordering::Relaxed);
-    drop(first_link);
+}
+
+/// Totals, rollups and the child index, shared by every backend.
+fn finish(
+    collector: Collector,
+    options: &ScanOptions,
+    control: &ScanControl,
+    start: Instant,
+) -> Snapshot {
+    let Collector {
+        mut entries,
+        mut summary,
+        links,
+        mut live,
+    } = collector;
+    live.publish(&control.live, true);
+    let mut phase = Instant::now();
+    control.abandoned.store(true, Ordering::Relaxed);
+    drop(links);
     // Report the memory bound once rather than once per truncated directory.
     if control.limit_reached.load(Ordering::Relaxed) {
         let path = summary.root.clone();
@@ -787,20 +1138,21 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
         let unique = entries[id].unique_logical_bytes;
         let allocated = entries[id].allocated_bytes;
         let modified = entries[id].modified_unix_ms;
-        entries[parent].modified_unix_ms = entries[parent].modified_unix_ms.max(modified);
-        entries[parent].file_count += entries[id].file_count;
-        entries[parent].logical_bytes = entries[parent].logical_bytes.saturating_add(logical);
-        entries[parent].unique_logical_bytes =
-            entries[parent].unique_logical_bytes.saturating_add(unique);
-        entries[parent].allocated_bytes = entries[parent]
+        let files = entries[id].file_count;
+        let target = &mut entries[parent];
+        target.modified_unix_ms = target.modified_unix_ms.max(modified);
+        target.file_count += files;
+        target.logical_bytes = target.logical_bytes.saturating_add(logical);
+        target.unique_logical_bytes = target.unique_logical_bytes.saturating_add(unique);
+        target.allocated_bytes = target
             .allocated_bytes
             .zip(allocated)
             .map(|(a, b)| a.saturating_add(b));
     }
+    trace("rollup", &mut phase);
     summary.logical_bytes = entries[0].logical_bytes;
     summary.unique_logical_bytes = entries[0].unique_logical_bytes;
     summary.allocated_bytes = entries[0].allocated_bytes;
-    summary.elapsed_ms = start.elapsed().as_millis();
     summary.cancelled = control.is_cancelled();
     summary.complete = !summary.cancelled && summary.issue_count == 0;
     control.files.store(summary.files, Ordering::Relaxed);
@@ -808,11 +1160,45 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
         .directories
         .store(summary.directories, Ordering::Relaxed);
     let children = ChildIndex::build(&entries);
-    Ok(Snapshot {
+    trace("child index", &mut phase);
+    summary.elapsed_ms = start.elapsed().as_millis();
+    Snapshot {
         summary,
         entries,
         children,
-    })
+    }
+}
+
+/// Profiling aid: with `RILLDISK_TRACE_PHASES=1`, print how long each scan phase
+/// took to stderr (local only; nothing is recorded or sent anywhere).
+pub(crate) fn tracing() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("RILLDISK_TRACE_PHASES").is_some())
+}
+
+pub(crate) fn trace(phase: &str, since: &mut Instant) {
+    if tracing() {
+        eprintln!(
+            "phase {phase}: {:.1} ms",
+            since.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    *since = Instant::now();
+}
+
+/// Full path of `id`, rebuilt from the parent chain.
+fn entry_path(entries: &[Entry], id: usize) -> PathBuf {
+    let mut chain = Vec::new();
+    let mut cursor = Some(id);
+    while let Some(current) = cursor {
+        chain.push(&*entries[current].name);
+        cursor = entries[current].parent_id;
+    }
+    let mut path = PathBuf::from(chain.pop().expect("an entry has at least itself"));
+    for name in chain.into_iter().rev() {
+        path.push(name);
+    }
+    path
 }
 
 /// Drop the `\\?\` prefix from canonical drive and UNC paths so reports show
@@ -998,17 +1384,7 @@ impl Snapshot {
 
     /// Full path, rebuilt from the parent chain.
     pub fn path(&self, id: usize) -> PathBuf {
-        let mut chain = Vec::new();
-        let mut cursor = Some(id);
-        while let Some(current) = cursor {
-            chain.push(&*self.entries[current].name);
-            cursor = self.entries[current].parent_id;
-        }
-        let mut path = PathBuf::from(chain.pop().expect("an entry has at least itself"));
-        for name in chain.into_iter().rev() {
-            path.push(name);
-        }
-        path
+        entry_path(&self.entries, id)
     }
 
     pub fn view(&self, id: usize) -> EntryView<'_> {

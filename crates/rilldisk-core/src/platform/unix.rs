@@ -10,16 +10,25 @@
 //! in `skipped_mounts`. Virtual filesystems (`/proc`, `/sys`, `/dev`, `/run`, tmpfs,
 //! overlay and snap images on Linux; `/dev`, `/Volumes` and `/System/Volumes` on
 //! macOS) are skipped even when crossing filesystems is allowed.
-use crate::{Batch, EntryKind, IssueKind, RawEntry, ScanControl, ScanIssue, ScanOptions};
+use crate::{Backend, Batch, EntryKind, RawEntry, ScanControl, ScanOptions};
 use std::{
     collections::{HashMap, HashSet},
-    ffi::OsStr,
+    ffi::{CStr, CString, OsStr},
     fs, io,
-    os::unix::{ffi::OsStrExt, fs::MetadataExt},
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        unix::{ffi::OsStrExt, fs::MetadataExt},
+    },
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
-pub(crate) const BACKEND: &str = "unix-readdir";
+const BACKEND_FD: &str = if cfg!(any(target_os = "linux", target_os = "android")) {
+    "linux-getdents"
+} else {
+    "unix-openat"
+};
+const BACKEND_LEGACY: &str = "unix-readdir";
 
 /// Per-scan filesystem facts shared by every directory read.
 #[derive(Debug, Clone, Default)]
@@ -37,9 +46,15 @@ pub(crate) struct VolumeInfo {
     /// Set when the mount table could not be read: bind mounts of the same
     /// filesystem cannot be told apart and may be counted twice.
     warning: Option<String>,
+    /// Use RillDisk 0.1's `std::fs::read_dir` walk.
+    legacy: bool,
 }
 
-pub(crate) fn volume_info(root: &Path, options: &ScanOptions) -> io::Result<VolumeInfo> {
+pub(crate) fn volume_info(
+    root: &Path,
+    options: &ScanOptions,
+    backend: Backend,
+) -> io::Result<VolumeInfo> {
     let device = fs::metadata(root)?.dev();
     #[allow(unused_mut)]
     let mut devices = vec![device];
@@ -53,6 +68,7 @@ pub(crate) fn volume_info(root: &Path, options: &ScanOptions) -> io::Result<Volu
     let mut info = VolumeInfo {
         devices,
         cross_filesystems: options.cross_filesystems,
+        legacy: backend == Backend::Legacy,
         ..Default::default()
     };
     let mounts = match read_mount_table() {
@@ -80,6 +96,14 @@ impl VolumeInfo {
     /// A problem that makes the result less certain, reported as a scan issue.
     pub(crate) fn warning(&self) -> Option<&str> {
         self.warning.as_deref()
+    }
+
+    pub(crate) fn backend(&self) -> &'static str {
+        if self.legacy {
+            BACKEND_LEGACY
+        } else {
+            BACKEND_FD
+        }
     }
 
     /// Whether the directory `parent/name` (on `device`) must not be entered.
@@ -149,35 +173,67 @@ fn is_virtual(fstype: &str) -> bool {
     )
 }
 
-pub(crate) fn read_directory(path: &Path, control: &ScanControl, volume: &VolumeInfo) -> Batch {
-    let mut batch = Batch::default();
-    match enumerate(path, control, volume, &mut batch) {
-        Ok(complete) => batch.complete = complete,
-        Err(error) => batch.issues.push(ScanIssue::from_error(path, &error)),
-    }
-    batch
+/// How a worker opens one folder: by full path (legacy `std::fs::read_dir`), or
+/// by name relative to its parent's open descriptor (`None` for the scan root).
+/// The path is kept for the mount checks.
+pub(crate) enum Target {
+    Path(PathBuf),
+    Relative {
+        parent: Option<Arc<DirFd>>,
+        name: CString,
+        path: PathBuf,
+    },
 }
 
+pub(crate) fn root_target(root: &Path, volume: &VolumeInfo) -> Target {
+    if volume.legacy {
+        return Target::Path(root.to_path_buf());
+    }
+    match CString::new(root.as_os_str().as_bytes()) {
+        Ok(name) => Target::Relative {
+            parent: None,
+            name,
+            path: root.to_path_buf(),
+        },
+        Err(_) => Target::Path(root.to_path_buf()),
+    }
+}
+
+/// One folder's entries, plus the subfolders to read next (index into
+/// `batch.entries` and how to open it).
+#[derive(Default)]
+pub(crate) struct Listing {
+    pub batch: Batch,
+    pub children: Vec<(usize, Target)>,
+}
+
+pub(crate) fn read_directory(
+    target: Target,
+    control: &ScanControl,
+    volume: &VolumeInfo,
+) -> Listing {
+    let mut listing = Listing::default();
+    let result = match target {
+        Target::Path(path) => enumerate(&path, control, volume, &mut listing),
+        Target::Relative { parent, name, path } => {
+            fd_enumerate(parent, &name, &path, control, volume, &mut listing)
+        }
+    };
+    match result {
+        Ok(complete) => listing.batch.complete = complete,
+        Err(error) => listing.batch.errors.push((None, error)),
+    }
+    listing
+}
+
+/// RillDisk 0.1's walk: `std::fs::read_dir` on the full path, then `lstat`-like
+/// metadata per file and folder.
 fn enumerate(
     path: &Path,
     control: &ScanControl,
     volume: &VolumeInfo,
-    batch: &mut Batch,
+    listing: &mut Listing,
 ) -> io::Result<bool> {
-    // A listable folder without search permission refuses `lstat` on every entry.
-    // That is one protected folder, so it is reported once, on the folder.
-    let mut denied = false;
-    let mut entry_error = |batch: &mut Batch, name: &OsStr, error: io::Error| {
-        if IssueKind::of(&error) != IssueKind::AccessDenied {
-            batch
-                .issues
-                .push(ScanIssue::from_error(path.join(name), &error));
-        } else if !std::mem::replace(&mut denied, true) {
-            let mut issue = ScanIssue::from_error(path, &error);
-            issue.message = format!("entries could not be examined: {error}");
-            batch.issues.push(issue);
-        }
-    };
     for item in fs::read_dir(path)? {
         if control.should_stop() {
             return Ok(false);
@@ -189,20 +245,14 @@ fn enumerate(
         let listed = match item.file_type() {
             Ok(value) => value,
             Err(error) => {
-                entry_error(batch, &name, error);
+                listing
+                    .batch
+                    .errors
+                    .push((Some(name.into_boxed_os_str()), error));
                 continue;
             }
         };
-        let mut entry = RawEntry {
-            name: name.into_boxed_os_str(),
-            kind: EntryKind::Other,
-            logical: 0,
-            allocated: Some(0),
-            modified: None,
-            identity: None,
-            skipped: false,
-            key: None,
-        };
+        let mut entry = blank(name.into_boxed_os_str());
         if listed.is_symlink() {
             entry.kind = EntryKind::Link;
         } else if listed.is_file() || listed.is_dir() {
@@ -210,34 +260,415 @@ fn enumerate(
             let metadata = match item.metadata() {
                 Ok(value) => value,
                 Err(error) => {
-                    entry_error(batch, &entry.name, error);
+                    listing.batch.errors.push((Some(entry.name), error));
                     continue;
                 }
             };
-            // The entry may have been replaced since it was listed; trust the metadata.
-            let actual = metadata.file_type();
-            entry.modified = unix_ms(metadata.mtime(), metadata.mtime_nsec());
-            if actual.is_file() {
-                entry.kind = EntryKind::File;
-                entry.logical = metadata.len();
-                // st_blocks is in 512-byte units on Linux and macOS.
-                entry.allocated = Some(metadata.blocks().saturating_mul(512));
-                // A file with one link cannot be a duplicate; skipping it keeps the
-                // hard-link table small.
-                entry.identity = (metadata.nlink() > 1).then(|| (metadata.dev(), metadata.ino()));
-            } else if actual.is_dir() {
-                entry.kind = EntryKind::Directory;
-                entry.skipped = volume.skip(path, &entry.name, metadata.dev());
-            } else if actual.is_symlink() {
-                entry.kind = EntryKind::Link;
-            }
+            let facts = Facts {
+                mode: metadata.mode(),
+                size: metadata.len(),
+                blocks: metadata.blocks(),
+                nlink: metadata.nlink(),
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+                mtime: metadata.mtime(),
+                mtime_nsec: metadata.mtime_nsec(),
+            };
+            apply(&mut entry, &facts, path, volume);
         }
         if !control.record(entry.kind, entry.logical) {
             return Ok(false);
         }
-        batch.entries.push(entry);
+        let enter = entry.kind == EntryKind::Directory && !entry.skipped;
+        let child = enter.then(|| path.join(&*entry.name));
+        listing.batch.entries.push(entry);
+        if let Some(child) = child {
+            let index = listing.batch.entries.len() - 1;
+            listing.children.push((index, Target::Path(child)));
+        }
     }
     Ok(true)
+}
+
+fn blank(name: Box<OsStr>) -> RawEntry {
+    RawEntry {
+        name,
+        kind: EntryKind::Other,
+        logical: 0,
+        allocated: Some(0),
+        modified: None,
+        identity: None,
+        skipped: false,
+        key: None,
+    }
+}
+
+/// The `stat` fields the accounting uses.
+struct Facts {
+    mode: u32,
+    size: u64,
+    blocks: u64,
+    nlink: u64,
+    dev: u64,
+    ino: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+}
+
+/// Fill an entry from its metadata. The entry may have been replaced since it
+/// was listed; the metadata wins.
+// `mode_t` is u32 on Linux but u16 on macOS, so the casts are needed there.
+#[allow(clippy::unnecessary_cast)]
+fn apply(entry: &mut RawEntry, facts: &Facts, parent: &Path, volume: &VolumeInfo) {
+    let format = facts.mode & libc::S_IFMT as u32;
+    entry.modified = unix_ms(facts.mtime, facts.mtime_nsec);
+    if format == libc::S_IFREG as u32 {
+        entry.kind = EntryKind::File;
+        entry.logical = facts.size;
+        // st_blocks is in 512-byte units on Linux and macOS.
+        entry.allocated = Some(facts.blocks.saturating_mul(512));
+        // A file with one link cannot be a duplicate; skipping it keeps the
+        // hard-link table small.
+        entry.identity = (facts.nlink > 1).then_some((facts.dev, facts.ino));
+    } else if format == libc::S_IFDIR as u32 {
+        entry.kind = EntryKind::Directory;
+        entry.skipped = volume.skip(parent, &entry.name, facts.dev);
+    } else if format == libc::S_IFLNK as u32 {
+        entry.kind = EntryKind::Link;
+    } else {
+        entry.kind = EntryKind::Other;
+    }
+}
+
+/// `lstat` of `name` inside the open directory `dir`.
+fn stat_at(dir: &DirFd, name: &CStr) -> io::Result<Facts> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: name is terminated and stat is writable; the descriptor is open.
+    if unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fstatat succeeded and initialized the structure.
+    let stat = unsafe { stat.assume_init() };
+    #[allow(clippy::unnecessary_cast)]
+    Ok(Facts {
+        mode: stat.st_mode as u32,
+        size: stat.st_size.max(0) as u64,
+        blocks: stat.st_blocks.max(0) as u64,
+        nlink: stat.st_nlink as u64,
+        dev: stat.st_dev as u64,
+        ino: stat.st_ino as u64,
+        mtime: stat.st_mtime as i64,
+        mtime_nsec: stat.st_mtime_nsec as i64,
+    })
+}
+
+/// Directory descriptors open right now: the folders being listed plus the
+/// parents that queued children keep open for their relative opens.
+static OPEN_DIRS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// An open directory, counted in `OPEN_DIRS`.
+pub(crate) struct DirFd(OwnedFd);
+
+impl Drop for DirFd {
+    fn drop(&mut self) {
+        OPEN_DIRS.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl AsRawFd for DirFd {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.0.as_raw_fd()
+    }
+}
+
+/// How many directory descriptors queued children may keep open: half the
+/// soft descriptor limit (256 by default on macOS). Past it, children open by
+/// full path instead, so a deep tree cannot exhaust descriptors.
+fn descriptor_budget() -> usize {
+    static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        // SAFETY: zeroed rlimit is valid; getrlimit fills it.
+        let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+        // SAFETY: limit is writable.
+        let soft = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
+            limit.rlim_cur as u64
+        } else {
+            256
+        };
+        (soft.min(1 << 20) as usize / 2).max(32)
+    })
+}
+
+/// Open a folder for listing relative to its parent, never following a symlink.
+fn open_at(parent: Option<&DirFd>, name: &CStr) -> io::Result<DirFd> {
+    // SAFETY: name is terminated; the parent descriptor (if any) is open.
+    let fd = unsafe {
+        libc::openat(
+            parent.map_or(libc::AT_FDCWD, |p| p.as_raw_fd()),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            return Err(io::Error::other(
+                "directory became a symbolic link; skipped",
+            ));
+        }
+        return Err(error);
+    }
+    OPEN_DIRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: openat returned a new descriptor that nothing else owns.
+    Ok(DirFd(unsafe { OwnedFd::from_raw_fd(fd) }))
+}
+
+/// Names of one open directory, with their listed type (`DT_*`).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn for_each_name(
+    dir: &DirFd,
+    control: &ScanControl,
+    mut visit: impl FnMut(&CStr, u8) -> bool,
+) -> io::Result<bool> {
+    thread_local! {
+        /// One `getdents64` buffer per worker, reused for every folder.
+        static BUFFER: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    BUFFER.with(|cell| {
+        let mut buffer = cell.borrow_mut();
+        if buffer.is_empty() {
+            *buffer = vec![0; LIST_BUFFER / 8];
+        }
+        while !control.should_stop() {
+            // SAFETY: the buffer is writable for its length; the descriptor is an
+            // open directory.
+            let read = unsafe {
+                libc::syscall(
+                    libc::SYS_getdents64,
+                    dir.as_raw_fd(),
+                    buffer.as_mut_ptr(),
+                    buffer.len() * 8,
+                )
+            };
+            if read < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if read == 0 {
+                return Ok(true);
+            }
+            // SAFETY: the kernel initialized `read` bytes.
+            let bytes =
+                unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), read as usize) };
+            // struct linux_dirent64 { u64 d_ino; i64 d_off; u16 d_reclen; u8 d_type; char d_name[]; }
+            let mut at = 0;
+            while at + 19 < bytes.len() {
+                let length = usize::from(u16::from_ne_bytes([bytes[at + 16], bytes[at + 17]]));
+                if length < 20 || at + length > bytes.len() {
+                    return Err(io::Error::other("invalid directory record length"));
+                }
+                let name = CStr::from_bytes_until_nul(&bytes[at + 19..at + length])
+                    .map_err(|_| io::Error::other("unterminated directory record"))?;
+                let bytes_of = name.to_bytes();
+                if bytes_of != b"." && bytes_of != b".." && !visit(name, bytes[at + 18]) {
+                    return Ok(false);
+                }
+                at += length;
+            }
+        }
+        Ok(false)
+    })
+}
+
+/// Names of one open directory, with their listed type (`DT_*`).
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn for_each_name(
+    dir: &DirFd,
+    control: &ScanControl,
+    mut visit: impl FnMut(&CStr, u8) -> bool,
+) -> io::Result<bool> {
+    // fdopendir takes ownership of the descriptor it is given, so give it a copy.
+    // SAFETY: dup of an open descriptor.
+    let copy = unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if copy < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: copy is an open directory descriptor owned by nobody else.
+    let stream = unsafe { libc::fdopendir(copy) };
+    if stream.is_null() {
+        let error = io::Error::last_os_error();
+        // SAFETY: fdopendir failed, so copy is still ours to close.
+        unsafe { libc::close(copy) };
+        return Err(error);
+    }
+    struct Stream(*mut libc::DIR);
+    impl Drop for Stream {
+        fn drop(&mut self) {
+            // SAFETY: the stream came from fdopendir and is closed once.
+            unsafe { libc::closedir(self.0) };
+        }
+    }
+    let stream = Stream(stream);
+    loop {
+        if control.should_stop() {
+            return Ok(false);
+        }
+        // readdir signals errors only through errno.
+        // SAFETY: errno is thread-local.
+        #[cfg(target_vendor = "apple")]
+        unsafe {
+            *libc::__error() = 0
+        };
+        // SAFETY: the stream is open; the entry is valid until the next readdir.
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            let error = io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(0) | None => Ok(true),
+                _ => Err(error),
+            };
+        }
+        // SAFETY: readdir returned a valid entry with a terminated name.
+        let (name, kind) = unsafe { (CStr::from_ptr((*entry).d_name.as_ptr()), (*entry).d_type) };
+        let bytes = name.to_bytes();
+        if bytes != b"." && bytes != b".." && !visit(name, kind) {
+            return Ok(false);
+        }
+    }
+}
+
+/// Bytes per `getdents64` call.
+#[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
+const LIST_BUFFER: usize = 64 << 10;
+
+/// The descriptor-relative walk: `openat` from the parent's descriptor, list with
+/// `getdents64` (Linux) or `readdir`, and `fstatat` each file and folder relative
+/// to the open directory. No path is built per entry.
+fn fd_enumerate(
+    parent: Option<Arc<DirFd>>,
+    name: &CStr,
+    path: &Path,
+    control: &ScanControl,
+    volume: &VolumeInfo,
+    listing: &mut Listing,
+) -> io::Result<bool> {
+    let dir = Arc::new(open_at(parent.as_deref(), name)?);
+    // The parent stays open only until its last child has opened.
+    drop(parent);
+    let mut result = Ok(());
+    let complete = for_each_name(&dir, control, |name, listed| {
+        let os = OsStr::from_bytes(name.to_bytes());
+        let mut entry = blank(os.into());
+        match listed {
+            libc::DT_LNK => entry.kind = EntryKind::Link,
+            libc::DT_REG | libc::DT_DIR | libc::DT_UNKNOWN => match stat_at(&dir, name) {
+                Ok(facts) => apply(&mut entry, &facts, path, volume),
+                Err(error) => {
+                    listing.batch.errors.push((Some(entry.name), error));
+                    return true;
+                }
+            },
+            _ => {}
+        }
+        if !control.record(entry.kind, entry.logical) {
+            return false;
+        }
+        let enter = entry.kind == EntryKind::Directory && !entry.skipped;
+        listing.batch.entries.push(entry);
+        if enter {
+            let index = listing.batch.entries.len() - 1;
+            let child = path.join(os);
+            // Under descriptor pressure the child opens by full path and does
+            // not keep this folder open.
+            let relative =
+                OPEN_DIRS.load(std::sync::atomic::Ordering::Relaxed) < descriptor_budget();
+            let target = if relative {
+                CString::new(name.to_bytes()).map(|name| Target::Relative {
+                    parent: Some(dir.clone()),
+                    name,
+                    path: child,
+                })
+            } else {
+                CString::new(child.as_os_str().as_bytes()).map(|name| Target::Relative {
+                    parent: None,
+                    name,
+                    path: child,
+                })
+            };
+            match target {
+                Ok(target) => listing.children.push((index, target)),
+                Err(error) => result = Err(io::Error::other(error)),
+            }
+        }
+        true
+    })?;
+    result?;
+    Ok(complete)
+}
+
+/// Root (effective UID 0) is elevated.
+pub(crate) fn is_elevated() -> bool {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// `sudo` or `pkexec` on `PATH` is a way to get to root.
+pub(crate) fn elevation() -> crate::Elevation {
+    let is_elevated = is_elevated();
+    crate::Elevation {
+        is_elevated,
+        can_elevate: !is_elevated && (executable_on_path("sudo") || executable_on_path("pkexec")),
+        backup_privilege_enabled: false,
+    }
+}
+
+/// Unix has no backup privilege: root already lists every folder except macOS
+/// privacy-protected ones, which need Full Disk Access instead.
+pub(crate) fn enable_backup_privilege() -> bool {
+    false
+}
+
+/// Whether a regular file named `program` in a `PATH` directory is executable by
+/// this user (real UID and groups, as `access(X_OK)` checks).
+pub(crate) fn executable_on_path(program: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| {
+            let candidate = dir.join(program);
+            fs::metadata(&candidate).is_ok_and(|m| m.is_file())
+                && std::ffi::CString::new(candidate.as_os_str().as_bytes()).is_ok_and(|c| {
+                    // SAFETY: `c` is a NUL-terminated path that outlives the call.
+                    unsafe { libc::access(c.as_ptr(), libc::X_OK) == 0 }
+                })
+        })
+    })
+}
+
+/// The NTFS Master File Table backend exists on Windows only.
+pub(crate) const BACKEND_MFT: &str = "ntfs-mft";
+
+pub(crate) enum NoMft {}
+
+pub(crate) fn mft_source(_root: &Path, _explicit: bool) -> io::Result<NoMft> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "the MFT backend reads NTFS volumes on Windows only",
+    ))
+}
+
+pub(crate) fn scan_mft(
+    source: NoMft,
+    _root: &Path,
+    _control: &ScanControl,
+    _collector: &mut crate::Collector,
+) -> io::Result<()> {
+    match source {}
 }
 
 fn unix_ms(seconds: i64, nanoseconds: i64) -> Option<u64> {
@@ -582,43 +1013,6 @@ pub fn volumes() -> Vec<crate::Volume> {
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
 pub fn volumes() -> Vec<crate::Volume> {
     Vec::new()
-}
-
-/// Root (effective UID 0) is elevated.
-pub(crate) fn is_elevated() -> bool {
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    unsafe { libc::geteuid() == 0 }
-}
-
-/// `sudo` or `pkexec` on `PATH` is a way to get to root.
-pub(crate) fn elevation() -> crate::Elevation {
-    let is_elevated = is_elevated();
-    crate::Elevation {
-        is_elevated,
-        can_elevate: !is_elevated && (executable_on_path("sudo") || executable_on_path("pkexec")),
-        backup_privilege_enabled: false,
-    }
-}
-
-/// Unix has no backup privilege: root already lists every folder except macOS
-/// privacy-protected ones, which need Full Disk Access instead.
-pub(crate) fn enable_backup_privilege() -> bool {
-    false
-}
-
-/// Whether a regular file named `program` in a `PATH` directory is executable by
-/// this user (real UID and groups, as `access(X_OK)` checks).
-pub(crate) fn executable_on_path(program: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|dir| {
-            let candidate = dir.join(program);
-            fs::metadata(&candidate).is_ok_and(|m| m.is_file())
-                && std::ffi::CString::new(candidate.as_os_str().as_bytes()).is_ok_and(|c| {
-                    // SAFETY: `c` is a NUL-terminated path that outlives the call.
-                    unsafe { libc::access(c.as_ptr(), libc::X_OK) == 0 }
-                })
-        })
-    })
 }
 
 #[cfg(test)]

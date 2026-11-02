@@ -23,13 +23,17 @@
   saved scans and scan-to-scan diff, optional Explorer reveal behind a scoped
   proposal.
 
-## Phase 3 — qualify the fast NTFS path
+## Phase 3 — qualify the fast NTFS path (first version done)
 
-* Read-only bulk MFT backend, explicit privilege detection and ordinary-scan fallback.
-* NTFS fixtures for hard links, resident data, compressed/sparse files, alternate
-  streams, extension records, long paths and concurrently changing volumes.
+* Done: read-only bulk MFT backend (`ntfs-mft`), used by `--backend auto` for whole
+  NTFS volumes when elevated, with fallback to the directory walk; handle-relative
+  NT directory walk otherwise ([PERFORMANCE.md](docs/PERFORMANCE.md)).
+* Done: synthetic NTFS image and fixtures for hard links (incl. extension
+  records), resident data, sparse and WOF-compressed files, long paths; a
+  benchmark gate that compares every backend against a measured truth on CI.
+* Next: measure the MFT on large real drives (20M+ files) elevated, cold and
+  warm; alternate streams; concurrently changing volumes.
 * Compare counts and accounting before comparing speed with other analyzers.
-* Publish cold/warm, end-to-end latency and peak working set on real Windows disks.
 * USN incremental refresh after correctness and recovery behavior are accepted.
 
 ## Phase 4 — reviewed actions and portability

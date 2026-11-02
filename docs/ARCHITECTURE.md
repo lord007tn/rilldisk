@@ -43,8 +43,9 @@ Issues the scanner raises itself (stalled folders, the entry limit, volume
 warnings) set `kind` directly and have no `os_error`. See
 [the elevation proposal](proposals/elevation.md).
 
-File identity uses the volume serial plus file ID, and zero IDs are treated as
-unknown rather than collapsing every such file together. Logical bytes describe
+File identity is the file ID (128-bit where the filesystem offers it; a scan
+never leaves its volume on Windows, so the volume serial is not needed), and zero
+IDs are treated as unknown rather than collapsing every such file together. Logical bytes describe
 names; unique bytes describe discovered file identities. Unknown allocation
 propagates as `null` rather than becoming zero. Hard-link ownership is attributed
 to first encounter. The user-visible allocation figure excludes directory and
@@ -66,13 +67,16 @@ compact name arena and indexed queries should follow profiling, not precede it.
 
 ## Unix backend (Linux, macOS)
 
-`unix-readdir` plugs into the same parallel walk, so scheduling, the shared entry
+`unix-readdir` (the default) plugs into the same parallel walk, so scheduling, the shared entry
 budget, cancellation and stall reporting are identical to Windows. Each directory
 is listed with `std::fs::read_dir` (`getdents64` on Linux, `readdir` on macOS).
 The listing's type (`d_type`) is enough for symlinks, sockets, FIFOs and devices,
 which therefore cost no further call. Regular files and directories get one
 no-follow metadata call each: `statx`/`fstatat` relative to the open directory
 handle on Linux, `lstat` on macOS. Symlinks are listed as links and never followed.
+`--backend dir` selects the descriptor-relative variant instead (`openat` from the
+parent's descriptor, `getdents64` on Linux, `fstatat` per entry); it measured no
+faster here (see PERFORMANCE.md), so it is not the default.
 
 * **Allocation** is `st_blocks * 512` (512-byte units on both kernels), so sparse
   files report what they occupy. Directory blocks are excluded, as on Windows.
@@ -233,19 +237,79 @@ them alone and links the matching new package from `latest.yml` instead. Scope,
 privacy and threat model are in [proposals/updates.md](proposals/updates.md);
 installation per system is in [INSTALL.md](INSTALL.md).
 
-## Direct NTFS backend
+## Scan backends
 
-WizTree documents direct MFT access as its NTFS speed advantage. This first
-backend is not equivalent. A fast path must read NTFS metadata in bulk, reconstruct
-parent/name relationships, handle extension records and resident/nonresident data,
-account for hard links and alternate streams, handle malformed records, and keep
-privilege requirements explicit. Enumerating USN names alone does not provide all
-the size/accounting data required for a disk analyzer.
+`ScanOptions::backend` (`--backend auto|mft|dir` in the CLI) chooses how a scan
+enumerates; `Summary.backend` names the one that ran. Every backend feeds the
+same collector: `Collector::accept` is the single place each retained entry is
+counted and stored, with its parent id, parents before children (it also feeds
+the live view). Rollups, the child index, issues, the entry budget, cancellation
+and partial results are shared. Measurements are in [PERFORMANCE.md](PERFORMANCE.md).
 
-Before enabling auto-selection: fixture parity with the directory backend,
-comparison against an independent Windows inventory, no writes to the volume,
-clear fallback behavior, and repeated whole-volume measurements. Incremental USN
-updates follow an accepted full-scan implementation.
+* **`nt-directory`** (Windows walk): each folder opens with `NtCreateFile`
+  relative to its parent's open handle (`FILE_OPEN_FOR_BACKUP_INTENT`,
+  `FILE_OPEN_REPARSE_POINT`; no path is rebuilt or re-parsed from the root) and
+  lists with `NtQueryDirectoryFile` into a per-thread 64 KiB buffer, using
+  `FileIdExtdDirectoryInformation` (128-bit file IDs, for ReFS) or
+  `FileIdBothDirectoryInformation` where the filesystem lacks it. A folder's own
+  `.` record (or, without one, its handle) shows whether it became a reparse
+  point after it was listed. A parent handle stays open until its last child
+  has opened.
+* **`win32-batched-directory`** (`Backend::Legacy`): RillDisk 0.1's walk, kept as
+  a reference for benchmarks and backend comparisons.
+* **`unix-readdir`** (Linux and macOS default) and **`linux-getdents`** /
+  **`unix-openat`** (`--backend dir`): see the Unix section. Past half the soft
+  descriptor limit, the descriptor-relative walk opens children by path.
+* **`ntfs-mft`**: below.
+
+Hard links on NTFS start in a hash map keyed by file ID; once a scan has seen
+enough files that a table indexed by MFT record number is smaller, they move
+there (8 bytes per record, no hashing). A record reused during the scan keeps
+both identities apart.
+
+## Direct NTFS backend (`ntfs-mft`)
+
+The backend opens the volume read-only (administrator rights; nothing is
+written), reads the boot sector and `$MFT`'s own record (including its attribute
+list when the table is fragmented), and requires `$MFT`'s runs to cover the
+table continuously from offset 0 on disk. Records up to the valid data length
+are read in 4 MiB blocks by the scan's thread pool, unbuffered, and parsed in
+parallel. Each record is validated: `FILE` signature, a complete update-sequence
+array, attribute bounds, an end marker within `bytes_in_use`. A record that
+fails is skipped and counted in one issue ("records changed while they were
+read"), so the result is never complete-looking when it is not.
+
+From each record: `$STANDARD_INFORMATION` (last write time, reparse attribute),
+every `$FILE_NAME` except DOS 8.3 aliases (each is one hard link: parent
+reference and name), the unnamed `$DATA` stream's size and allocation (the
+compressed/sparse total when present; resident data has no clusters), the
+reparse tag, and for WOF-compressed files the `WofCompressedData` stream's
+allocation. Extension records are folded into their base record. Links whose
+parent is not a live folder with the matching sequence number are dropped;
+records below 16 and everything under `$Extend` are NTFS metadata, hidden like in
+a listing.
+
+The tree below the scan root is planned breadth first on indexes (entry ids,
+the entry budget, hard links: a record knows its link count, so only files with
+several names enter the hard-link table), then entries are built in parallel and
+passed through `Collector::accept`. Cancellation is polled while reading and
+while planning.
+
+Accounting matches the directory walk: reparse points that listings expose
+(junctions, symlinks, mount points, app aliases) are links that are not
+followed. WOF compression (CompactOS), deduplication, cloud placeholders
+(OneDrive) and ProjFS are reparse points that their filter drivers present as
+ordinary files and folders, so both backends list, size and enter them. Where
+the backends legitimately differ, the MFT is the more exact one: listings report
+allocation cached in folder entries, which lags some files' records, and report
+0 for WOF-compressed files.
+
+The table is read raw, so it shows what NTFS has written to disk; changes from
+the last seconds may still be in memory. Parsing costs ~90 bytes per record
+whatever the scan keeps, so a table with more than twice `max_entries` records
+is refused before anything is allocated (`auto` then walks directories). Under
+`auto` the MFT is only used for a whole volume, since a folder scan would still
+read the whole table.
 
 ## Sources
 
