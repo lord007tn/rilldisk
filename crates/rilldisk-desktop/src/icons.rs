@@ -29,6 +29,7 @@ pub enum Icon {
     Eye,
     Terminal,
     Gear,
+    Trash,
 }
 
 fn arc(center: Pos2, radius: f32, from: f32, to: f32) -> Vec<Pos2> {
@@ -267,6 +268,23 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
             );
             p.add(poly(vec![at(4.5, 6.0), at(6.8, 8.0), at(4.5, 10.0)]));
             p.line_segment([at(8.5, 10.2), at(11.5, 10.2)], line);
+        }
+        Icon::Trash => {
+            p.line_segment([at(2.0, 4.0), at(14.0, 4.0)], line);
+            p.add(poly(vec![
+                at(6.0, 4.0),
+                at(6.0, 2.0),
+                at(10.0, 2.0),
+                at(10.0, 4.0),
+            ]));
+            p.add(poly(vec![
+                at(3.5, 4.0),
+                at(4.5, 14.0),
+                at(11.5, 14.0),
+                at(12.5, 4.0),
+            ]));
+            p.line_segment([at(6.7, 6.8), at(6.9, 11.4)], line);
+            p.line_segment([at(9.3, 6.8), at(9.1, 11.4)], line);
         }
     }
 }

@@ -59,7 +59,7 @@ pub struct Data {
 }
 
 impl Data {
-    fn analyze(snapshot: Snapshot) -> Self {
+    pub(crate) fn analyze(snapshot: Snapshot) -> Self {
         let start = Instant::now();
         let reclaim = find_reclaimable(&snapshot, now_ms());
         let candidate_of = reclaim
@@ -190,6 +190,8 @@ pub struct RillApp {
     after_scan: Option<(Tab, Option<Category>)>,
     pub tour: Option<Tour>,
     pub injected: Vec<egui::Event>,
+    /// Selection removal: confirmation, progress and results (cleanup_ui.rs).
+    pub cleanup: crate::cleanup_ui::CleanupUi,
 }
 
 pub fn now_ms() -> u64 {
@@ -331,6 +333,7 @@ impl RillApp {
             after_scan: None,
             tour,
             injected: Vec::new(),
+            cleanup: Default::default(),
         };
         if path.is_some() {
             app.start_scan(&cc.egui_ctx);
@@ -448,7 +451,7 @@ impl RillApp {
         }
     }
 
-    fn install(&mut self, data: Data) {
+    pub(crate) fn install(&mut self, data: Data) {
         self.selected = None;
         self.zoom = 0;
         self.generation += 1;
@@ -630,6 +633,9 @@ impl RillApp {
 
     fn shortcuts(&mut self, ctx: &egui::Context) -> Vec<Action> {
         let mut actions = Vec::new();
+        if self.cleanup.modal_open() {
+            return actions;
+        }
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
             if self.settings_open {
                 actions.push(Action::Settings(false));
@@ -891,7 +897,7 @@ impl RillApp {
                 let (dot, _) = ui.allocate_exact_size(vec2(8.0, 14.0), Sense::hover());
                 ui.painter().circle_filled(dot.center(), 3.5, th.good);
                 ui.label(
-                    RichText::new("Read-only · nothing leaves this PC")
+                    RichText::new("Local only · nothing leaves this PC")
                         .font(style::regular(11.5))
                         .color(th.dim),
                 );
@@ -2202,7 +2208,7 @@ impl RillApp {
 
     // ------------------------------------------------------------- clean up
 
-    fn cleanup(&mut self, ui: &mut Ui, data: &Data) -> Vec<Action> {
+    fn cleanup(&mut self, ui: &mut Ui, data: &Arc<Data>) -> Vec<Action> {
         let mut actions = Vec::new();
         let th = t();
         let report = &data.reclaim;
@@ -2337,11 +2343,7 @@ impl RillApp {
             }
         });
         ui.add_space(6.0);
-        ui.label(
-            RichText::new("RillDisk never deletes. Tick folders to build a cleanup plan you can review and run yourself; Git refuses to remove a worktree with uncommitted changes.")
-                .font(style::regular(12.0))
-                .color(th.faint),
-        );
+        crate::cleanup_ui::toolbar(self, ui, data);
         ui.add_space(8.0);
         // Rows grouped by category, biggest group first.
         enum Row {
@@ -2562,7 +2564,7 @@ impl RillApp {
     }
 
     /// Floating bar summarising ticked folders, with a copyable plan.
-    fn plan_bar(&mut self, ui: &mut Ui, data: &Data, area: Rect) -> Vec<Action> {
+    fn plan_bar(&mut self, ui: &mut Ui, data: &Arc<Data>, area: Rect) -> Vec<Action> {
         let mut actions = Vec::new();
         if self.picked.is_empty() {
             return actions;
@@ -2582,7 +2584,7 @@ impl RillApp {
             .collect();
         chosen.sort_by_key(|c| std::cmp::Reverse(c.logical_bytes));
         let total: u64 = chosen.iter().map(|c| frees(c, self.allocated)).sum();
-        let width = area.width().min(640.0);
+        let width = area.width().min(760.0);
         let rect = Rect::from_center_size(
             pos2(area.center().x, area.bottom() - 36.0),
             vec2(width, 60.0),
@@ -2594,7 +2596,11 @@ impl RillApp {
         p.text(
             pos2(inner.left(), inner.center().y - 9.0),
             Align2::LEFT_CENTER,
-            format!("{} selected", style::count(chosen.len() as u64)),
+            format!(
+                "{} · {} selected",
+                style::plural(chosen.len() as u64, "item"),
+                style::bytes(chosen.iter().map(|c| size_metric(c, self.allocated)).sum())
+            ),
             style::semibold(14.0),
             th.text,
         );
@@ -2611,12 +2617,13 @@ impl RillApp {
                 .layout(Layout::right_to_left(Align::Center)),
         );
         bar.spacing_mut().item_spacing.x = 8.0;
-        if w::button(&mut bar, Kind::Primary, Some(Icon::Copy), "Copy cleanup plan")
+        crate::cleanup_ui::bar_buttons(self, &mut bar, data);
+        if w::button(&mut bar, Kind::Soft, Some(Icon::Copy), "Copy plan")
             .on_hover_text("A commented list of the suggested command for each folder. Review it, then run what you agree with.")
             .clicked()
         {
             let mut plan = format!(
-                "# RillDisk cleanup plan: {} folders, frees at least {}\n# Review every line before running it. RillDisk itself never deletes anything.\n",
+                "# RillDisk cleanup plan: {} folders, frees at least {}\n# Review every line before running it.\n",
                 chosen.len(),
                 style::bytes(total)
             );
@@ -3077,7 +3084,7 @@ impl RillApp {
                     ui.vertical_centered(|ui| {
                         ui.label(
                             RichText::new(concat!(
-                                "Read-only · metadata only · nothing leaves this PC   ·   v",
+                                "Metadata only · nothing leaves this PC   ·   v",
                                 env!("CARGO_PKG_VERSION"),
                                 " · AGPL-3.0"
                             ))
@@ -3300,6 +3307,7 @@ impl eframe::App for RillApp {
             actions.extend(central.inner);
         }
         self.apply(&ctx, actions);
+        crate::cleanup_ui::show(self, &ctx);
         self.paint_toast(&ctx);
         if self.tour.is_some() {
             crate::capture::advance(self, &ctx);
@@ -3365,7 +3373,7 @@ fn find_path(snapshot: &Snapshot, path: &str) -> Option<usize> {
 }
 
 /// Space removing a candidate frees at least: hard-linked files are excluded.
-fn frees(candidate: &Candidate, allocated: bool) -> u64 {
+pub(crate) fn frees(candidate: &Candidate, allocated: bool) -> u64 {
     if allocated {
         candidate.exclusive_bytes
     } else {
