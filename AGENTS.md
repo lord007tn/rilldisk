@@ -6,6 +6,10 @@
 * Core, CLI and MCP must share scanner and accounting logic.
 * Phase one is read-only. Do not add file deletion/moves, content reads, shell
   execution, telemetry, elevation or a network listener without a scoped proposal.
+  The one exception is [docs/proposals/cleanup.md](docs/proposals/cleanup.md):
+  deletion happens only through `rilldisk-core::cleanup`, only for reclaim
+  candidates, only after explicit user confirmation, and to the Recycle Bin /
+  Trash by default. MCP stays read-only.
 * Preserve logical/unique/allocation distinctions. Partial scans, skipped paths,
   cancellation and unknown values must remain visible.
 * Use AGPL-3.0-only for project code. Never commit private scan inventories.

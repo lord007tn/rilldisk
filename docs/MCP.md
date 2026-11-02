@@ -40,8 +40,14 @@ command, and treat `review` candidates as possibly unique work.
 
 Only one scan/snapshot is retained. A new scan expires the previous completed ID;
 queries with that ID fail rather than returning another scan's data. Queries run
-against immutable in-memory results, not additional live reads. MCP currently
-does not export full snapshots or expose destructive operations.
+against immutable in-memory results, not additional live reads. MCP does not
+export full snapshots.
+
+**The MCP server is read-only and has no tool that deletes, moves or modifies
+files.** Removing reclaim candidates is possible only in the CLI
+(`rilldisk reclaim --delete`) and the desktop, after a person confirms each run
+([docs/proposals/cleanup.md](proposals/cleanup.md)). An assistant can suggest
+candidates; the user decides and removes them.
 Two queries may run concurrently; a capacity error means the client should retry
 after an outstanding query finishes.
 

@@ -34,8 +34,11 @@
 
 ## Phase 4 — reviewed actions and portability
 
-* Cleanup proposals with live identity revalidation and explicit user approval.
-* Recycle-bin-first execution, protected paths, auditable results and recovery.
+* Done: removal of selected reclaim candidates with explicit approval,
+  Recycle-Bin-first execution, protected paths, live path revalidation and
+  per-item results ([proposal](docs/proposals/cleanup.md)).
+* Next: directory identity revalidation (needs directory IDs in the snapshot) and
+  restore from the Trash inside RillDisk.
 * Separate capability for mutation; the read-only MCP remains the default.
 * macOS/Linux distribution (the native Unix scanner, CLI, MCP and desktop already
   build and pass CI), plus measured macOS performance.
