@@ -22,14 +22,19 @@ app has Full Disk Access.
 1. **Issue kinds.** Every `ScanIssue` gets a machine-readable `kind`
    (`access_denied`, `not_found`, `in_use`, `stalled`, `entry_limit`, `other`) and
    the raw `os_error` when there is one. `message` is unchanged. The summary
-   gains `access_denied_count` (counted over every issue, not only the 100 listed)
-   and `elevated`. The reclaim report repeats `issue_count`,
-   `access_denied_count` and `elevated`. All fields are additive; the schema
-   version stays 2.
+   gains `access_denied_count` (counted over every issue, not only the 100 listed),
+   `privacy_denied_count` (macOS: the `EPERM` part of it, also uncapped; 0
+   elsewhere) and `elevated`. An access-denied issue is always a folder: on Unix,
+   a folder that can be listed but not searched refuses `lstat` on every entry,
+   and that is reported once, on the folder. The reclaim report repeats
+   `issue_count`, `access_denied_count` and `elevated`. All fields are additive;
+   the schema version stays 2.
 2. **Detection.** `rilldisk_core::elevation()` returns `is_elevated`,
    `can_elevate` and `backup_privilege_enabled`. Windows reads `TokenElevation`
    and checks `SeBackupPrivilege` with `PrivilegeCheck`. Unix compares the
-   effective UID with 0 and looks for `sudo` or `pkexec` on `PATH`. It is public
+   effective UID with 0 and looks for a `sudo` or `pkexec` on `PATH` that this
+   user may execute (`access(X_OK)`). A scan only records `is_elevated()`, which
+   touches no file, so a slow `PATH` directory cannot delay it. It is public
    so other backends (such as a direct NTFS reader that needs administrator rights)
    reuse it instead of probing on their own.
 3. **Backup privilege (Windows).** `rilldisk_core::enable_backup_privilege()`
@@ -39,16 +44,23 @@ app has Full Disk Access.
    privilege enabled the existing read-only open
    (`FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES`) bypasses the folder's read ACL.
    The CLI `scan`/`reclaim` commands and the desktop call it at start. The MCP
-   server never does.
+   server never does. If adjusting the token is not allowed, it reports whether
+   the privilege is already enabled.
 4. **CLI hint.** When access was denied and the process is not elevated, table
    output ends with one line: Windows "run from an elevated terminal (Run as
-   administrator) to read N protected folders"; Linux `sudo rilldisk …` with the
-   same arguments; macOS the same plus a Full Disk Access note (the note alone
-   when already root). JSON formats print it on stderr. The CLI never elevates or
+   administrator) to read N protected folders"; Linux and macOS `sudo <program> …`
+   with the program path and arguments as they were run (no command when an
+   argument is not valid UTF-8). With `--output`, it says to remove or rename that
+   file first, since `--output` never overwrites. On macOS, folders refused with
+   `EPERM` get a Full Disk Access note instead of `sudo` (the note alone when
+   already root). An elevated Windows run whose backup privilege could not be
+   enabled says so. JSON formats print it on stderr. The CLI never elevates or
    relaunches itself.
 5. **Desktop restart.** When access was denied and the app is not elevated, the
-   header and the top of the Issues tab offer a restart. Every route starts from
-   a click:
+   header (beside the "Partial" status) and the top of the Issues tab offer a
+   restart. Settings > Privacy shows the privilege state with the same route,
+   reopening the folder on screen. While a scan runs, the restart is hidden or
+   disabled, since it would end the scan. Every route starts from a click:
    * **Windows:** `ShellExecuteExW` with the verb `runas` on the app's own
      executable (`current_exe`), with the scan root and the current theme as
      arguments, so the elevated instance rescans the same folder. The current
@@ -56,10 +68,13 @@ app has Full Disk Access.
      UAC prompt and the process started. If the user declines
      (`ERROR_CANCELLED`), a quiet note says nothing changed.
    * **Linux:** if `pkexec` is on `PATH`, run
-     `pkexec env DISPLAY=… XAUTHORITY=… WAYLAND_DISPLAY=… XDG_RUNTIME_DIR=… <exe> <root>`
-     (only the variables that are set). The window stays open; a declined or
-     failed prompt (exit 126/127) shows the same note. Without `pkexec`, the app
-     shows a `sudo --preserve-env=… <exe> <root>` command to copy.
+     `pkexec env DISPLAY=… XAUTHORITY=… WAYLAND_DISPLAY=… XDG_RUNTIME_DIR=… <exe> <root> --theme <theme>`
+     (only the variables that are set; without `XAUTHORITY` on X11, the user's
+     `$HOME/.Xauthority`, because pkexec and sudo make `HOME` root's). The window
+     stays open and further clicks wait for that prompt. A declined or failed
+     prompt (exit 126/127) shows the same note; another failure says the elevated
+     instance stopped. Without `pkexec`, the app shows the same command with
+     `sudo` instead of `pkexec`, to copy.
    * **macOS:** when a folder fails with `EPERM` (privacy protection), offer
      **Grant Full Disk Access**, which opens
      `x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles`
@@ -80,7 +95,8 @@ the backup privilege it can list folders whose ACLs deny the user.
 
 * No automatic elevation, from any program. No elevation prompt without a click.
 * No ACL changes, no taking ownership, no `SeRestorePrivilege`,
-  `SeTakeOwnershipPrivilege` or `SeSecurityPrivilege`, no writes of any kind.
+  `SeTakeOwnershipPrivilege` or `SeSecurityPrivilege`, and no writes except the
+  report file a user explicitly asks for with `--output`.
 * No file contents are read. The backup privilege is used only through the
   existing directory-listing open; files are never opened.
 * No elevated helper, service, scheduled task or persistent setting. Closing the
@@ -121,8 +137,14 @@ the backup privilege it can list folders whose ACLs deny the user.
   `icacls`, scans it and expects one `access_denied` issue with `os_error` 5.
   When the test process is elevated (GitHub's Windows runners), it then enables
   the backup privilege and expects the same folder to be read completely. The ACE
-  is removed before asserting. The test skips if the ACE cannot be set.
+  is removed before asserting. The test fails, rather than passing unchecked, if
+  the ACE cannot be set or has no effect.
+* A Unix test checks that a listable but unsearchable folder is one
+  `access_denied` issue on the folder, not one per entry.
 * The desktop tests the `runas` argument quoting (`C:\` must become `"C:\\"`),
-  the `pkexec` command (only set display variables) and when each offer appears.
+  the `pkexec`/`sudo` commands (only set display variables, the default X cookie,
+  the theme) and when each offer appears, including Full Disk Access when the
+  `EPERM` folder is not among the listed issues. The CLI tests the hint's gates and
+  its rerun command.
   No test triggers a real UAC, polkit or settings prompt.
 * `scripts/test_mcp.py` keeps exercising the unprivileged MCP server.

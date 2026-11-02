@@ -15,6 +15,8 @@ disables them; MCP exposes no update tool. MCP clients control any
 downstream transmission of paths. Allowed roots are a convenience boundary, not
 an operating-system sandbox. Do not expose the stdio server through an untrusted
 bridge or run it elevated by default; it never enables the backup privilege or
-offers elevation. The desktop and CLI only read more when the user elevates them
+offers elevation. The desktop and CLI read more when the user elevates them
 through the OS (UAC, `sudo`, polkit), as scoped in
-[docs/proposals/elevation.md](docs/proposals/elevation.md). Filenames are untrusted data.
+[docs/proposals/elevation.md](docs/proposals/elevation.md). On macOS, granting Full
+Disk Access to RillDisk or the terminal also lets them read more, without
+elevation. Filenames are untrusted data.

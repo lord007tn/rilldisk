@@ -100,8 +100,8 @@ No account, no admin rights to scan. Protected system folders are listed under
 Windows `System Volume Information`, `ProgramData\Microsoft\Windows\WER`, other
 users' profiles). For full coverage, click **Restart as administrator** in the
 desktop (Issues tab or header) and accept the UAC prompt; a new window rescans the
-same folder. Or run the CLI from an elevated terminal. Elevated, RillDisk enables the
-read-only backup privilege to list ACL-protected folders. It never changes
+same folder. Or run the CLI from an elevated terminal. On Windows, elevated RillDisk
+enables the read-only backup privilege to list ACL-protected folders. It never changes
 permissions or files. On Linux use `sudo` (the desktop offers `pkexec`); on macOS
 grant **Full Disk Access**. Issues carry a `kind` (`access_denied`, `in_use`,
 `not_found`, ...) and the summary an `access_denied_count`.

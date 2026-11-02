@@ -37,8 +37,11 @@ production scanner, and it never elevates. When the process is already elevated,
 by MCP) enables `SeBackupPrivilege`, so the same `FILE_FLAG_BACKUP_SEMANTICS` open
 lists ACL-protected folders read-only. `elevation()` reports the token state for
 any backend that needs administrator rights. Every issue carries a `kind`
-classified from the raw OS error (`access_denied`, `not_found`, `in_use`,
-`stalled`, `entry_limit`, `other`); see [the elevation proposal](proposals/elevation.md).
+(`access_denied`, `not_found`, `in_use`, `stalled`, `entry_limit`, `other`). Issues
+from an OS error take their kind from the raw OS error and keep it as `os_error`.
+Issues the scanner raises itself (stalled folders, the entry limit, volume
+warnings) set `kind` directly and have no `os_error`. See
+[the elevation proposal](proposals/elevation.md).
 
 File identity uses the volume serial plus file ID, and zero IDs are treated as
 unknown rather than collapsing every such file together. Logical bytes describe
