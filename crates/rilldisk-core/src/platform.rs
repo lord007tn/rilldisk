@@ -11,7 +11,8 @@ mod windows;
 pub use windows::volumes;
 #[cfg(windows)]
 pub(crate) use windows::{
-    BACKEND_MFT, Listing, Target, VolumeInfo, mft_source, read_directory, root_target, scan_mft,
+    BACKEND_MFT, Listing, Target, VolumeInfo, elevation, enable_backup_privilege,
+    executable_on_path, is_elevated, mft_source, read_directory, root_target, scan_mft,
     scan_ntfs_image, volume_info,
 };
 
@@ -21,7 +22,8 @@ mod unix;
 pub use unix::volumes;
 #[cfg(unix)]
 pub(crate) use unix::{
-    BACKEND_MFT, Listing, Target, VolumeInfo, mft_source, read_directory, root_target, scan_mft,
+    BACKEND_MFT, Listing, Target, VolumeInfo, elevation, enable_backup_privilege,
+    executable_on_path, is_elevated, mft_source, read_directory, root_target, scan_mft,
     volume_info,
 };
 

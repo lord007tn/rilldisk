@@ -613,6 +613,43 @@ fn fd_enumerate(
     Ok(complete)
 }
 
+/// Root (effective UID 0) is elevated.
+pub(crate) fn is_elevated() -> bool {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// `sudo` or `pkexec` on `PATH` is a way to get to root.
+pub(crate) fn elevation() -> crate::Elevation {
+    let is_elevated = is_elevated();
+    crate::Elevation {
+        is_elevated,
+        can_elevate: !is_elevated && (executable_on_path("sudo") || executable_on_path("pkexec")),
+        backup_privilege_enabled: false,
+    }
+}
+
+/// Unix has no backup privilege: root already lists every folder except macOS
+/// privacy-protected ones, which need Full Disk Access instead.
+pub(crate) fn enable_backup_privilege() -> bool {
+    false
+}
+
+/// Whether a regular file named `program` in a `PATH` directory is executable by
+/// this user (real UID and groups, as `access(X_OK)` checks).
+pub(crate) fn executable_on_path(program: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| {
+            let candidate = dir.join(program);
+            fs::metadata(&candidate).is_ok_and(|m| m.is_file())
+                && std::ffi::CString::new(candidate.as_os_str().as_bytes()).is_ok_and(|c| {
+                    // SAFETY: `c` is a NUL-terminated path that outlives the call.
+                    unsafe { libc::access(c.as_ptr(), libc::X_OK) == 0 }
+                })
+        })
+    })
+}
+
 /// The NTFS Master File Table backend exists on Windows only.
 pub(crate) const BACKEND_MFT: &str = "ntfs-mft";
 

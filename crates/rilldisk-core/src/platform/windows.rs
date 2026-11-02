@@ -52,6 +52,16 @@ use windows_sys::{
     },
 };
 
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, LUID},
+    Security::{
+        AdjustTokenPrivileges, GetTokenInformation, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
+        PRIVILEGE_SET, PrivilegeCheck, SE_BACKUP_NAME, SE_PRIVILEGE_ENABLED,
+        TOKEN_ADJUST_PRIVILEGES, TOKEN_ELEVATION, TOKEN_PRIVILEGES, TOKEN_QUERY, TokenElevation,
+    },
+    System::Threading::{GetCurrentProcess, OpenProcessToken},
+};
+
 use windows_sys::Win32::System::WindowsProgramming::{DRIVE_FIXED, DRIVE_REMOVABLE};
 
 pub(crate) mod mft;
@@ -739,13 +749,14 @@ fn emit_mft(
         .ok_or_else(|| io::Error::other("the scan root is not in the MFT"))?;
     if table.torn > 0 {
         let path = crate::entry_path(collector.entries(), 0);
-        collector.issue(ScanIssue {
+        collector.issue(ScanIssue::new(
             path,
-            message: format!(
+            crate::IssueKind::Other,
+            format!(
                 "{} MFT records changed while they were read and were skipped; files they describe may be missing",
                 table.torn
             ),
-        });
+        ));
     }
     crate::trace("mft read and index", &mut phase);
     // Plan the breadth-first order on indexes only (ids, budget, hard links),
@@ -916,9 +927,155 @@ pub fn volumes() -> Vec<crate::Volume> {
     result
 }
 
+/// `PRIVILEGE_SET_ALL_NECESSARY` (Win32_System_SystemServices, not otherwise needed).
+const PRIVILEGE_SET_ALL_NECESSARY: u32 = 1;
+
+/// The process token, closed on drop.
+struct Token(HANDLE);
+
+impl Token {
+    fn open(access: u32) -> io::Result<Self> {
+        let mut handle: HANDLE = std::ptr::null_mut();
+        // SAFETY: the pseudo-handle from GetCurrentProcess needs no closing; the output
+        // handle is written only on success.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), access, &mut handle) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(handle))
+    }
+
+    fn query<T>(&self, class: i32) -> io::Result<T> {
+        let mut value = std::mem::MaybeUninit::<T>::zeroed();
+        let mut returned = 0;
+        // SAFETY: callers pair each token class with its exact fixed-size structure.
+        let success = unsafe {
+            GetTokenInformation(
+                self.0,
+                class,
+                value.as_mut_ptr().cast(),
+                size_of::<T>() as u32,
+                &mut returned,
+            )
+        };
+        if success == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the successful call initialized the structure.
+        Ok(unsafe { value.assume_init() })
+    }
+
+    fn backup_privilege_enabled(&self, luid: LUID) -> bool {
+        let mut set = PRIVILEGE_SET {
+            PrivilegeCount: 1,
+            Control: PRIVILEGE_SET_ALL_NECESSARY,
+            Privilege: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: 0,
+            }],
+        };
+        let mut result = 0;
+        // SAFETY: the set holds exactly the one privilege it declares.
+        unsafe { PrivilegeCheck(self.0, &mut set, &mut result) != 0 && result != 0 }
+    }
+}
+
+impl Drop for Token {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from OpenProcessToken and is closed once.
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+fn backup_luid() -> Option<LUID> {
+    let mut luid = LUID::default();
+    // SAFETY: SE_BACKUP_NAME is a terminated constant; luid is writable.
+    (unsafe { LookupPrivilegeValueW(std::ptr::null(), SE_BACKUP_NAME, &mut luid) } != 0)
+        .then_some(luid)
+}
+
+impl Token {
+    fn is_elevated(&self) -> bool {
+        self.query::<TOKEN_ELEVATION>(TokenElevation)
+            .is_ok_and(|e| e.TokenIsElevated != 0)
+    }
+}
+
+pub(crate) fn is_elevated() -> bool {
+    Token::open(TOKEN_QUERY).is_ok_and(|token| token.is_elevated())
+}
+
+/// Windows offers elevation through UAC; this only serves the shared API.
+pub(crate) fn executable_on_path(program: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
+}
+
+pub(crate) fn elevation() -> crate::Elevation {
+    let Ok(token) = Token::open(TOKEN_QUERY) else {
+        return crate::Elevation::default();
+    };
+    let is_elevated = token.is_elevated();
+    crate::Elevation {
+        is_elevated,
+        // UAC offers consent (administrators) or a credentials prompt (standard
+        // users) for any unelevated process.
+        can_elevate: !is_elevated,
+        backup_privilege_enabled: backup_luid().is_some_and(|l| token.backup_privilege_enabled(l)),
+    }
+}
+
+/// Enables `SeBackupPrivilege` when the token is elevated. Elevated administrator
+/// tokens hold it disabled; unelevated tokens do not hold it at all, so this never
+/// asks for anything new. Only the enabled flag of an existing privilege changes.
+pub(crate) fn enable_backup_privilege() -> bool {
+    let Some(luid) = backup_luid() else {
+        return false;
+    };
+    let Ok(token) = Token::open(TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES) else {
+        // Adjusting is not allowed; report the privilege as it already is.
+        return Token::open(TOKEN_QUERY).is_ok_and(|t| t.backup_privilege_enabled(luid));
+    };
+    if !token.is_elevated() {
+        return token.backup_privilege_enabled(luid);
+    }
+    let state = TOKEN_PRIVILEGES {
+        PrivilegeCount: 1,
+        Privileges: [LUID_AND_ATTRIBUTES {
+            Luid: luid,
+            Attributes: SE_PRIVILEGE_ENABLED,
+        }],
+    };
+    // SAFETY: the state holds exactly the one privilege it declares; no previous
+    // state is requested. ERROR_NOT_ALL_ASSIGNED leaves the token unchanged, and
+    // PrivilegeCheck below reports the real outcome either way.
+    unsafe {
+        AdjustTokenPrivileges(
+            token.0,
+            0,
+            &state,
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    token.backup_privilege_enabled(luid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn elevation_is_consistent() {
+        let state = elevation();
+        assert_eq!(state.can_elevate, !state.is_elevated);
+        // Unelevated tokens never gain the privilege.
+        if !state.is_elevated {
+            assert!(!enable_backup_privilege());
+            assert!(!elevation().backup_privilege_enabled);
+        }
+    }
+
     #[test]
     fn rejects_invalid_native_records() {
         for layout in [ID_BOTH, ID_EXTD] {

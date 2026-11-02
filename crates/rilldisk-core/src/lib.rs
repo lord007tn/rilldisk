@@ -2,6 +2,7 @@
 use std::{
     collections::HashMap,
     ffi::OsStr,
+    io,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -69,11 +70,141 @@ pub struct Entry {
     pub fully_listed: bool,
 }
 
+/// Why a path could not be read, for programs that act on issues (for example,
+/// offering to rerun with administrator rights). `message` keeps the OS text.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueKind {
+    /// The OS refused access (Windows `ERROR_ACCESS_DENIED`, Unix `EACCES`/`EPERM`).
+    /// Administrator rights or, on macOS, Full Disk Access usually help.
+    AccessDenied,
+    /// The path disappeared between listing and reading.
+    NotFound,
+    /// Another process holds the path open or locked.
+    InUse,
+    /// The read made no progress before the stall timeout.
+    Stalled,
+    /// The entry limit stopped the scan.
+    EntryLimit,
+    Other,
+}
+
+impl IssueKind {
+    /// Classify an I/O error. Raw OS codes are checked first because they are
+    /// platform-specific (raw 1 is `EPERM` on Unix but `ERROR_INVALID_FUNCTION` on
+    /// Windows), then the portable [`io::ErrorKind`].
+    pub fn of(error: &io::Error) -> Self {
+        if let Some(kind) = error.raw_os_error().and_then(Self::from_raw_os_error) {
+            return kind;
+        }
+        match error.kind() {
+            io::ErrorKind::PermissionDenied => Self::AccessDenied,
+            io::ErrorKind::NotFound => Self::NotFound,
+            io::ErrorKind::ResourceBusy => Self::InUse,
+            _ => Self::Other,
+        }
+    }
+
+    /// The kind for a raw OS error code of the platform this was compiled for.
+    pub fn from_raw_os_error(code: i32) -> Option<Self> {
+        if cfg!(windows) {
+            match code {
+                // ERROR_ACCESS_DENIED, ERROR_PRIVILEGE_NOT_HELD
+                5 | 1314 => Some(Self::AccessDenied),
+                // ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND
+                2 | 3 => Some(Self::NotFound),
+                // ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION
+                32 | 33 => Some(Self::InUse),
+                _ => None,
+            }
+        } else {
+            match code {
+                // EPERM (macOS privacy protection), EACCES
+                1 | 13 => Some(Self::AccessDenied),
+                // ENOENT, ENOTDIR (replaced by a file since it was listed)
+                2 | 20 => Some(Self::NotFound),
+                // EBUSY, ETXTBSY
+                16 | 26 => Some(Self::InUse),
+                _ => None,
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanIssue {
     #[serde(serialize_with = "serialize_path")]
     pub path: PathBuf,
+    pub kind: IssueKind,
     pub message: String,
+    /// The raw OS error code, when the issue came from the OS. On macOS, `1`
+    /// (`EPERM`) on a folder usually means privacy protection (Full Disk Access).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub os_error: Option<i32>,
+}
+
+impl ScanIssue {
+    pub fn new(path: impl Into<PathBuf>, kind: IssueKind, message: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            kind,
+            message: message.into(),
+            os_error: None,
+        }
+    }
+
+    /// An issue for an I/O error, classified by [`IssueKind::of`].
+    pub fn from_error(path: impl Into<PathBuf>, error: &io::Error) -> Self {
+        Self {
+            path: path.into(),
+            kind: IssueKind::of(error),
+            message: error.to_string(),
+            os_error: error.raw_os_error(),
+        }
+    }
+}
+
+/// The process's privilege state, for deciding whether to offer a rerun with more
+/// rights. Querying never changes anything.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
+pub struct Elevation {
+    /// Windows: the token is elevated (Run as administrator). Unix: effective UID 0.
+    pub is_elevated: bool,
+    /// The OS offers a way to restart with more rights: Windows UAC (consent or
+    /// credentials); Unix `sudo` or `pkexec` on `PATH`. False when already elevated.
+    pub can_elevate: bool,
+    /// Windows: `SeBackupPrivilege` is enabled, so directories protected by their
+    /// ACLs can be listed through backup semantics. Always false on Unix.
+    pub backup_privilege_enabled: bool,
+}
+
+/// Current privilege state of this process. On Unix this looks for `sudo` and
+/// `pkexec` on `PATH`; [`is_elevated`] alone touches no file.
+pub fn elevation() -> Elevation {
+    platform::elevation()
+}
+
+/// Whether this process is elevated (administrator token, or effective UID 0).
+/// Cheap and file-free, so a scan can record it before it starts.
+pub fn is_elevated() -> bool {
+    platform::is_elevated()
+}
+
+/// Whether `program` is an executable file in a `PATH` directory that this user
+/// may run (Unix `access(X_OK)`), for offering `sudo` or `pkexec`.
+pub fn executable_on_path(program: &str) -> bool {
+    platform::executable_on_path(program)
+}
+
+/// When the process is elevated on Windows, enable `SeBackupPrivilege` on its token
+/// so directory listings (which always open with `FILE_FLAG_BACKUP_SEMANTICS`)
+/// bypass read ACLs. The privilege only widens read access through that flag:
+/// nothing is written and no ACL or owner is changed. Does nothing when not
+/// elevated, and on Unix, where root already lists everything except macOS
+/// privacy-protected folders. Returns whether the privilege is enabled afterwards.
+/// The CLI scan commands and the desktop call this; the MCP server never does.
+pub fn enable_backup_privilege() -> bool {
+    platform::enable_backup_privilege()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -97,9 +228,19 @@ pub struct Summary {
     pub unique_logical_bytes: u64,
     pub allocated_bytes: Option<u64>,
     pub issue_count: u64,
+    /// Issues of kind `access_denied`, counted over all issues (not only the
+    /// listed ones). Each is a folder that could not be listed or whose entries
+    /// could not be examined. Rerunning elevated usually reads these folders.
+    pub access_denied_count: u64,
+    /// macOS only: the part of `access_denied_count` refused with `EPERM`, which
+    /// privacy protection returns even to root (Full Disk Access lifts it).
+    /// Counted over all issues; always 0 on other platforms.
+    pub privacy_denied_count: u64,
     pub issues: Vec<ScanIssue>,
     pub cancelled: bool,
     pub complete: bool,
+    /// The scanning process was elevated (administrator or root).
+    pub elevated: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -623,16 +764,29 @@ impl Collector {
         add_issue(&mut self.summary, issue);
     }
 
-    /// Report an error for the entry `id`, or for its child `name`.
-    fn error(&mut self, id: usize, name: Option<&OsStr>, error: &std::io::Error) {
-        let mut path = entry_path(&self.entries, id);
-        if let Some(name) = name {
-            path.push(name);
+    /// Report one folder's errors: for the folder itself (`None`) or a named
+    /// child. A listable folder without search permission refuses `lstat` on
+    /// every entry; that is one protected folder, so it is reported once, on the
+    /// folder.
+    fn errors(&mut self, id: usize, errors: &[(Option<Box<OsStr>>, std::io::Error)]) {
+        let mut denied = false;
+        for (name, error) in errors {
+            let mut path = entry_path(&self.entries, id);
+            match name {
+                Some(name) if IssueKind::of(error) == IssueKind::AccessDenied => {
+                    if !std::mem::replace(&mut denied, true) {
+                        let mut issue = ScanIssue::from_error(path, error);
+                        issue.message = format!("entries could not be examined: {error}");
+                        self.issue(issue);
+                    }
+                }
+                Some(name) => {
+                    path.push(&**name);
+                    self.issue(ScanIssue::from_error(path, error));
+                }
+                None => self.issue(ScanIssue::from_error(path, error)),
+            }
         }
-        self.issue(ScanIssue {
-            path,
-            message: error.to_string(),
-        });
     }
 }
 
@@ -674,9 +828,12 @@ impl Collector {
             unique_logical_bytes: 0,
             allocated_bytes: Some(0),
             issue_count: 0,
+            access_denied_count: 0,
+            privacy_denied_count: 0,
             issues: Vec::new(),
             cancelled: false,
             complete: true,
+            elevated: is_elevated(),
         };
         let entry = Entry {
             id: 0,
@@ -774,10 +931,7 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
     collector.summary.backend = volume.backend();
     if let Some(warning) = volume.warning() {
         let path = collector.summary.root.clone();
-        collector.issue(ScanIssue {
-            path,
-            message: warning.to_string(),
-        });
+        collector.issue(ScanIssue::new(path, IssueKind::Other, warning));
     }
     walk(&pool, verbatim, volume, &control, &mut collector);
     Ok(pool.install(|| finish(collector, &options, &control, start)))
@@ -887,9 +1041,7 @@ fn walk(
                 continue;
             };
             outstanding.remove(&key);
-            for (name, error) in &batch.errors {
-                collector.error(parent, name.as_deref(), error);
-            }
+            collector.errors(parent, &batch.errors);
             collector.set_fully_listed(parent, batch.complete);
             for raw in batch.entries {
                 let child = raw.key;
@@ -917,13 +1069,14 @@ fn walk(
         for key in keys {
             if let Some(&id) = ids.get(key).filter(|&&id| id != usize::MAX) {
                 let path = entry_path(&collector.entries, id);
-                collector.issue(ScanIssue {
+                collector.issue(ScanIssue::new(
                     path,
-                    message: format!(
+                    IssueKind::Stalled,
+                    format!(
                         "not read: no progress for {} s (unresponsive folder or provider)",
                         STALL_TIMEOUT.as_secs()
                     ),
-                });
+                ));
             }
         }
     }
@@ -953,13 +1106,14 @@ fn finish(
         let path = summary.root.clone();
         add_issue(
             &mut summary,
-            ScanIssue {
+            ScanIssue::new(
                 path,
-                message: format!(
+                IssueKind::EntryLimit,
+                format!(
                     "entry limit of {} reached; some folders were not scanned (raise --max-entries)",
                     options.max_entries
                 ),
-            },
+            ),
         );
     }
     // Parents always precede their children, so one reverse pass aggregates the tree.
@@ -1061,6 +1215,11 @@ pub(crate) fn unix_ms(time: SystemTime) -> Option<u64> {
 fn add_issue(summary: &mut Summary, mut issue: ScanIssue) {
     issue.path = simplify(issue.path);
     summary.issue_count += 1;
+    let denied = issue.kind == IssueKind::AccessDenied;
+    summary.access_denied_count += u64::from(denied);
+    // Recorded before the cap below, so it holds even when the issue is not listed.
+    summary.privacy_denied_count +=
+        u64::from(cfg!(target_os = "macos") && denied && issue.os_error == Some(1));
     if summary.issues.len() < 100 {
         summary.issues.push(issue);
     }
