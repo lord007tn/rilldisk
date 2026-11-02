@@ -107,11 +107,15 @@ fn directory_and_legacy_walks_agree() {
     );
     assert_eq!(new.summary.hard_link_duplicates, 2);
     assert_eq!(new.summary.skipped_links, 1);
-    // `Auto` never reads the MFT for a folder, so it is the directory walk here.
-    assert_eq!(
-        scan_with(root.path(), Backend::Auto).summary.backend,
+    // `Auto` never reads the MFT for a folder: on Windows it is the NT walk; on
+    // Linux and macOS the std walk, which measured as fast there.
+    let auto = scan_with(root.path(), Backend::Auto).summary.backend;
+    let expected = if cfg!(windows) {
         new.summary.backend
-    );
+    } else {
+        old.summary.backend
+    };
+    assert_eq!(auto, expected);
 }
 
 #[cfg(target_os = "macos")]

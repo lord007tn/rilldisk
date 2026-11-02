@@ -410,7 +410,8 @@ impl ScanControl {
 pub enum Backend {
     /// Windows: read the NTFS Master File Table when the root is a whole NTFS
     /// volume and the process may read the volume (administrator); otherwise, and
-    /// whenever that fails, walk directories. Linux and macOS: walk directories.
+    /// whenever that fails, the `Directory` walk. Linux and macOS: the `Legacy`
+    /// (`std::fs::read_dir`) walk, which measured as fast as `Directory` there.
     #[default]
     Auto,
     /// Windows only: read the NTFS Master File Table directly. Needs administrator
@@ -418,9 +419,10 @@ pub enum Backend {
     Mft,
     /// Walk directories with the fastest listing calls this OS offers.
     Directory,
-    /// The directory walk of RillDisk 0.1 (full-path opens with
-    /// `GetFileInformationByHandleEx` on Windows, `std::fs::read_dir` elsewhere),
-    /// kept as a reference for benchmarks and backend comparisons.
+    /// The directory walk of RillDisk 0.1: full-path opens with
+    /// `GetFileInformationByHandleEx` on Windows (kept as a reference for
+    /// benchmarks and comparisons), `std::fs::read_dir` on Linux and macOS (the
+    /// default there).
     Legacy,
 }
 
@@ -920,6 +922,11 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
                         return Ok(finish(collector, &options, &control, start));
                     }
                 }
+            }
+            // Linux and macOS: the descriptor-relative walk measured no faster
+            // than `std::fs::read_dir` (docs/PERFORMANCE.md), so it stays opt-in.
+            if cfg!(unix) {
+                walk_backend = Backend::Legacy;
             }
         }
         Backend::Directory => {}
