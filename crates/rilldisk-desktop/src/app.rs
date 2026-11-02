@@ -1022,7 +1022,10 @@ impl RillApp {
                 if chip.clicked() && !s.complete {
                     actions.push(Action::Tab(Tab::Issues));
                 }
-                self.elevate.header(ui, s);
+                // Restart (or the Administrator badge) right beside the status chip.
+                let scanning = self.running.is_some();
+                self.elevate
+                    .header(ui, s, scanning, self.tab != Tab::Issues);
             });
         });
         actions
@@ -2882,7 +2885,8 @@ impl RillApp {
     }
 
     fn issues(&mut self, ui: &mut Ui, data: &Data) {
-        self.elevate.issues(ui, &data.snapshot.summary);
+        let scanning = self.running.is_some();
+        self.elevate.issues(ui, &data.snapshot.summary, scanning);
     }
 
     fn search_tab(&mut self, ui: &mut Ui, data: &Data) -> Vec<Action> {

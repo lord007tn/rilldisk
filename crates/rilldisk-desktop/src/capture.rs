@@ -128,8 +128,9 @@ impl Tour {
         use Step::*;
         use Target::*;
         let steps = if kind == TourKind::Issues {
-            // Scan a fixture with unreadable folders: the restart offer, then the
-            // elevated look (simulated; nothing is elevated).
+            // Scan a fixture with unreadable folders: the restart offer in the
+            // Issues tab, the header and Settings, then the elevated look
+            // (simulated; nothing is elevated).
             vec![
                 Theme(false),
                 WaitData,
@@ -140,6 +141,14 @@ impl Tour {
                 Wait(20),
                 Shot("issues-dark"),
                 Theme(false),
+                Tab(View::Overview),
+                Wait(20),
+                Shot("issues-header"),
+                Settings(true),
+                Wait(20),
+                Shot("issues-settings"),
+                Settings(false),
+                Tab(View::Issues),
                 Elevated(true),
                 Wait(20),
                 Shot("issues-elevated"),

@@ -11,7 +11,10 @@ use crate::style::{self, t};
 use crate::widgets::{self as w, Kind};
 use eframe::egui::{self, Frame, Margin, Rect, RichText, Sense, Ui, pos2, vec2};
 use rilldisk_core::{Elevation, IssueKind, ScanIssue, Summary};
-use std::{ffi::OsString, path::Path};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
 
 /// Kinds in the order the Issues tab shows them: the actionable one first.
 const ORDER: [IssueKind; 6] = [
@@ -35,10 +38,34 @@ pub enum Offer {
     Command(String),
 }
 
+/// The result of the last attempt: a few words for the header, the full text in
+/// the Issues callout and Settings.
+struct Note {
+    short: &'static str,
+    text: String,
+}
+
+impl Note {
+    fn new(short: &'static str, text: impl Into<String>) -> Self {
+        Self {
+            short,
+            text: text.into(),
+        }
+    }
+
+    fn declined() -> Self {
+        Self::new(
+            "Declined",
+            "Administrator access was declined. Nothing changed.",
+        )
+    }
+}
+
 pub struct Elevate {
     state: Elevation,
-    /// Result of the last attempt, shown quietly under the offer.
-    note: Option<String>,
+    /// `pkexec` is installed and runnable (Unix). Checked once, not every frame.
+    pkexec: bool,
+    note: Option<Note>,
     /// Linux: the `pkexec` launch, watched so a declined prompt can be reported.
     #[cfg(not(windows))]
     child: Option<std::process::Child>,
@@ -53,6 +80,7 @@ impl Elevate {
         rilldisk_core::enable_backup_privilege();
         Self {
             state: rilldisk_core::elevation(),
+            pkexec: cfg!(unix) && rilldisk_core::executable_on_path("pkexec"),
             note: None,
             #[cfg(not(windows))]
             child: None,
@@ -64,61 +92,88 @@ impl Elevate {
         self.state.is_elevated || self.preview_elevated
     }
 
+    /// A `pkexec` prompt, or the elevated app it started, is still running.
+    #[cfg(not(windows))]
+    fn pending(&self) -> bool {
+        self.child.is_some()
+    }
+
+    /// Windows waits for UAC synchronously, so nothing is ever pending.
+    #[cfg(windows)]
+    fn pending(&self) -> bool {
+        false
+    }
+
     pub fn offer(&self, summary: &Summary) -> Offer {
         offer(
             summary,
             self.elevated(),
             self.state.can_elevate,
-            &|program| on_path(program),
+            self.pkexec,
+            t().dark,
         )
     }
 
-    /// Header: an "Administrator" badge when elevated, otherwise a compact restart
-    /// button when protected folders were skipped. For a right-to-left layout.
-    pub fn header(&mut self, ui: &mut Ui, summary: &Summary) {
-        let th = t();
+    /// Header, next to the scan status chip (right-to-left layout): an
+    /// "Administrator" badge when elevated, otherwise a compact restart button when
+    /// protected folders were skipped. `scanning` hides the restart, which would end
+    /// the scan. `show_note` adds the last attempt's result in a few words; the
+    /// Issues tab shows it in full instead.
+    pub fn header(&mut self, ui: &mut Ui, summary: &Summary, scanning: bool, show_note: bool) {
+        self.poll(ui.ctx());
         if self.elevated() {
-            let tip = if self.state.backup_privilege_enabled || self.preview_elevated {
-                "Running as administrator. Protected folders are listed with the backup privilege (read-only)."
-            } else {
-                "Running with administrator rights."
-            };
-            badge(ui).on_hover_text(tip);
+            badge(ui).on_hover_text(self.badge_tip());
             return;
         }
-        if self.offer(summary) == Offer::Restart {
-            let count = style::count(summary.access_denied_count);
-            if w::button(ui, Kind::Soft, Some(Icon::Shield), restart_label())
-                .on_hover_text(format!(
-                    "{count} protected folders could not be read. Restart RillDisk with administrator rights and rescan {}.",
-                    summary.root.display()
-                ))
-                .clicked()
-            {
-                self.restart(ui.ctx(), &summary.root);
-            }
-        } else if let Some(note) = &self.note {
-            ui.label(RichText::new(note).color(th.faint).size(11.5));
+        if !scanning && self.offer(summary) == Offer::Restart {
+            let folders = style::plural(summary.access_denied_count, "protected folder");
+            let root = summary.root.clone();
+            ui.add_enabled_ui(!self.pending(), |ui| {
+                let clicked = w::button(ui, Kind::Soft, Some(Icon::Shield), restart_label())
+                    .on_hover_text(format!(
+                        "{folders} could not be read. Restart RillDisk with administrator rights and rescan {}.",
+                        root.display()
+                    ))
+                    .on_disabled_hover_text("Waiting for the administrator prompt.")
+                    .clicked();
+                if clicked {
+                    self.restart(ui.ctx(), Some(&root));
+                }
+            });
+        }
+        if show_note && let Some(note) = &self.note {
+            ui.label(RichText::new(note.short).color(t().faint).size(11.5))
+                .on_hover_text(&note.text);
         }
     }
 
-    /// The Issues tab: the offer on top, then issues grouped by kind.
-    pub fn issues(&mut self, ui: &mut Ui, summary: &Summary) {
+    fn badge_tip(&self) -> &'static str {
+        if self.state.backup_privilege_enabled || self.preview_elevated {
+            "Running as administrator. Protected folders are listed with the backup privilege (read-only)."
+        } else {
+            "Running with administrator rights."
+        }
+    }
+
+    /// The Issues tab: the offer on top, then issues grouped by kind. While
+    /// `scanning`, the restart is shown but disabled, since it would end the scan.
+    pub fn issues(&mut self, ui: &mut Ui, summary: &Summary, scanning: bool) {
         let th = t();
-        self.poll();
+        self.poll(ui.ctx());
         let offer = self.offer(summary);
         if offer != Offer::None || self.elevated() {
-            self.callout(ui, summary, &offer);
+            self.callout(ui, summary, &offer, scanning);
             ui.add_space(12.0);
         }
+        let listed = summary.issues.len() as u64;
         ui.label(
             RichText::new(format!(
                 "{} issues: folders that could not be read (left out of the totals) or checks that could not be made. {} are listed.",
                 style::count(summary.issue_count),
-                if summary.issues.len() as u64 == summary.issue_count {
+                if listed == summary.issue_count {
                     "All".to_string()
                 } else {
-                    format!("The first {}", summary.issues.len())
+                    format!("The first {}", style::count(listed))
                 }
             ))
             .color(th.dim),
@@ -131,6 +186,7 @@ impl Elevate {
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 for (kind, issues) in groups {
+                    // Access denied is counted over every issue, not only the listed ones.
                     let total = if kind == IssueKind::AccessDenied {
                         summary.access_denied_count
                     } else {
@@ -140,6 +196,16 @@ impl Elevate {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(kind_title(kind)).font(style::semibold(13.5)));
                         w::chip(ui, &style::count(total), kind_color(kind));
+                        if (issues.len() as u64) < total {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} listed",
+                                    style::count(issues.len() as u64)
+                                ))
+                                .color(th.faint)
+                                .size(11.5),
+                            );
+                        }
                     });
                     ui.label(RichText::new(kind_help(kind)).color(th.faint).size(11.5));
                     ui.add_space(6.0);
@@ -150,7 +216,7 @@ impl Elevate {
             });
     }
 
-    fn callout(&mut self, ui: &mut Ui, summary: &Summary, offer: &Offer) {
+    fn callout(&mut self, ui: &mut Ui, summary: &Summary, offer: &Offer, scanning: bool) {
         let th = t();
         let tint = if self.elevated() { th.good } else { th.accent };
         Frame::new()
@@ -169,8 +235,12 @@ impl Elevate {
                     let text_width = (ui.available_width() - button).max(200.0);
                     ui.vertical(|ui| {
                         ui.set_max_width(text_width);
-                        let count = summary.access_denied_count;
-                        let (title, body) = callout_text(offer, count, self.elevated());
+                        let (title, body) = callout_text(
+                            offer,
+                            summary.access_denied_count,
+                            summary.privacy_denied_count,
+                            self.elevated(),
+                        );
                         ui.label(RichText::new(title).font(style::semibold(15.0)));
                         ui.label(RichText::new(body).color(th.dim));
                         if let Offer::Command(command) = offer {
@@ -178,92 +248,187 @@ impl Elevate {
                         }
                         if let Some(note) = &self.note {
                             ui.add_space(2.0);
-                            ui.label(RichText::new(note).color(th.faint).size(11.5));
+                            ui.label(RichText::new(&note.text).color(th.faint).size(11.5));
                         }
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        match offer {
-                            Offer::Restart => {
-                                if w::button(ui, Kind::Primary, Some(Icon::Shield), restart_label())
-                                    .clicked()
-                                {
-                                    self.restart(ui.ctx(), &summary.root);
-                                }
-                            }
-                            Offer::FullDiskAccess => {
-                                if w::button(ui, Kind::Primary, None, "Grant Full Disk Access")
-                                    .clicked()
-                                {
-                                    self.note = Some(open_full_disk_access());
-                                }
-                            }
-                            Offer::Command(command) => {
-                                if w::button(ui, Kind::Soft, Some(Icon::Copy), "Copy command")
-                                    .on_hover_text(command)
-                                    .clicked()
-                                {
-                                    ui.ctx().copy_text(command.clone());
-                                    self.note = Some(
-                                        "Copied. Run it in a terminal, then close this window."
-                                            .into(),
-                                    );
-                                }
-                            }
-                            Offer::None => {}
-                        }
+                        self.action(ui, offer, Some(&summary.root), scanning);
                     });
                 });
             });
     }
 
-    /// Restart elevated on `root`. Windows closes this window once the elevated
-    /// instance has started; a declined prompt only leaves a note.
-    fn restart(&mut self, ctx: &egui::Context, root: &Path) {
+    /// The button for `offer`. A restart is disabled while a scan runs or a prompt
+    /// is pending.
+    fn action(&mut self, ui: &mut Ui, offer: &Offer, root: Option<&Path>, scanning: bool) {
+        match offer {
+            Offer::Restart => {
+                let pending = self.pending();
+                ui.add_enabled_ui(!scanning && !pending, |ui| {
+                    let clicked = w::button(ui, Kind::Primary, Some(Icon::Shield), restart_label())
+                        .on_disabled_hover_text(if pending {
+                            "Waiting for the administrator prompt."
+                        } else {
+                            "Available when the scan finishes."
+                        })
+                        .clicked();
+                    if clicked {
+                        self.restart(ui.ctx(), root);
+                    }
+                });
+            }
+            Offer::FullDiskAccess => {
+                if w::button(ui, Kind::Primary, None, "Grant Full Disk Access").clicked() {
+                    self.note = Some(open_full_disk_access());
+                }
+            }
+            Offer::Command(command) => {
+                if w::button(ui, Kind::Soft, Some(Icon::Copy), "Copy command")
+                    .on_hover_text(command)
+                    .clicked()
+                {
+                    ui.ctx().copy_text(command.clone());
+                    self.note = Some(Note::new(
+                        "Copied",
+                        "Copied. Run it in a terminal, then close this window.",
+                    ));
+                }
+            }
+            Offer::None => {}
+        }
+    }
+
+    /// Settings > Privacy: the privilege state in words.
+    pub fn status(&self) -> String {
+        if self.elevated() {
+            return self.badge_tip().into();
+        }
+        if cfg!(windows) {
+            "Not running as administrator. Protected system folders are skipped and listed under Issues. Restart as administrator to read them; RillDisk only lists them and never changes permissions or files.".into()
+        } else if cfg!(target_os = "macos") {
+            "Folders protected by macOS privacy controls need Full Disk Access for RillDisk. Other folders you cannot read are skipped and listed under Issues.".into()
+        } else if self.state.can_elevate {
+            "Not running as root. Folders you cannot read are skipped and listed under Issues. Restart with administrator rights to read them; RillDisk never changes permissions or files.".into()
+        } else {
+            "Not running as root. Folders you cannot read are skipped and listed under Issues."
+                .into()
+        }
+    }
+
+    /// Settings > Privacy: the route to more rights, if any, reopening `root`.
+    pub fn settings_control(&mut self, ui: &mut Ui, root: Option<&Path>, scanning: bool) {
+        self.poll(ui.ctx());
+        if self.elevated() {
+            badge(ui).on_hover_text(self.badge_tip());
+            return;
+        }
+        let offer = if cfg!(target_os = "macos") {
+            Offer::FullDiskAccess
+        } else if !self.state.can_elevate {
+            Offer::None
+        } else if cfg!(windows) || self.pkexec {
+            Offer::Restart
+        } else {
+            let exe = std::env::current_exe().unwrap_or_else(|_| "rilldisk-desktop".into());
+            Offer::Command(sudo_command(
+                &exe,
+                root.map(absolute).as_deref(),
+                t().dark,
+                &|key| std::env::var_os(key),
+            ))
+        };
+        self.action(ui, &offer, root, scanning);
+    }
+
+    /// The last attempt's result, for Settings.
+    pub fn note(&self) -> Option<&str> {
+        self.note.as_ref().map(|n| n.text.as_str())
+    }
+
+    /// Restart elevated, rescanning `root` if given. Windows closes this window
+    /// once the elevated instance has started; a declined prompt only leaves a note.
+    fn restart(&mut self, ctx: &egui::Context, root: Option<&Path>) {
+        if self.pending() {
+            return;
+        }
         let Ok(exe) = std::env::current_exe() else {
-            self.note = Some("Could not find the RillDisk executable to restart.".into());
+            self.note = Some(Note::new(
+                "Restart failed",
+                "Could not find the RillDisk executable to restart.",
+            ));
             return;
         };
-        let root = absolute(root);
+        let root = root.map(absolute);
+        let dark = t().dark;
         #[cfg(windows)]
-        {
-            match windows::run_as(&exe, &runas_parameters(&root, t().dark)) {
-                Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-                Err(error) if error.raw_os_error() == Some(windows::ERROR_CANCELLED) => {
-                    self.note = Some("Administrator access was declined. Nothing changed.".into());
-                }
-                Err(error) => {
-                    self.note = Some(format!("Could not restart as administrator: {error}"))
-                }
+        match windows::run_as(&exe, &runas_parameters(root.as_deref(), dark)) {
+            Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Err(error) if error.raw_os_error() == Some(windows::ERROR_CANCELLED) => {
+                self.note = Some(Note::declined());
+            }
+            Err(error) => {
+                self.note = Some(Note::new(
+                    "Restart failed",
+                    format!("Could not restart as administrator: {error}"),
+                ));
             }
         }
         #[cfg(not(windows))]
         {
-            let _ = ctx;
-            let args = pkexec_command(&exe, &root, &|key: &str| std::env::var_os(key));
+            let args = elevated_command("pkexec", &exe, root.as_deref(), dark, &|key| {
+                std::env::var_os(key)
+            });
             match std::process::Command::new(&args[0])
                 .args(&args[1..])
                 .spawn()
             {
                 Ok(child) => {
                     self.child = Some(child);
-                    self.note = Some("Waiting for authentication. When the administrator window opens, you can close this one.".into());
+                    self.note = Some(Note::new(
+                        "Waiting for authentication…",
+                        "Waiting for authentication. When the administrator window opens, you can close this one.",
+                    ));
+                    ctx.request_repaint();
                 }
-                Err(error) => self.note = Some(format!("Could not start pkexec: {error}")),
+                Err(error) => {
+                    self.note = Some(Note::new(
+                        "Restart failed",
+                        format!("Could not start pkexec: {error}"),
+                    ));
+                }
             }
         }
     }
 
-    /// Linux: report a declined or failed `pkexec` prompt.
-    fn poll(&mut self) {
+    /// Linux: report how the `pkexec` launch ended. Its exit status is the elevated
+    /// app's own once authentication succeeded.
+    #[cfg_attr(windows, allow(unused_variables))]
+    fn poll(&mut self, ctx: &egui::Context) {
         #[cfg(not(windows))]
-        if let Some(child) = &mut self.child
-            && let Ok(Some(status)) = child.try_wait()
-        {
-            // pkexec: 126 = not authorized or dismissed, 127 = authentication failed.
-            if matches!(status.code(), Some(126 | 127)) {
-                self.note = Some("Administrator access was declined. Nothing changed.".into());
-            }
+        if let Some(child) = &mut self.child {
+            let status = match child.try_wait() {
+                Ok(None) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(500));
+                    return;
+                }
+                Ok(Some(status)) => Ok(status),
+                Err(error) => Err(error),
+            };
             self.child = None;
+            self.note = match status {
+                // The elevated app ran and was closed normally.
+                Ok(status) if status.success() => None,
+                // pkexec: 126 = not authorized or dismissed, 127 = authentication failed.
+                Ok(status) if matches!(status.code(), Some(126 | 127)) => Some(Note::declined()),
+                Ok(status) => Some(Note::new(
+                    "Restart failed",
+                    format!("The administrator instance stopped ({status})."),
+                )),
+                Err(error) => Some(Note::new(
+                    "Restart failed",
+                    format!("Could not follow the administrator instance: {error}"),
+                )),
+            };
         }
     }
 }
@@ -307,10 +472,12 @@ fn badge(ui: &mut Ui) -> egui::Response {
 
 fn row(ui: &mut Ui, issue: &ScanIssue, kind: IssueKind) {
     let th = t();
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 54.0), Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 54.0), Sense::hover());
     if !ui.is_rect_visible(rect) {
         return;
     }
+    // The row truncates both lines; the full text is one hover away.
+    response.on_hover_text(format!("{}\n{}", issue.path.display(), issue.message));
     let p = ui.painter();
     let card = rect.shrink2(vec2(0.0, 3.0));
     p.rect_filled(card, 12, th.card);
@@ -368,7 +535,7 @@ fn kind_title(kind: IssueKind) -> &'static str {
 fn kind_help(kind: IssueKind) -> &'static str {
     match kind {
         IssueKind::AccessDenied => {
-            "Protected folders the OS refused to list. Their contents are left out of the totals."
+            "Protected folders the OS refused to list or examine. Their contents are left out of the totals."
         }
         IssueKind::InUse => {
             "Another program had these open or locked. A rescan usually reads them."
@@ -382,7 +549,7 @@ fn kind_help(kind: IssueKind) -> &'static str {
     }
 }
 
-fn callout_text(offer: &Offer, count: u64, elevated: bool) -> (String, String) {
+fn callout_text(offer: &Offer, count: u64, privacy: u64, elevated: bool) -> (String, String) {
     let folders = style::plural(count, "protected folder");
     match offer {
         Offer::Restart if cfg!(windows) => (
@@ -394,7 +561,14 @@ fn callout_text(offer: &Offer, count: u64, elevated: bool) -> (String, String) {
             "Restart with administrator rights (you will be asked to authenticate) to read them; the scan reruns on the same folder. RillDisk only lists them and never changes permissions or files.".into(),
         ),
         Offer::FullDiskAccess => (
-            format!("{folders} are protected by macOS privacy controls"),
+            if privacy == 1 {
+                "1 folder is protected by macOS privacy controls".to_string()
+            } else {
+                format!(
+                    "{} folders are protected by macOS privacy controls",
+                    style::count(privacy)
+                )
+            },
             "Grant RillDisk Full Disk Access in System Settings > Privacy & Security, then quit and reopen RillDisk and rescan. Administrator rights alone do not lift this protection.".into(),
         ),
         Offer::Command(_) => (
@@ -421,43 +595,36 @@ pub fn group(issues: &[ScanIssue]) -> Vec<(IssueKind, Vec<&ScanIssue>)> {
         .collect()
 }
 
-/// macOS privacy protection refuses with `EPERM` even for root; plain Unix
-/// permissions refuse with `EACCES`.
-fn privacy_protected(issue: &ScanIssue) -> bool {
-    issue.kind == IssueKind::AccessDenied && issue.os_error == Some(1)
-}
-
-fn offer(
-    summary: &Summary,
-    elevated: bool,
-    can_elevate: bool,
-    on_path: &dyn Fn(&str) -> bool,
-) -> Offer {
+/// What to offer for `summary`. `privacy_denied_count` is counted by the scanner
+/// before the issue list is capped, so the Full Disk Access offer holds even when
+/// none of those folders is among the listed issues.
+fn offer(summary: &Summary, elevated: bool, can_elevate: bool, pkexec: bool, dark: bool) -> Offer {
     if summary.access_denied_count == 0 {
         return Offer::None;
     }
-    if cfg!(target_os = "macos") && summary.issues.iter().any(privacy_protected) {
+    // macOS privacy protection refuses with EPERM even for root.
+    if summary.privacy_denied_count > 0 {
         return Offer::FullDiskAccess;
     }
     if elevated || !can_elevate {
         return Offer::None;
     }
-    if cfg!(windows) || on_path("pkexec") {
+    if cfg!(windows) || pkexec {
         return Offer::Restart;
     }
     let exe = std::env::current_exe().unwrap_or_else(|_| "rilldisk-desktop".into());
-    Offer::Command(sudo_command(&exe, &absolute(&summary.root)))
+    Offer::Command(sudo_command(
+        &exe,
+        Some(&absolute(&summary.root)),
+        dark,
+        &|key| std::env::var_os(key),
+    ))
 }
 
-fn absolute(root: &Path) -> std::path::PathBuf {
+fn absolute(root: &Path) -> PathBuf {
     std::fs::canonicalize(root)
         .map(rilldisk_core::simplify)
         .unwrap_or_else(|_| root.to_path_buf())
-}
-
-fn on_path(program: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
 }
 
 /// Display variables the elevated app needs to open a window on this session.
@@ -468,35 +635,61 @@ const DISPLAY_VARS: [&str; 4] = [
     "XDG_RUNTIME_DIR",
 ];
 
+fn theme_name(dark: bool) -> &'static str {
+    if dark { "dark" } else { "light" }
+}
+
 #[cfg_attr(windows, allow(dead_code))]
-/// `pkexec env DISPLAY=… <exe> <root>`: polkit clears the environment, so the
-/// display variables that are set are passed on explicitly.
-pub fn pkexec_command(
+/// `<launcher> env DISPLAY=… <exe> [root] --theme <theme>`. pkexec clears the
+/// environment and sudo resets it, so the display variables that are set are passed
+/// on explicitly. Both also make `HOME` root's: an X session without `XAUTHORITY`
+/// uses `$HOME/.Xauthority`, so the user's file is passed in that case.
+pub fn elevated_command(
+    launcher: &str,
     exe: &Path,
-    root: &Path,
+    root: Option<&Path>,
+    dark: bool,
     env: &dyn Fn(&str) -> Option<OsString>,
 ) -> Vec<OsString> {
-    let mut args: Vec<OsString> = vec!["pkexec".into(), "env".into()];
+    let mut args: Vec<OsString> = vec![launcher.into(), "env".into()];
     for key in DISPLAY_VARS {
-        if let Some(value) = env(key) {
+        let value = env(key).or_else(|| {
+            let default_cookie = key == "XAUTHORITY" && env("DISPLAY").is_some();
+            default_cookie
+                .then(|| env("HOME"))
+                .flatten()
+                .map(|mut home| {
+                    // A Unix path, so `/` rather than the build platform's separator.
+                    home.push("/.Xauthority");
+                    home
+                })
+        });
+        if let Some(value) = value {
             let mut pair = OsString::from(format!("{key}="));
             pair.push(value);
             args.push(pair);
         }
     }
     args.push(exe.as_os_str().into());
-    args.push(root.as_os_str().into());
+    if let Some(root) = root {
+        args.push(root.as_os_str().into());
+    }
+    args.extend(["--theme", theme_name(dark)].map(OsString::from));
     args
 }
 
 /// A copyable fallback when `pkexec` is not installed.
-fn sudo_command(exe: &Path, root: &Path) -> String {
-    format!(
-        "sudo --preserve-env={} {} {}",
-        DISPLAY_VARS.join(","),
-        shell_quote(&exe.to_string_lossy()),
-        shell_quote(&root.to_string_lossy())
-    )
+fn sudo_command(
+    exe: &Path,
+    root: Option<&Path>,
+    dark: bool,
+    env: &dyn Fn(&str) -> Option<OsString>,
+) -> String {
+    elevated_command("sudo", exe, root, dark, env)
+        .iter()
+        .map(|arg| shell_quote(&arg.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn shell_quote(text: &str) -> String {
@@ -512,13 +705,13 @@ fn shell_quote(text: &str) -> String {
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
-/// The elevated instance's command line: the scan root, then the theme.
-pub fn runas_parameters(root: &Path, dark: bool) -> String {
-    format!(
-        "{} --theme {}",
-        quote_windows_arg(&root.to_string_lossy()),
-        if dark { "dark" } else { "light" }
-    )
+/// The elevated instance's command line: the scan root if any, then the theme.
+pub fn runas_parameters(root: Option<&Path>, dark: bool) -> String {
+    let theme = format!("--theme {}", theme_name(dark));
+    match root {
+        Some(root) => format!("{} {theme}", quote_windows_arg(&root.to_string_lossy())),
+        None => theme,
+    }
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -549,11 +742,19 @@ pub fn quote_windows_arg(arg: &str) -> String {
 }
 
 /// Opens System Settings at Privacy & Security > Full Disk Access.
-fn open_full_disk_access() -> String {
+fn open_full_disk_access() -> Note {
     const URL: &str = "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles";
     match std::process::Command::new("open").arg(URL).spawn() {
-        Ok(_) => "Turn on RillDisk in the list (use + to add it if missing), then quit and reopen RillDisk and rescan.".into(),
-        Err(error) => format!("Could not open System Settings ({error}). Open Privacy & Security > Full Disk Access yourself."),
+        Ok(_) => Note::new(
+            "Settings opened",
+            "Turn on RillDisk in the list (use + to add it if missing), then quit and reopen RillDisk and rescan.",
+        ),
+        Err(error) => Note::new(
+            "Settings not opened",
+            format!(
+                "Could not open System Settings ({error}). Open Privacy & Security > Full Disk Access yourself."
+            ),
+        ),
     }
 }
 
@@ -598,7 +799,6 @@ mod windows {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     #[test]
     fn windows_arguments_round_trip() {
@@ -611,51 +811,84 @@ mod tests {
         assert_eq!(quote_windows_arg(r#"say "hi""#), r#""say \"hi\"""#);
         assert_eq!(quote_windows_arg(r#"a\"b"#), r#""a\\\"b""#);
         assert_eq!(
-            runas_parameters(Path::new(r"C:\"), true),
+            runas_parameters(Some(Path::new(r"C:\")), true),
             r#""C:\\" --theme dark"#
         );
+        assert_eq!(runas_parameters(None, false), "--theme light");
+    }
+
+    fn strings(args: Vec<OsString>) -> Vec<String> {
+        args.iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
     }
 
     #[test]
-    fn pkexec_passes_only_set_display_variables() {
-        let env = |key: &str| match key {
-            "DISPLAY" => Some(OsString::from(":0")),
+    fn elevated_commands_pass_the_display_and_theme() {
+        // Wayland only: just the variables that are set, no X cookie.
+        let wayland = |key: &str| match key {
+            "WAYLAND_DISPLAY" => Some(OsString::from("wayland-0")),
             "XDG_RUNTIME_DIR" => Some(OsString::from("/run/user/1000")),
+            "HOME" => Some(OsString::from("/home/a")),
             _ => None,
         };
-        let args = pkexec_command(
-            Path::new("/opt/rilldisk/rilldisk-desktop"),
-            Path::new("/"),
-            &env,
-        );
-        let args: Vec<_> = args
-            .iter()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
+        let exe = Path::new("/opt/rilldisk/rilldisk-desktop");
         assert_eq!(
-            args,
+            strings(elevated_command(
+                "pkexec",
+                exe,
+                Some(Path::new("/")),
+                true,
+                &wayland
+            )),
+            [
+                "pkexec",
+                "env",
+                "WAYLAND_DISPLAY=wayland-0",
+                "XDG_RUNTIME_DIR=/run/user/1000",
+                "/opt/rilldisk/rilldisk-desktop",
+                "/",
+                "--theme",
+                "dark"
+            ]
+        );
+        // X11 without XAUTHORITY: the user's default cookie, not root's.
+        let x11 = |key: &str| match key {
+            "DISPLAY" => Some(OsString::from(":0")),
+            "HOME" => Some(OsString::from("/home/a b")),
+            _ => None,
+        };
+        assert_eq!(
+            strings(elevated_command("pkexec", exe, None, false, &x11)),
             [
                 "pkexec",
                 "env",
                 "DISPLAY=:0",
-                "XDG_RUNTIME_DIR=/run/user/1000",
+                "XAUTHORITY=/home/a b/.Xauthority",
                 "/opt/rilldisk/rilldisk-desktop",
-                "/"
+                "--theme",
+                "light"
             ]
         );
         assert_eq!(
             sudo_command(
                 Path::new("/usr/bin/rilldisk-desktop"),
-                Path::new("/home/a b")
+                Some(Path::new("/home/a b")),
+                false,
+                &x11
             ),
-            "sudo --preserve-env=DISPLAY,XAUTHORITY,WAYLAND_DISPLAY,XDG_RUNTIME_DIR /usr/bin/rilldisk-desktop '/home/a b'"
+            "sudo env DISPLAY=:0 'XAUTHORITY=/home/a b/.Xauthority' /usr/bin/rilldisk-desktop '/home/a b' --theme light"
         );
     }
 
     fn summary(issues: Vec<ScanIssue>) -> Summary {
-        let denied = issues
+        let denied = |i: &&ScanIssue| i.kind == IssueKind::AccessDenied;
+        let access_denied_count = issues.iter().filter(denied).count() as u64;
+        // As the scanner counts it: EPERM denials, on macOS only.
+        let privacy_denied_count = issues
             .iter()
-            .filter(|i| i.kind == IssueKind::AccessDenied)
+            .filter(denied)
+            .filter(|i| cfg!(target_os = "macos") && i.os_error == Some(1))
             .count() as u64;
         Summary {
             schema_version: 2,
@@ -672,7 +905,8 @@ mod tests {
             unique_logical_bytes: 0,
             allocated_bytes: None,
             issue_count: issues.len() as u64,
-            access_denied_count: denied,
+            access_denied_count,
+            privacy_denied_count,
             issues,
             cancelled: false,
             complete: false,
@@ -705,26 +939,42 @@ mod tests {
             "denied",
         )]);
         let busy = summary(vec![ScanIssue::new("/c", IssueKind::InUse, "busy")]);
-        let yes = |_: &str| true;
-        let no = |_: &str| false;
-        assert_eq!(offer(&busy, false, true, &yes), Offer::None);
-        assert_eq!(offer(&denied, true, false, &yes), Offer::None);
-        assert_eq!(offer(&denied, false, false, &yes), Offer::None);
-        assert_eq!(offer(&denied, false, true, &yes), Offer::Restart);
-        let fallback = offer(&denied, false, true, &no);
+        assert_eq!(offer(&busy, false, true, true, false), Offer::None);
+        assert_eq!(offer(&denied, true, false, true, false), Offer::None);
+        assert_eq!(offer(&denied, false, false, true, false), Offer::None);
+        assert_eq!(offer(&denied, false, true, true, false), Offer::Restart);
+        let fallback = offer(&denied, false, true, false, false);
         if cfg!(windows) {
             assert_eq!(fallback, Offer::Restart);
         } else {
-            assert!(matches!(fallback, Offer::Command(c) if c.starts_with("sudo ")));
+            assert!(
+                matches!(&fallback, Offer::Command(c) if c.starts_with("sudo env ") && c.ends_with("--theme light")),
+                "{fallback:?}"
+            );
         }
         // macOS privacy protection (EPERM) needs Full Disk Access, even as root.
         let mut tcc = ScanIssue::new("/Users/a/Library/Mail", IssueKind::AccessDenied, "denied");
         tcc.os_error = Some(1);
         let tcc = summary(vec![tcc]);
         if cfg!(target_os = "macos") {
-            assert_eq!(offer(&tcc, true, false, &yes), Offer::FullDiskAccess);
+            assert_eq!(
+                offer(&tcc, true, false, false, false),
+                Offer::FullDiskAccess
+            );
         } else {
-            assert_eq!(offer(&tcc, true, false, &yes), Offer::None);
+            assert_eq!(offer(&tcc, true, false, false, false), Offer::None);
         }
+    }
+
+    #[test]
+    fn full_disk_access_holds_when_the_denial_is_not_listed() {
+        // 150 denials: the listed ones are other folders, the privacy one was cut.
+        let mut capped = summary(Vec::new());
+        capped.access_denied_count = 150;
+        capped.privacy_denied_count = 1;
+        assert_eq!(
+            offer(&capped, true, false, false, false),
+            Offer::FullDiskAccess
+        );
     }
 }
