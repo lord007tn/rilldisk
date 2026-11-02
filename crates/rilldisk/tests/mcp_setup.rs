@@ -248,9 +248,10 @@ fn claude_code_uses_its_own_cli_when_present() {
         fs::write(bin.join("claude.cmd"), "@echo %*>>\"%~dp0calls.txt\"\r\n").unwrap();
     } else {
         let script = bin.join("claude");
+        // Only builtins: PATH holds nothing but this folder.
         fs::write(
             &script,
-            "#!/bin/sh\necho \"$@\" >> \"$(dirname \"$0\")/calls.txt\"\n",
+            format!("#!/bin/sh\necho \"$@\" >> '{}'\n", calls.display()),
         )
         .unwrap();
         #[cfg(unix)]
