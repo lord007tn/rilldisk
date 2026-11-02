@@ -573,6 +573,8 @@ fn trash_mode_moves_the_folder_to_the_trash() {
     let root = fixture(dir.path());
     let (snapshot, report) = analyze(&root);
     let target = id_of(&report, &root.join("lib/target"));
+    // Identifies this test's item in the Trash (purged below where supported).
+    #[cfg(any(windows, all(unix, not(target_os = "macos"))))]
     let unique = root.file_name().unwrap().to_owned();
     let result = cleanup::execute(
         &snapshot,
