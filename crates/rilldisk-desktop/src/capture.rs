@@ -49,6 +49,8 @@ pub enum Step {
     RunCleanup,
     /// Clean up: close any dialog.
     Dismiss,
+    /// Show the elevated look (badge) without elevating.
+    Elevated(bool),
     Quit,
 }
 
@@ -61,6 +63,8 @@ pub enum TourKind {
     Full,
     /// Frames of the live dashboard while a (large) scan runs, then Settings.
     Live,
+    /// The Issues view of a fixture with unreadable folders (`--tour issues`).
+    Issues,
 }
 
 pub struct Tour {
@@ -123,7 +127,26 @@ impl Tour {
     pub fn new(dir: PathBuf, kind: TourKind) -> Self {
         use Step::*;
         use Target::*;
-        let steps = if kind == TourKind::Welcome {
+        let steps = if kind == TourKind::Issues {
+            // Scan a fixture with unreadable folders: the restart offer, then the
+            // elevated look (simulated; nothing is elevated).
+            vec![
+                Theme(false),
+                WaitData,
+                Tab(View::Issues),
+                Wait(24),
+                Shot("issues"),
+                Theme(true),
+                Wait(20),
+                Shot("issues-dark"),
+                Theme(false),
+                Elevated(true),
+                Wait(20),
+                Shot("issues-elevated"),
+                Wait(6),
+                Quit,
+            ]
+        } else if kind == TourKind::Welcome {
             vec![
                 Theme(false),
                 Wait(30),
@@ -381,6 +404,7 @@ pub fn advance(app: &mut RillApp, ctx: &egui::Context) {
         }
         Step::Theme(dark) => app.dark = dark,
         Step::Settings(open) => app.settings_open = open,
+        Step::Elevated(on) => app.elevate.preview_elevated = on,
         Step::Pick(category, n) => {
             if let Some(data) = &app.data {
                 let picks: Vec<usize> = data

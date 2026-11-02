@@ -30,6 +30,8 @@ pub enum Icon {
     Terminal,
     Gear,
     Trash,
+    /// Administrator rights.
+    Shield,
 }
 
 fn arc(center: Pos2, radius: f32, from: f32, to: f32) -> Vec<Pos2> {
@@ -250,6 +252,18 @@ pub fn paint(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
         }
         Icon::Stop => {
             p.rect_filled(r(4.0, 4.0, 12.0, 12.0), 2.0 * s, color);
+        }
+        Icon::Shield => {
+            p.add(poly(vec![
+                at(8.0, 1.5),
+                at(13.5, 3.5),
+                at(13.0, 8.5),
+                at(8.0, 14.5),
+                at(3.0, 8.5),
+                at(2.5, 3.5),
+                at(8.0, 1.5),
+            ]));
+            p.add(poly(vec![at(5.6, 8.0), at(7.4, 9.8), at(10.6, 6.2)]));
         }
         Icon::Eye => {
             let mut top = arc(at(8.0, 13.0), 8.0 * s, -PI * 0.82, -PI * 0.18);

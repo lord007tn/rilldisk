@@ -6,6 +6,7 @@ mod app;
 mod assistants;
 mod capture;
 mod cleanup_ui;
+mod elevation;
 mod icons;
 mod live;
 mod settings;
@@ -33,6 +34,7 @@ enum Capture {
 fn main() -> eframe::Result {
     let mut path = None;
     let mut capture = None;
+    let mut tour_name = None;
     let mut dark = None;
     let mut identity = None;
     let mut size = [1480.0_f32, 920.0];
@@ -52,6 +54,7 @@ fn main() -> eframe::Result {
             "--capture-cleanup" => {
                 capture = value(&mut args).map(|d| (PathBuf::from(d), Capture::Cleanup))
             }
+            "--tour" => tour_name = value(&mut args),
             // Unknown values keep the saved or system theme.
             "--theme" => match value(&mut args).as_deref() {
                 Some("dark") => dark = Some(true),
@@ -71,7 +74,7 @@ fn main() -> eframe::Result {
             "--help" | "-h" => {
                 attach_console();
                 println!(
-                    "rilldisk-desktop [PATH] [--theme light|dark] [--palette tide|moss|aurora] [--size WIDTHxHEIGHT] [--capture DIR] [--capture-cleanup DIR]\n\nOpens the RillDisk desktop app. PATH starts a scan immediately.\n--capture runs a scripted tour and saves screenshots to DIR (development).\n--capture-cleanup captures the cleanup dialogs; it only removes folders from a synthetic fixture.\n--version prints the version."
+                    "rilldisk-desktop [PATH] [--theme light|dark] [--palette tide|moss|aurora] [--size WIDTHxHEIGHT] [--capture DIR [--tour issues]] [--capture-cleanup DIR]\n\nOpens the RillDisk desktop app. PATH starts a scan immediately.\n--capture runs a scripted tour and saves screenshots to DIR (development).\n--capture-cleanup captures the cleanup dialogs; it only removes folders from a synthetic fixture.\n--version prints the version."
                 );
                 return Ok(());
             }
@@ -83,10 +86,26 @@ fn main() -> eframe::Result {
             _ => path = Some(arg),
         }
     }
+    let issues_tour = match tour_name.as_deref() {
+        None => false,
+        Some("issues") if path.is_some() => true,
+        Some("issues") => {
+            // The issues tour waits for scan data, so without a PATH it would never end.
+            attach_console();
+            eprintln!("--tour issues needs a PATH to scan.");
+            return Ok(());
+        }
+        Some(other) => {
+            attach_console();
+            eprintln!("unknown --tour {other}; the only named tour is `issues`.");
+            return Ok(());
+        }
+    };
     let tour = capture.map(|(dir, mode)| {
         let kind = match (path.is_none(), mode) {
             (_, Capture::Cleanup) => return capture::Tour::cleanup(dir),
             (true, _) => capture::TourKind::Welcome,
+            (false, _) if issues_tour => capture::TourKind::Issues,
             (false, Capture::Live) => capture::TourKind::Live,
             (false, Capture::Tour) => capture::TourKind::Full,
         };

@@ -193,6 +193,7 @@ pub struct RillApp {
     /// Selection removal: confirmation, progress and results (cleanup_ui.rs).
     pub cleanup: crate::cleanup_ui::CleanupUi,
     assistants: crate::assistants::State,
+    pub elevate: crate::elevation::Elevate,
 }
 
 pub fn now_ms() -> u64 {
@@ -336,6 +337,7 @@ impl RillApp {
             injected: Vec::new(),
             cleanup: Default::default(),
             assistants: Default::default(),
+            elevate: crate::elevation::Elevate::new(),
         };
         if path.is_some() {
             app.start_scan(&cc.egui_ctx);
@@ -1020,6 +1022,7 @@ impl RillApp {
                 if chip.clicked() && !s.complete {
                     actions.push(Action::Tab(Tab::Issues));
                 }
+                self.elevate.header(ui, s);
             });
         });
         actions
@@ -2879,54 +2882,7 @@ impl RillApp {
     }
 
     fn issues(&mut self, ui: &mut Ui, data: &Data) {
-        let th = t();
-        let summary = &data.snapshot.summary;
-        ui.label(
-            RichText::new(format!(
-                "{} issues: folders that could not be read (left out of the totals) or checks that could not be made (each message says which). {} are listed. Protected system folders are expected without administrator rights.",
-                style::count(summary.issue_count),
-                if summary.issues.len() as u64 == summary.issue_count { "All".to_string() } else { format!("The first {}", summary.issues.len()) }
-            ))
-            .color(th.dim),
-        );
-        ui.add_space(10.0);
-        let issues = &summary.issues;
-        egui::ScrollArea::vertical()
-            .id_salt("issues")
-            .auto_shrink(false)
-            .show_rows(ui, 54.0, issues.len(), |ui, range| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                for issue in &issues[range] {
-                    let (rect, _) =
-                        ui.allocate_exact_size(vec2(ui.available_width(), 54.0), Sense::hover());
-                    let p = ui.painter();
-                    let card = rect.shrink2(vec2(0.0, 3.0));
-                    p.rect_filled(card, 12, th.card);
-                    let tile = Rect::from_min_size(
-                        pos2(card.left() + 12.0, card.center().y - 15.0),
-                        vec2(30.0, 30.0),
-                    );
-                    p.rect_filled(tile, 9, style::alpha(th.warn, 40));
-                    icons::paint(p, tile.shrink(8.0), Icon::Warning, th.warn);
-                    let x = tile.right() + 12.0;
-                    let g = w::fit(
-                        p,
-                        issue.path.display().to_string(),
-                        style::mono(12.0),
-                        th.text,
-                        card.right() - x - 12.0,
-                    );
-                    p.galley(pos2(x, card.top() + 9.0), g, th.text);
-                    let g = w::fit(
-                        p,
-                        issue.message.clone(),
-                        style::regular(11.5),
-                        th.faint,
-                        card.right() - x - 12.0,
-                    );
-                    p.galley(pos2(x, card.top() + 27.0), g, th.faint);
-                }
-            });
+        self.elevate.issues(ui, &data.snapshot.summary);
     }
 
     fn search_tab(&mut self, ui: &mut Ui, data: &Data) -> Vec<Action> {
