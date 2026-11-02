@@ -306,3 +306,22 @@ fn mft_matches_the_walk(root: &Path, mft: Snapshot) {
     );
     assert_eq!(totals(&mft), totals(&walk));
 }
+
+#[test]
+fn the_live_view_ends_at_the_final_totals_for_every_walk() {
+    let root = tree();
+    for backend in [Backend::Directory, Backend::Legacy] {
+        let control = Arc::new(ScanControl::default());
+        let snapshot = scan(
+            root.path(),
+            ScanOptions {
+                backend,
+                ..Default::default()
+            },
+            control.clone(),
+        )
+        .unwrap();
+        let live = control.live().expect("published at the end of the scan");
+        assert_eq!(live.total_logical(), snapshot.summary.logical_bytes);
+    }
+}
