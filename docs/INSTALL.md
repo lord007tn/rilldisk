@@ -165,13 +165,18 @@ On Windows: `Get-FileHash .\RillDisk-<version>-x64.msi` and compare with
 | Installed with | How it updates |
 | --- | --- |
 | `.zip` / `.tar.gz` | `rilldisk update`, or **Install and restart** in the app. Verified with SHA-256, both programs replaced. |
-| `.msi` | The app and `rilldisk update --check` link the new `.msi`; run it to upgrade in place. |
+| `.msi` | Choose **Update and restart** in the bottom bar. The app downloads and verifies the MSI, then Windows Installer upgrades it after administrator consent. The CLI links the matching package. |
 | `.deb` / `.rpm` | They link the new package; install it with `apt` / `dnf` / `zypper` as above. |
 | AppImage | They link the new AppImage; replace the old file (or use AppImageUpdate). |
 | `.dmg` | They link the new `.dmg`; drag the new RillDisk over the old one. |
 
-RillDisk never replaces files that an installer or package manager owns, and it
-never runs an installer itself. The desktop checks for updates once a day if
+RillDisk leaves package-managed files to their owner. For its own Windows MSI,
+the desktop can launch the verified installer after you choose **Update and restart**.
+Downloads show byte progress in the bottom bar on every page. Windows Installer
+shows installation progress after RillDisk closes, and the app reopens afterward.
+A declined permission prompt leaves the app open; failures offer details and retry.
+Finish active scans or cleanup before updating. Other package managers keep the
+manual instructions above. The desktop checks once a day, including while open, if
 you allow it; set `RILLDISK_NO_UPDATE_CHECK=1` to turn every check off. Details:
 [proposals/updates.md](proposals/updates.md).
 

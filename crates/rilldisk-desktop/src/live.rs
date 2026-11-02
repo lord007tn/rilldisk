@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The dashboard while a scan runs: the largest folders found so far, drawn as
 //! a treemap whose tiles grow (smoothly) as the scanner reads more.
+use crate::app::nav;
 use crate::style::{self, t};
 use crate::treemap;
 use crate::widgets as w;
 use eframe::egui::{self, Align2, Color32, Rect, Sense, Ui, pos2, vec2};
-use rilldisk_core::{LiveFolder, LiveView};
-use std::collections::HashMap;
+use rilldisk_core::{LiveFolder, LiveView, ScanControl};
+use std::{collections::HashMap, path::PathBuf};
 
 /// Tile positions carried between frames so growth animates instead of jumping.
 #[derive(Default)]
@@ -14,6 +15,9 @@ pub struct Anim {
     rects: HashMap<String, Rect>,
     last_time: Option<f64>,
     pressed: Option<usize>,
+    /// Selected folder; going up selects the branch the user just left.
+    came_from: Option<usize>,
+    reveal: bool,
 }
 
 impl Anim {
@@ -21,6 +25,46 @@ impl Anim {
         self.rects.clear();
         self.last_time = None;
         self.pressed = None;
+        self.came_from = None;
+        self.reveal = false;
+    }
+
+    /// Browse to `id`, remembering the branch left when going up from `view`.
+    pub fn open(&mut self, control: &ScanControl, id: usize, view: Option<&LiveView>) {
+        let came_from = view.and_then(|view| branch_below(view, id));
+        control.focus_live(id);
+        self.reset();
+        self.came_from = came_from;
+        self.reveal = came_from.is_some();
+    }
+
+    #[cfg(test)]
+    pub fn selection(&self) -> Option<usize> {
+        self.came_from
+    }
+
+    /// Select a visible folder, or open the selected folder on Enter.
+    pub fn keyboard(
+        &mut self,
+        view: &LiveView,
+        up: bool,
+        down: bool,
+        enter: bool,
+    ) -> Option<usize> {
+        if (up || down) && !view.folders.is_empty() {
+            let position = self
+                .came_from
+                .and_then(|id| view.folders.iter().position(|f| f.id == id));
+            let next = match position {
+                None => 0,
+                Some(p) if up => p.saturating_sub(1),
+                Some(p) => (p + 1).min(view.folders.len() - 1),
+            };
+            self.came_from = Some(view.folders[next].id);
+            self.reveal = true;
+        }
+        self.came_from
+            .filter(|id| enter && view.folders.iter().any(|f| f.id == *id))
     }
 
     /// Move the remembered rect for `key` toward `target`.
@@ -49,6 +93,59 @@ pub fn parent(view: Option<&LiveView>, requested: usize) -> Option<usize> {
     (ancestors.last()?.0 == requested).then(|| ancestors.iter().rev().nth(1).map_or(0, |a| a.0))
 }
 
+/// Whether the published view shows the requested folder yet.
+pub fn caught_up(view: &LiveView, requested: usize) -> bool {
+    view.ancestors.last().map_or(0, |a| a.0) == requested
+}
+
+/// The child of ancestor `id` that leads to the shown folder.
+fn branch_below(view: &LiveView, id: usize) -> Option<usize> {
+    let mut chain = view.ancestors.iter().map(|a| a.0);
+    if id != 0 {
+        chain.find(|&a| a == id)?;
+    }
+    chain.next()
+}
+
+/// Everything found so far in the shown folder.
+pub fn total(view: &LiveView, allocated: bool) -> u64 {
+    let loose = if allocated {
+        view.loose_allocated_bytes
+    } else {
+        view.loose_logical_bytes
+    };
+    loose
+        + view
+            .folders
+            .iter()
+            .map(|f| value(f, allocated))
+            .sum::<u64>()
+}
+
+/// Scan root to the shown folder. Only the shown folder has a total yet.
+pub fn location(root: &str, view: &LiveView, allocated: bool) -> Vec<nav::Place> {
+    let mut path = PathBuf::from(root);
+    let mut places = vec![nav::Place {
+        id: 0,
+        name: nav::root_name(root),
+        detail: root.to_string(),
+        size: String::new(),
+    }];
+    for (id, name) in &view.ancestors {
+        path.push(name);
+        places.push(nav::Place {
+            id: *id,
+            name: name.clone(),
+            detail: path.display().to_string(),
+            size: String::new(),
+        });
+    }
+    if let Some(shown) = places.last_mut() {
+        shown.size = style::bytes(total(view, allocated));
+    }
+    places
+}
+
 fn value(folder: &LiveFolder, allocated: bool) -> u64 {
     if allocated {
         folder.allocated_bytes
@@ -57,16 +154,18 @@ fn value(folder: &LiveFolder, allocated: bool) -> u64 {
     }
 }
 
-/// Draw the live treemap and the "largest so far" list into `area`.
+/// Draw the live treemap and the folder panel into `area`.
 pub fn paint(
     ui: &mut Ui,
     area: Rect,
     view: Option<&LiveView>,
+    places: &[nav::Place],
     anim: &mut Anim,
     allocated: bool,
 ) -> Option<usize> {
     let mut clicked = None;
     let th = t();
+    let mut hovered_top = None;
     let now = ui.input(|i| i.time);
     let dt = anim
         .last_time
@@ -230,6 +329,7 @@ pub fn paint(
         anim.pressed = None;
     }
     if let Some((folder, kid)) = hovered {
+        hovered_top = Some(folder.id);
         response.on_hover_ui_at_pointer(|ui| {
             let f = kid.unwrap_or(folder);
             let label = match kid {
@@ -245,38 +345,53 @@ pub fn paint(
         });
     }
 
-    // Every immediate folder remains accessible in a scrollable list, even if
-    // it has no sized tiles yet or is too small to hit on the map.
-    let mut list = ui.new_child(egui::UiBuilder::new().max_rect(list_rect.shrink(16.0)));
-    list.label(egui::RichText::new("Folders found so far").font(style::semibold(14.0)));
-    list.label("Click a folder to enter");
-    list.label(format!("{} files directly here", view.loose_files));
-    if view.folders.is_empty() {
-        list.label("No subfolders found yet. Scanning continues.");
+    // Every immediate folder remains accessible in the panel, even if it has no
+    // sized tiles yet or is too small to hit on the map.
+    let tile_color: HashMap<usize, Color32> = tops
+        .iter()
+        .enumerate()
+        .map(|(i, f)| (f.id, style::chart(position[&(i as u32)], 0)))
+        .collect();
+    let reveal = anim
+        .came_from
+        .filter(|_| anim.reveal)
+        .and_then(|id| view.folders.iter().position(|f| f.id == id));
+    if reveal.is_some() {
+        anim.reveal = false;
     }
-    egui::ScrollArea::vertical()
-        .id_salt(("live-folders", view.ancestors.last().map(|a| a.0)))
-        .show_rows(&mut list, 22.0, view.folders.len(), |ui, rows| {
-            for folder in &view.folders[rows] {
-                if ui
-                    .push_id(folder.id, |ui| {
-                        ui.selectable_label(
-                            false,
-                            format!(
-                                "{}   {}",
-                                folder.name,
-                                style::bytes(value(folder, allocated))
-                            ),
-                        )
-                        .clicked()
-                    })
-                    .inner
-                {
-                    clicked = Some(folder.id);
-                }
-            }
-        });
-    clicked
+    let spec = nav::Panel {
+        places,
+        summary: format!(
+            "{} · {} directly here",
+            style::plural(view.folders.len() as u64, "folder"),
+            style::plural(view.loose_files, "file")
+        ),
+        notice: None,
+        rows: view.folders.len(),
+        empty: "No subfolders found yet. Scanning continues.",
+        selected: anim.came_from,
+        hovered: hovered_top,
+        reveal,
+    };
+    let row = |index: usize| {
+        let folder = &view.folders[index];
+        nav::Row {
+            id: folder.id,
+            name: folder.name.clone(),
+            size: style::bytes(value(folder, allocated)),
+            folder: true,
+            dot: tile_color.get(&folder.id).copied().unwrap_or(th.faint),
+            mark: None,
+            partial: false,
+            tip: format!(
+                "{}\n{} files so far · click to open",
+                folder.name,
+                style::count(folder.files)
+            ),
+        }
+    };
+    let result = nav::panel(ui, list_rect.shrink(8.0), spec, row, |_, _| {});
+    clicked.or(result.go).or(result.clicked.map(|row| row.0))
 }
 
 /// Corner radius that never turns a small tile into a dot.
@@ -352,6 +467,94 @@ mod tests {
     }
 
     #[test]
+    fn going_up_remembers_the_branch_that_was_left() {
+        let view = LiveView {
+            ancestors: vec![(1, "A".into()), (2, "B".into()), (3, "C".into())],
+            ..Default::default()
+        };
+        assert_eq!(branch_below(&view, 0), Some(1));
+        assert_eq!(branch_below(&view, 1), Some(2));
+        assert_eq!(branch_below(&view, 2), Some(3));
+        // The shown folder and its children have nothing below them to mark.
+        assert_eq!(branch_below(&view, 3), None);
+        assert_eq!(branch_below(&view, 9), None);
+    }
+
+    #[test]
+    fn location_names_the_chain_and_totals_only_the_shown_folder() {
+        let view = LiveView {
+            ancestors: vec![(4, "Projects".into())],
+            folders: vec![LiveFolder {
+                logical_bytes: 2048,
+                ..Default::default()
+            }],
+            loose_logical_bytes: 1024,
+            ..Default::default()
+        };
+        let list = location(r"C:\Synthetic\home", &view, false);
+        assert_eq!(list[0].name, "home");
+        assert_eq!(list[0].size, "");
+        assert_eq!(list[1].id, 4);
+        assert!(list[1].detail.ends_with("Projects"));
+        assert_eq!(list[1].size, style::bytes(3072));
+        assert!(caught_up(&view, 4));
+        assert!(!caught_up(&view, 0));
+    }
+
+    #[test]
+    fn panel_row_click_enters_a_folder_during_scan() {
+        let ctx = egui::Context::default();
+        let view = LiveView {
+            folders: vec![LiveFolder {
+                id: 42,
+                name: "folder without any size yet".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let places = location("C:\\Synthetic", &view, false);
+        let mut anim = Anim::default();
+        let mut opened = None;
+        let hit = |ctx: &egui::Context| {
+            ctx.data(|d| d.get_temp::<Vec<(usize, Rect)>>(egui::Id::unique(nav::PANEL_HITS)))
+                .and_then(|hits| hits.first().copied())
+        };
+        for step in 0..3 {
+            let mut input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 600.0))),
+                ..Default::default()
+            };
+            if let Some((_, rect)) = hit(&ctx).filter(|_| step > 0) {
+                let pos = rect.center();
+                input.events.push(egui::Event::PointerMoved(pos));
+                if step == 2 {
+                    for pressed in [true, false] {
+                        input.events.push(egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Default::default(),
+                        });
+                    }
+                }
+            }
+            ctx.run_ui(input, |ui| {
+                opened = paint(
+                    ui,
+                    ui.available_rect_before_wrap(),
+                    Some(&view),
+                    &places,
+                    &mut anim,
+                    false,
+                )
+                .or(opened);
+            })
+            .drop_without_applying_deltas();
+        }
+        assert_eq!(opened, Some(42));
+    }
+
+    #[test]
     fn map_click_enters_a_folder_during_scan() {
         let ctx = egui::Context::default();
         let mut view = LiveView {
@@ -365,6 +568,7 @@ mod tests {
         };
         let mut anim = Anim::default();
         let mut selected = None;
+        let places = location("C:\\Synthetic", &view, false);
         for pressed in [None, Some(true), Some(false)] {
             // A publication replaces the tile under the stationary pointer
             // between press and release; the original folder must still open.
@@ -390,6 +594,7 @@ mod tests {
                     ui,
                     ui.available_rect_before_wrap(),
                     Some(&view),
+                    &places,
                     &mut anim,
                     false,
                 )

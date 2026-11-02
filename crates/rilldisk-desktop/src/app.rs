@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
+pub(crate) mod nav;
 mod settings_page;
 
 use crate::capture::Tour;
@@ -15,8 +16,8 @@ use eframe::egui::{
     Shape, Stroke, Ui, UiBuilder, pos2, vec2,
 };
 use rilldisk_core::{
-    Candidate, Category, EntryKind, ReclaimReport, Safety, ScanControl, ScanOptions, Snapshot,
-    TypeStat, Volume, file_types, find_reclaimable, largest_files, scan, volumes,
+    Candidate, Category, EntryKind, LiveView, ReclaimReport, Safety, ScanControl, ScanOptions,
+    Snapshot, TypeStat, Volume, file_types, find_reclaimable, largest_files, scan, volumes,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -113,6 +114,17 @@ struct Running {
     root: String,
     started: Instant,
     rx: mpsc::Receiver<Result<Data, String>>,
+    /// Scripted views by focused folder, standing in for a scan in capture tours.
+    preview: Option<HashMap<usize, Arc<LiveView>>>,
+}
+
+impl Running {
+    fn live(&self) -> Option<Arc<LiveView>> {
+        match &self.preview {
+            Some(views) => views.get(&self.control.live_focus()).cloned(),
+            None => self.control.live(),
+        }
+    }
 }
 
 enum Action {
@@ -143,6 +155,9 @@ enum Action {
     CheckUpdates,
 }
 
+/// Scan generation, folder and metric of a sorted child list.
+type FolderRowsKey = (usize, usize, bool);
+
 pub struct RillApp {
     pub path: String,
     volumes: Vec<Volume>,
@@ -156,6 +171,10 @@ pub struct RillApp {
     pub color_by: ColorBy,
     pub selected: Option<usize>,
     pub zoom: usize,
+    /// Entry to scroll into view in the folder panel.
+    reveal: Option<usize>,
+    /// The shown folder's children, sorted by the current metric.
+    folder_rows: Option<(FolderRowsKey, Arc<Vec<u32>>)>,
     pub map: treemap::Layout,
     pub mini: treemap::Layout,
     pub rings: Rings,
@@ -187,6 +206,8 @@ pub struct RillApp {
     pub available: Option<update::Release>,
     installing: Option<update::Install>,
     update_error: Option<String>,
+    update_notice: Option<String>,
+    next_update_check: Instant,
     after_scan: Option<(Tab, Option<Category>)>,
     pub tour: Option<Tour>,
     pub injected: Vec<egui::Event>,
@@ -299,6 +320,8 @@ impl RillApp {
             color_by: ColorBy::Folder,
             selected: None,
             zoom: 0,
+            reveal: None,
+            folder_rows: None,
             map: Default::default(),
             mini: Default::default(),
             rings: Default::default(),
@@ -332,6 +355,8 @@ impl RillApp {
             available: None,
             installing: None,
             update_error: None,
+            update_notice: None,
+            next_update_check: Instant::now() + std::time::Duration::from_secs(900),
             after_scan: None,
             tour,
             injected: Vec::new(),
@@ -344,6 +369,11 @@ impl RillApp {
         }
         // Scripted captures never touch the network.
         if app.tour.is_none() {
+            match update::installer_notice() {
+                Some(Ok(notice)) => app.update_notice = Some(notice),
+                Some(Err(error)) => app.update_error = Some(error),
+                None => {}
+            }
             app.update_check = Some(update::check(&cc.egui_ctx, update::Trigger::Automatic));
         }
         app
@@ -378,6 +408,7 @@ impl RillApp {
             root,
             started: Instant::now(),
             rx,
+            preview: None,
         });
     }
 
@@ -387,6 +418,14 @@ impl RillApp {
                 Ok(Ok(data)) => {
                     let long = running.started.elapsed().as_secs() >= 10;
                     let id = running.control.live_focus();
+                    // A rescan of the shown results keeps the user where they are.
+                    let location = self
+                        .data
+                        .as_ref()
+                        .filter(|_| {
+                            self.zoom != 0 && self.rescanning() && self.pending_open.is_none()
+                        })
+                        .map(|data| data.snapshot.path(self.zoom).display().to_string());
                     let focus = (id != 0
                         && self.pending_open.is_none()
                         && data
@@ -400,6 +439,21 @@ impl RillApp {
                     if let Some(id) = focus {
                         self.zoom = id;
                         self.tab = Tab::Explore;
+                    }
+                    if let Some(path) = location {
+                        let found = self
+                            .data
+                            .as_ref()
+                            .and_then(|data| find_path(&data.snapshot, &path));
+                        match found {
+                            Some(id) => self.zoom = id,
+                            None => {
+                                self.toast = Some((
+                                    "That folder is not in the new results. Showing the top of the scan".into(),
+                                    ctx.input(|i| i.time),
+                                ));
+                            }
+                        }
                     }
                     if long && !ctx.input(|i| i.viewport().focused.unwrap_or(true)) {
                         ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
@@ -420,6 +474,17 @@ impl RillApp {
                     self.error = Some("scan worker stopped unexpectedly".into());
                 }
             }
+        }
+        if self.tour.is_none()
+            && self.update_check.is_none()
+            && self.installing.is_none()
+            && Instant::now() >= self.next_update_check
+        {
+            self.next_update_check = Instant::now() + std::time::Duration::from_secs(900);
+            self.update_check = Some(update::check(ctx, update::Trigger::Automatic));
+        }
+        if self.tour.is_none() {
+            ctx.request_repaint_after(std::time::Duration::from_secs(60));
         }
         if let Some(result) = self.update_check.as_ref().and_then(|c| c.poll()) {
             self.update_check = None;
@@ -470,6 +535,7 @@ impl RillApp {
 
     pub(crate) fn install(&mut self, data: Data) {
         self.selected = None;
+        self.reveal = None;
         self.zoom = 0;
         self.generation += 1;
         self.search_results = None;
@@ -517,6 +583,73 @@ impl RillApp {
         treemap::size_of(snapshot, id, self.allocated)
     }
 
+    /// No size can be stated: the metric is missing, or nothing could be listed.
+    fn size_unknown(&self, snapshot: &Snapshot, id: usize) -> bool {
+        let entry = &snapshot.entries[id];
+        (self.allocated && entry.allocated_bytes.is_none())
+            || (!entry.fully_listed && snapshot.children(id).is_empty())
+    }
+
+    fn size_text(&self, snapshot: &Snapshot, id: usize) -> String {
+        if self.size_unknown(snapshot, id) {
+            "unknown".to_string()
+        } else {
+            style::bytes(self.size(snapshot, id))
+        }
+    }
+
+    /// Every child of the shown folder, largest first; nothing is hidden, so the
+    /// item count, the list and arrow-key navigation agree.
+    fn children_of_zoom(&mut self, snapshot: &Snapshot) -> Arc<Vec<u32>> {
+        let key = (self.generation, self.zoom, self.allocated);
+        if let Some((cached, rows)) = &self.folder_rows
+            && *cached == key
+        {
+            return rows.clone();
+        }
+        let mut rows = snapshot.children(self.zoom).to_vec();
+        if self.allocated {
+            rows.sort_by_key(|&id| {
+                std::cmp::Reverse(snapshot.entries[id as usize].allocated_bytes)
+            });
+        }
+        let rows = Arc::new(rows);
+        self.folder_rows = Some((key, rows.clone()));
+        rows
+    }
+
+    /// Scan root to `id`, for the location bar and the folder panel.
+    fn location(&self, snapshot: &Snapshot, id: usize) -> Vec<nav::Place> {
+        ancestors(snapshot, id)
+            .into_iter()
+            .map(|level| {
+                let detail = snapshot.path(level).display().to_string();
+                let name = if level == 0 {
+                    nav::root_name(&detail)
+                } else {
+                    snapshot.name(level).into_owned()
+                };
+                nav::Place {
+                    id: level,
+                    name,
+                    detail,
+                    size: self.size_text(snapshot, level),
+                }
+            })
+            .collect()
+    }
+
+    /// A scan is refreshing the results on screen, which stay usable meanwhile.
+    fn rescanning(&self) -> bool {
+        match (&self.data, &self.running) {
+            (Some(data), Some(running)) => same_path(
+                &data.snapshot.summary.root.display().to_string(),
+                &running.root,
+            ),
+            _ => false,
+        }
+    }
+
     fn volume_of(&self, root: &str) -> Option<&Volume> {
         let root = root.to_lowercase();
         self.volumes
@@ -546,7 +679,10 @@ impl RillApp {
     fn apply(&mut self, ctx: &egui::Context, actions: Vec<Action>) {
         for action in actions {
             match action {
-                Action::Select(id) => self.selected = Some(id),
+                Action::Select(id) => {
+                    self.selected = Some(id);
+                    self.reveal = Some(id);
+                }
                 Action::Zoom(id) | Action::Explore(id) => {
                     let Some(data) = &self.data else { continue };
                     let entry = &data.snapshot.entries[id];
@@ -563,16 +699,24 @@ impl RillApp {
                             self.zoom = folder;
                         }
                     } else {
+                        // Going back up marks the branch the user came from.
+                        let came_from = nav::child_under(
+                            |at| data.snapshot.entries[at].parent_id,
+                            self.zoom,
+                            folder,
+                        );
                         self.tab = Tab::Explore;
                         self.zoom = folder;
-                        self.selected = (folder != id).then_some(id);
+                        self.selected = (folder != id).then_some(id).or(came_from);
                     }
+                    self.reveal = self.selected;
                 }
                 Action::Up => {
                     if let Some(data) = &self.data
                         && let Some(parent) = data.snapshot.entries[self.zoom].parent_id
                     {
                         self.selected = Some(self.zoom);
+                        self.reveal = self.selected;
                         self.zoom = parent;
                     }
                 }
@@ -581,6 +725,8 @@ impl RillApp {
                     self.toast = Some((format!("Copied {what}"), ctx.input(|i| i.time)));
                 }
                 Action::Tab(tab) => self.tab = tab,
+                Action::Scan(_) | Action::ScanThen(..) | Action::Open(_)
+                    if self.installing.is_some() => {}
                 Action::Scan(_) | Action::ScanThen(..) if self.running.is_some() => {}
                 Action::Scan(path) => {
                     self.path = path;
@@ -636,6 +782,22 @@ impl RillApp {
                         }
                     }
                 }
+                Action::Install(_)
+                    if self.installing.is_some()
+                        || self.running.is_some()
+                        || self.cleanup.modal_open() =>
+                {
+                    self.toast = Some((
+                        "Finish the current scan or cleanup before updating".into(),
+                        ctx.input(|i| i.time),
+                    ));
+                }
+                Action::Install(_) if self.tour.is_some() => {
+                    let sender = self.preview_update(update::Preview::Downloading);
+                    if let Some(tour) = &mut self.tour {
+                        tour.update_sender = sender;
+                    }
+                }
                 Action::Install(release) => {
                     self.update_error = None;
                     self.installing = Some(update::install_and_restart(ctx, *release));
@@ -682,13 +844,18 @@ impl RillApp {
         let Some(data) = self.data.clone() else {
             return actions;
         };
-        if ctx.egui_wants_keyboard_input() || self.running.is_some() {
+        let live_dashboard = self.running.is_some() && !self.rescanning();
+        if ctx.egui_wants_keyboard_input() || live_dashboard || self.settings_open {
             return actions;
         }
         let snapshot = &data.snapshot;
-        if ctx.input(|i| {
-            i.key_pressed(Key::Backspace) || i.pointer.button_pressed(egui::PointerButton::Extra1)
-        }) {
+        // Only Explore shows a folder; elsewhere going up would be invisible.
+        if self.tab == Tab::Explore
+            && ctx.input(|i| {
+                i.key_pressed(Key::Backspace)
+                    || i.pointer.button_pressed(egui::PointerButton::Extra1)
+            })
+        {
             actions.push(Action::Up);
         }
         for (key, tab) in [
@@ -703,7 +870,7 @@ impl RillApp {
             }
         }
         if self.tab == Tab::Explore {
-            let rows = treemap::sized_children(snapshot, self.zoom, self.allocated);
+            let rows = self.children_of_zoom(snapshot);
             let (up, down, enter) = ctx.input(|i| {
                 (
                     i.key_pressed(Key::ArrowUp),
@@ -711,16 +878,16 @@ impl RillApp {
                     i.key_pressed(Key::Enter) || i.key_pressed(Key::ArrowRight),
                 )
             });
-            let position = self
-                .selected
-                .and_then(|s| rows.iter().position(|r| r.0 as usize == s));
             if (up || down) && !rows.is_empty() {
+                let position = self
+                    .selected
+                    .and_then(|s| rows.iter().position(|&r| r as usize == s));
                 let next = match position {
                     None => 0,
                     Some(p) if up => p.saturating_sub(1),
                     Some(p) => (p + 1).min(rows.len() - 1),
                 };
-                actions.push(Action::Select(rows[next].0 as usize));
+                actions.push(Action::Select(rows[next] as usize));
             }
             if ctx.input(|i| i.key_pressed(Key::ArrowLeft)) {
                 actions.push(Action::Up);
@@ -746,33 +913,30 @@ impl RillApp {
 
     // ------------------------------------------------------------- sidebar
 
+    /// The folder actually displayed, including results retained during a rescan.
+    fn viewing_path(&self) -> String {
+        if let Some(data) = &self.data
+            && (self.running.is_none() || self.rescanning())
+        {
+            return data.snapshot.path(self.zoom).display().to_string();
+        }
+        self.running
+            .as_ref()
+            .map_or_else(String::new, |running| running.root.clone())
+    }
+
     fn sidebar(&mut self, ui: &mut Ui) -> Vec<Action> {
         let mut actions = Vec::new();
         let th = t();
-        let root = self
-            .running
-            .as_ref()
-            .map(|r| r.root.clone())
-            .or_else(|| {
-                self.data
-                    .as_ref()
-                    .map(|d| d.snapshot.summary.root.display().to_string())
-            })
-            .unwrap_or_default()
-            .to_lowercase();
-        // What the main area shows, to highlight the matching drive or place.
-        let viewing = match (&self.data, &self.running) {
-            (_, Some(running)) => running.root.to_lowercase(),
-            (Some(data), None) => data
-                .snapshot
-                .path(self.zoom)
-                .display()
-                .to_string()
-                .to_lowercase(),
-            (None, None) => String::new(),
-        };
-        let viewing = viewing.trim_end_matches(['\\', '/']).to_string();
-        let _ = &root;
+        // What the main area shows: the closest drive or place containing it is lit.
+        let viewing = self.viewing_path();
+        let located = self
+            .volumes
+            .iter()
+            .map(|v| v.root.display().to_string())
+            .chain(self.places.iter().map(|(_, _, path)| path.clone()))
+            .filter(|path| !viewing.is_empty() && covers(path, &viewing))
+            .max_by_key(|path| path.trim_end_matches(['\\', '/']).len());
         ui.horizontal(|ui| {
             let (rect, _) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::hover());
             logo(ui.painter(), rect);
@@ -791,90 +955,100 @@ impl RillApp {
             });
         });
         ui.add_space(20.0);
-        w::section_label(ui, "Drives");
-        ui.add_space(2.0);
-        for volume in &self.volumes {
-            let letter = volume.root.display().to_string();
-            let active = viewing == letter.to_lowercase().trim_end_matches(['\\', '/']);
-            let (rect, response) =
-                ui.allocate_exact_size(vec2(ui.available_width(), 50.0), Sense::click());
-            let p = ui.painter();
-            w::row_fill(p, rect, response.hovered(), active);
-            let tile = Rect::from_min_size(rect.left_top() + vec2(8.0, 10.0), vec2(30.0, 30.0));
-            p.rect_filled(
-                tile,
-                9,
-                style::alpha(th.accent, if th.dark { 50 } else { 34 }),
-            );
-            icons::paint(p, tile.shrink(7.0), Icon::Drive, th.accent);
-            let label = if volume.label.is_empty() {
-                "Local Disk"
-            } else {
-                &volume.label
-            };
-            let text_left = tile.right() + 10.0;
-            let width = rect.right() - text_left - 8.0;
-            let name = w::fit(
-                p,
-                format!("{label} ({})", letter.trim_end_matches('\\')),
-                style::semibold(13.0),
-                th.text,
-                width,
-            );
-            p.galley(pos2(text_left, rect.top() + 8.0), name, th.text);
-            let used = volume.total_bytes.saturating_sub(volume.free_bytes);
-            let share = used as f32 / volume.total_bytes.max(1) as f32;
-            p.text(
-                pos2(text_left, rect.top() + 26.0),
-                Align2::LEFT_TOP,
-                format!("{} free", style::bytes(volume.free_bytes)),
-                style::regular(11.0),
-                th.faint,
-            );
-            let bar = Rect::from_min_size(pos2(text_left, rect.bottom() - 7.0), vec2(width, 3.0));
-            w::progress(p, bar, share, usage_color(share));
-            if response
-                .on_hover_text(format!(
-                    "{} used of {} · {}\nClick to open",
-                    style::bytes(used),
-                    style::bytes(volume.total_bytes),
-                    volume.filesystem
-                ))
-                .clicked()
-            {
-                actions.push(Action::Open(letter));
-            }
-        }
-        ui.add_space(16.0);
-        w::section_label(ui, "Places");
-        ui.add_space(2.0);
-        for (i, (name, icon, path)) in self.places.iter().enumerate() {
-            let active = viewing == path.to_lowercase();
-            let row = place_row(
-                ui,
-                *icon,
-                name,
-                active,
-                Some(style::chart(i as f32 / 5.0, 0)),
-            )
-            .on_hover_text(format!("{path}\nRight-click to scan only this folder"));
-            if row.clicked() {
-                actions.push(Action::Open(path.clone()));
-            }
-            row.context_menu(|ui| {
-                if ui.button("Scan only this folder").clicked() {
-                    actions.push(Action::Scan(path.clone()));
-                    ui.close();
+        // Settings and the status lines below stay put however many drives there are.
+        let footer_height = 96.0;
+        egui::ScrollArea::vertical()
+            .id_salt("sidebar-places")
+            .max_height((ui.available_height() - footer_height).max(0.0))
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                w::section_label(ui, "Drives");
+                ui.add_space(2.0);
+                for volume in &self.volumes {
+                    let letter = volume.root.display().to_string();
+                    let active = located.as_deref() == Some(letter.as_str());
+                    let (rect, response) =
+                        ui.allocate_exact_size(vec2(ui.available_width(), 50.0), Sense::click());
+                    let p = ui.painter();
+                    w::row_fill(p, rect, response.hovered(), active);
+                    let tile =
+                        Rect::from_min_size(rect.left_top() + vec2(8.0, 10.0), vec2(30.0, 30.0));
+                    p.rect_filled(
+                        tile,
+                        9,
+                        style::alpha(th.accent, if th.dark { 50 } else { 34 }),
+                    );
+                    icons::paint(p, tile.shrink(7.0), Icon::Drive, th.accent);
+                    let label = if volume.label.is_empty() {
+                        "Local Disk"
+                    } else {
+                        &volume.label
+                    };
+                    let text_left = tile.right() + 10.0;
+                    let width = rect.right() - text_left - 8.0;
+                    let name = w::fit(
+                        p,
+                        format!("{label} ({})", letter.trim_end_matches('\\')),
+                        style::semibold(13.0),
+                        th.text,
+                        width,
+                    );
+                    p.galley(pos2(text_left, rect.top() + 8.0), name, th.text);
+                    let used = volume.total_bytes.saturating_sub(volume.free_bytes);
+                    let share = used as f32 / volume.total_bytes.max(1) as f32;
+                    p.text(
+                        pos2(text_left, rect.top() + 26.0),
+                        Align2::LEFT_TOP,
+                        format!("{} free", style::bytes(volume.free_bytes)),
+                        style::regular(11.0),
+                        th.faint,
+                    );
+                    let bar =
+                        Rect::from_min_size(pos2(text_left, rect.bottom() - 7.0), vec2(width, 3.0));
+                    w::progress(p, bar, share, usage_color(share));
+                    if response
+                        .on_hover_text(format!(
+                            "{} used of {} · {}\nClick to open",
+                            style::bytes(used),
+                            style::bytes(volume.total_bytes),
+                            volume.filesystem
+                        ))
+                        .clicked()
+                    {
+                        actions.push(Action::Open(letter));
+                    }
+                }
+                ui.add_space(16.0);
+                w::section_label(ui, "Places");
+                ui.add_space(2.0);
+                for (i, (name, icon, path)) in self.places.iter().enumerate() {
+                    let active = located.as_deref() == Some(path.as_str());
+                    let row = place_row(
+                        ui,
+                        *icon,
+                        name,
+                        active,
+                        Some(style::chart(i as f32 / 5.0, 0)),
+                    )
+                    .on_hover_text(format!("{path}\nRight-click to scan only this folder"));
+                    if row.clicked() {
+                        actions.push(Action::Open(path.clone()));
+                    }
+                    row.context_menu(|ui| {
+                        if ui.button("Scan only this folder").clicked() {
+                            actions.push(Action::Scan(path.clone()));
+                            ui.close();
+                        }
+                    });
+                }
+                if place_row(ui, Icon::Folder, "Choose folder…", false, None)
+                    .on_hover_text("Ctrl+O")
+                    .clicked()
+                    && let Some(folder) = rfd::FileDialog::new().pick_folder()
+                {
+                    actions.push(Action::Scan(folder.display().to_string()));
                 }
             });
-        }
-        if place_row(ui, Icon::Folder, "Choose folder…", false, None)
-            .on_hover_text("Ctrl+O")
-            .clicked()
-            && let Some(folder) = rfd::FileDialog::new().pick_folder()
-        {
-            actions.push(Action::Scan(folder.display().to_string()));
-        }
         ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
@@ -883,33 +1057,7 @@ impl RillApp {
                         .font(style::regular(11.0))
                         .color(th.faint),
                 );
-                let busy = self.update_check.is_some();
-                let link = settings_page::link(
-                    ui,
-                    if busy { "checking…" } else { "check for updates" },
-                );
-                if link.clicked() && !busy {
-                    actions.push(Action::CheckUpdates);
-                }
-                link.on_hover_text("Right-click for update settings")
-                    .context_menu(|ui| {
-                        let mut automatic = update::automatic_checks();
-                        if ui
-                            .checkbox(&mut automatic, "Check once a day on startup")
-                            .changed()
-                        {
-                            let _ = update::set_automatic_checks(automatic);
-                        }
-                        ui.label(
-                            RichText::new("Only asks GitHub for the latest version. Set RILLDISK_NO_UPDATE_CHECK=1 to turn checks off.")
-                                .font(style::regular(11.0))
-                                .color(th.faint),
-                        );
-                    });
             });
-            if let Some(action) = self.update_card(ui) {
-                actions.push(action);
-            }
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 let (dot, _) = ui.allocate_exact_size(vec2(8.0, 14.0), Sense::hover());
@@ -921,9 +1069,7 @@ impl RillApp {
                 );
             });
             ui.add_space(8.0);
-            if place_row(ui, Icon::Gear, "Settings", self.settings_open, None)
-                .clicked()
-            {
+            if place_row(ui, Icon::Gear, "Settings", self.settings_open, None).clicked() {
                 actions.push(Action::Settings(!self.settings_open));
             }
         });
@@ -939,36 +1085,6 @@ impl RillApp {
         ui.horizontal(|ui| {
             ui.set_height(34.0);
             ui.spacing_mut().item_spacing.x = 2.0;
-            // Only Explore is scoped to a folder; elsewhere the root is shown.
-            let zoom = if self.tab == Tab::Explore { self.zoom } else { 0 };
-            ui.add_enabled_ui(zoom != 0, |ui| {
-                if w::icon_button(ui, Icon::Back, "Up one level (Backspace)").clicked() {
-                    actions.push(Action::Up);
-                }
-            });
-            ui.add_space(4.0);
-            let chain = ancestors(snapshot, zoom);
-            let n = chain.len();
-            for (i, &id) in chain.iter().enumerate() {
-                if n > 5 && i > 0 && i < n - 3 {
-                    if i == 1 {
-                        crumb_separator(ui);
-                        ui.label(RichText::new("…").color(th.faint));
-                    }
-                    continue;
-                }
-                if i > 0 {
-                    crumb_separator(ui);
-                }
-                let name = if id == 0 {
-                    snapshot.summary.root.display().to_string()
-                } else {
-                    snapshot.name(id).into_owned()
-                };
-                if crumb(ui, &name, i == n - 1).clicked() {
-                    actions.push(Action::Zoom(id));
-                }
-            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 let root = snapshot.summary.root.display().to_string();
@@ -1009,7 +1125,7 @@ impl RillApp {
                     ("Stopped early · partial".to_string(), th.warn)
                 } else {
                     (
-                        format!("Partial · {} issues", style::count(s.issue_count)),
+                        format!("Partial · {}", style::plural(s.issue_count, "issue")),
                         th.warn,
                     )
                 };
@@ -1040,6 +1156,14 @@ impl RillApp {
                 let scanning = self.running.is_some();
                 self.elevate
                     .header(ui, s, scanning, self.tab != Tab::Issues);
+                // The scan root takes the room the controls leave.
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    let root = s.root.display().to_string();
+                    let font = style::semibold(15.0);
+                    let text = nav::fit_path(ui, &root, font.clone(), ui.available_width() - 12.0);
+                    ui.label(RichText::new(text).font(font).color(th.text))
+                        .on_hover_text(root);
+                });
             });
         });
         let s = &snapshot.summary;
@@ -1105,14 +1229,7 @@ impl RillApp {
     fn main(&mut self, ui: &mut Ui) -> Vec<Action> {
         let mut actions = Vec::new();
         // A scan of something the current results do not show: draw it live.
-        let rescan = match (&self.data, &self.running) {
-            (Some(data), Some(running)) => same_path(
-                &data.snapshot.summary.root.display().to_string(),
-                &running.root,
-            ),
-            _ => false,
-        };
-        if self.running.is_some() && !rescan {
+        if self.running.is_some() && !self.rescanning() {
             return self.live_dashboard(ui);
         }
         let Some(data) = self.data.clone() else {
@@ -1182,7 +1299,7 @@ impl RillApp {
             bytes: control.bytes.load(Ordering::Relaxed),
             seconds: running.started.elapsed().as_secs_f64(),
         };
-        let view = control.live();
+        let view = running.live();
         ui.horizontal(|ui| {
             ui.set_height(34.0);
             let (rect, _) = ui.allocate_exact_size(vec2(20.0, 20.0), Sense::hover());
@@ -1221,53 +1338,46 @@ impl RillApp {
             });
         });
         ui.add_space(4.0);
-        if view.is_some() {
-            ui.horizontal_wrapped(|ui| {
-                let parent = live::parent(view.as_deref(), control.live_focus());
-                let go_up = ui
-                    .add_enabled(parent.is_some(), egui::Button::new("← Parent"))
-                    .clicked()
-                    || (parent.is_some()
-                        && !ui.ctx().egui_wants_keyboard_input()
-                        && ui.input(|i| {
-                            i.key_pressed(Key::Backspace)
-                                || i.pointer.button_pressed(egui::PointerButton::Extra1)
-                        }));
-                if go_up {
-                    control.focus_live(parent.unwrap_or(0));
-                    self.live_anim.reset();
-                }
-                if crumb(ui, &root, false).clicked() {
-                    control.focus_live(0);
-                    self.live_anim.reset();
-                }
-                let chain = view
-                    .as_ref()
-                    .map(|v| v.ancestors.as_slice())
-                    .unwrap_or_default();
-                for (index, (id, name)) in chain.iter().enumerate() {
-                    if chain.len() > 3 && index < chain.len() - 2 {
-                        if index == 0 {
-                            crumb_separator(ui);
-                            ui.menu_button("…", |ui| {
-                                for (id, name) in &chain[..chain.len() - 2] {
-                                    if ui.button(name).clicked() {
-                                        control.focus_live(*id);
-                                        self.live_anim.reset();
-                                        ui.close();
-                                    }
-                                }
-                            });
-                        }
-                        continue;
-                    }
-                    crumb_separator(ui);
-                    if crumb(ui, name, index == chain.len() - 1).clicked() {
-                        control.focus_live(*id);
-                        self.live_anim.reset();
-                    }
-                }
-            });
+        let places = view
+            .as_deref()
+            .map_or_else(Vec::new, |view| live::location(&root, view, self.allocated));
+        if let Some(view) = &view {
+            let focus = control.live_focus();
+            let parent = live::parent(Some(view), focus);
+            let status = if live::caught_up(view, focus) {
+                format!("{} so far", style::bytes(live::total(view, self.allocated)))
+            } else {
+                "Opening folder…".to_string()
+            };
+            let go = nav::location_bar(ui, &places, parent.is_some(), &status);
+            let keys_go_up = !ui.ctx().egui_wants_keyboard_input()
+                && ui.input(|i| {
+                    i.key_pressed(Key::Backspace)
+                        || i.key_pressed(Key::ArrowLeft)
+                        || i.pointer.button_pressed(egui::PointerButton::Extra1)
+                });
+            let target = match (go, parent) {
+                (Some(nav::Go::To(id)), _) => Some(id),
+                (Some(nav::Go::Parent), parent) => parent,
+                (None, parent) if keys_go_up => parent,
+                (None, _) => None,
+            };
+            let keyboard = if !ui.ctx().egui_wants_keyboard_input() && live::caught_up(view, focus)
+            {
+                let (up, down, enter) = ui.input(|i| {
+                    (
+                        i.key_pressed(Key::ArrowUp),
+                        i.key_pressed(Key::ArrowDown),
+                        i.key_pressed(Key::Enter) || i.key_pressed(Key::ArrowRight),
+                    )
+                });
+                self.live_anim.keyboard(view, up, down, enter)
+            } else {
+                None
+            };
+            if let Some(id) = target.or(keyboard) {
+                self.live_anim.open(&control, id, Some(view));
+            }
         }
         ui.label(RichText::new(control.backend_status()).small().color(th.dim))
             .on_hover_text("Auto uses the fast MFT backend for whole NTFS volumes when existing administrator access permits it. Other paths use a directory walk. Standard-access whole-drive scans may be much slower; restart as administrator from Settings before scanning if desired.");
@@ -1286,16 +1396,16 @@ impl RillApp {
             ui,
             area,
             view.as_deref(),
+            &places,
             &mut self.live_anim,
             self.allocated,
         ) {
-            control.focus_live(id);
-            self.live_anim.reset();
+            self.live_anim.open(&control, id, view.as_deref());
         }
         ui.painter().text(
             egui::pos2(full.left() + 4.0, full.bottom() - 4.0),
             Align2::LEFT_BOTTOM,
-            if view.is_some() { "Partial sizes grow as folders are read. Click folders to browse; Parent or Backspace goes up. On disk is file allocation, not volume used space." } else { "Reading metadata. MFT scans publish folders after table processing; directory scans publish as batches arrive." },
+            if view.is_some() { "Partial sizes grow as folders are read. Click folders to browse; Parent, Backspace or Left goes up. On disk is file allocation, not volume used space." } else { "Reading metadata. MFT scans publish folders after table processing; directory scans publish as batches arrive." },
             style::regular(11.5),
             th.faint,
         );
@@ -1825,21 +1935,26 @@ impl RillApp {
     fn explore(&mut self, ui: &mut Ui, data: &Data) -> Vec<Action> {
         let mut actions = Vec::new();
         let th = t();
+        let snapshot = &data.snapshot;
+        let status = if self.size_unknown(snapshot, self.zoom) {
+            "Size unknown".to_string()
+        } else {
+            format!(
+                "{} · {}",
+                self.size_text(snapshot, self.zoom),
+                style::plural(snapshot.entries[self.zoom].file_count, "file")
+            )
+        };
+        let places = self.location(snapshot, self.zoom);
+        match nav::location_bar(ui, &places, self.zoom != 0, &status) {
+            Some(nav::Go::Parent) => actions.push(Action::Up),
+            Some(nav::Go::To(id)) => actions.push(Action::Zoom(id)),
+            None => {}
+        }
+        ui.add_space(8.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
             self.chart_controls(ui);
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let snapshot = &data.snapshot;
-                let entry = &snapshot.entries[self.zoom];
-                ui.label(
-                    RichText::new(format!(
-                        "{} · {}",
-                        style::bytes(self.size(snapshot, self.zoom)),
-                        style::plural(entry.file_count, "file")
-                    ))
-                    .color(th.dim),
-                );
-            });
         });
         ui.add_space(12.0);
         let full = ui.available_rect_before_wrap();
@@ -1850,7 +1965,7 @@ impl RillApp {
         let panel_rect = Rect::from_min_max(pos2(chart_rect.right() + 14.0, full.top()), full.max);
         ui.painter().rect_filled(chart_rect, 16, th.card);
         actions.extend(self.chart_area(ui, data, chart_rect.shrink(10.0), chart_rect));
-        actions.extend(self.side_panel(ui, data, panel_rect, th.card));
+        actions.extend(self.side_panel(ui, data, &places, panel_rect, th.card));
         actions
     }
 
@@ -1972,7 +2087,7 @@ impl RillApp {
                     painter.text(
                         inner.center(),
                         Align2::CENTER_CENTER,
-                        "Nothing with a size here",
+                        nothing_to_draw(snapshot, self.zoom),
                         style::regular(14.0),
                         th.faint,
                     );
@@ -2055,14 +2170,26 @@ impl RillApp {
                     -TAU / 4.0 + TAU * share,
                     th.accent,
                 );
-                w::big_bytes(
-                    &painter,
-                    rings.center + vec2(0.0, -6.0),
-                    Align2::CENTER_CENTER,
-                    focus_size,
-                    (rings.inner * 0.3).clamp(16.0, 28.0),
-                    th.text,
-                );
+                let number = rings.center + vec2(0.0, -6.0);
+                let number_size = (rings.inner * 0.3).clamp(16.0, 28.0);
+                if self.size_unknown(snapshot, focus) {
+                    painter.text(
+                        number,
+                        Align2::CENTER_CENTER,
+                        "unknown",
+                        style::semibold(number_size * 0.7),
+                        th.dim,
+                    );
+                } else {
+                    w::big_bytes(
+                        &painter,
+                        number,
+                        Align2::CENTER_CENTER,
+                        focus_size,
+                        number_size,
+                        th.text,
+                    );
+                }
                 let label = if focus == 0 {
                     snapshot.summary.root.display().to_string()
                 } else {
@@ -2093,7 +2220,7 @@ impl RillApp {
                     painter.text(
                         inner.center() + vec2(0.0, rings.outer() * 0.6),
                         Align2::CENTER_CENTER,
-                        "Nothing with a size here",
+                        nothing_to_draw(snapshot, self.zoom),
                         style::regular(14.0),
                         th.faint,
                     );
@@ -2118,60 +2245,29 @@ impl RillApp {
         actions
     }
 
-    /// Contents of the hovered folder (or the shown one), like a Finder column.
-    fn side_panel(&mut self, ui: &mut Ui, data: &Data, rect: Rect, fill: Color32) -> Vec<Action> {
+    /// The folder tree around the shown folder. It always lists the shown folder, so
+    /// rows do not change under the pointer on its way across the chart.
+    fn side_panel(
+        &mut self,
+        ui: &mut Ui,
+        data: &Data,
+        places: &[nav::Place],
+        rect: Rect,
+        fill: Color32,
+    ) -> Vec<Action> {
         let mut actions = Vec::new();
         let th = t();
         let snapshot = &data.snapshot;
         ui.painter().rect_filled(rect, 16, fill);
-        let focus = match self.hovered {
-            Some(id) if snapshot.entries[id].kind == EntryKind::Directory => id,
-            Some(id) => snapshot.entries[id].parent_id.unwrap_or(self.zoom),
-            None => self.zoom,
-        };
         let inner = rect.shrink(18.0);
         let p = ui.painter().clone();
-        let size = self.size(snapshot, focus);
-        let size_rect = w::big_bytes(
-            &p,
-            inner.right_top(),
-            Align2::RIGHT_TOP,
-            size,
-            22.0,
-            th.text,
-        );
-        let title = if focus == 0 {
-            snapshot.summary.root.display().to_string()
-        } else {
-            snapshot.name(focus).into_owned()
-        };
-        let galley = w::fit(
-            &p,
-            title,
-            style::semibold(19.0),
-            th.text,
-            inner.width() - size_rect.width() - 12.0,
-        );
-        p.galley(inner.left_top(), galley, th.text);
-        let children = treemap::sized_children(snapshot, focus, self.allocated);
-        let entry = &snapshot.entries[focus];
-        p.text(
-            inner.left_top() + vec2(0.0, 30.0),
-            Align2::LEFT_TOP,
-            format!(
-                "{} · {}",
-                style::plural(entry.file_count, "file"),
-                style::plural(snapshot.children(focus).len() as u64, "item")
-            ),
-            style::regular(12.0),
-            th.faint,
-        );
+        let rows = self.children_of_zoom(snapshot);
+        let entry = &snapshot.entries[self.zoom];
         let footer_h = 58.0;
-        let list = Rect::from_min_max(
-            pos2(rect.left() + 8.0, inner.top() + 56.0),
-            pos2(rect.right() - 8.0, rect.bottom() - footer_h),
+        let body = Rect::from_min_max(
+            pos2(rect.left() + 6.0, rect.top() + 8.0),
+            pos2(rect.right() - 6.0, rect.bottom() - footer_h),
         );
-        let mut child = ui.new_child(UiBuilder::new().max_rect(list));
         let colors: HashMap<u32, Color32> = match self.chart {
             Chart::Map => self.map.tiles.iter().map(|t| (t.id, t.color)).collect(),
             Chart::Rings => self
@@ -2181,86 +2277,83 @@ impl RillApp {
                 .map(|s| (s.id, s.color))
                 .collect(),
         };
-        let mut row_hover = None;
-        let candidate_of = &data.candidate_of;
-        egui::ScrollArea::vertical()
-            .id_salt(("side", focus))
-            .auto_shrink(false)
-            .show_rows(&mut child, 36.0, children.len(), |ui, range| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                for &(id, bytes) in &children[range] {
-                    let id = id as usize;
-                    let (row, response) =
-                        ui.allocate_exact_size(vec2(ui.available_width(), 36.0), Sense::click());
-                    let p = ui.painter();
-                    let selected = self.selected == Some(id);
-                    w::row_fill(
-                        p,
-                        row.shrink2(vec2(2.0, 1.0)),
-                        response.hovered() || self.hovered == Some(id),
-                        selected,
-                    );
-                    if response.hovered() {
-                        row_hover = Some(id);
-                    }
-                    let is_dir = snapshot.entries[id].kind == EntryKind::Directory;
-                    let color = colors.get(&(id as u32)).copied().unwrap_or(th.faint);
-                    let dot = pos2(row.left() + 18.0, row.center().y);
-                    if is_dir {
-                        p.circle_filled(dot, 5.0, color);
-                    } else {
-                        p.circle_stroke(dot, 4.0, Stroke::new(2.0, color));
-                    }
-                    let size_text = style::bytes(bytes as u64);
-                    let name_w = row.width() - 120.0;
-                    let mut name_x = row.left() + 34.0;
-                    let name = w::fit(
-                        p,
-                        snapshot.name(id).into_owned(),
-                        style::regular(13.0),
-                        th.text,
-                        name_w,
-                    );
-                    let name_size = name.size().x;
-                    p.galley(
-                        pos2(name_x, row.center().y - name.size().y / 2.0),
-                        name,
-                        th.text,
-                    );
-                    name_x += name_size + 8.0;
-                    if let Some(&c) = candidate_of.get(&id) {
-                        let color = style::safety_color(data.reclaim.candidates[c].safety);
-                        if name_x + 10.0 < row.right() - 90.0 {
-                            p.circle_filled(pos2(name_x, row.center().y), 3.0, color);
-                        }
-                    }
-                    p.text(
-                        pos2(row.right() - 12.0, row.center().y),
-                        Align2::RIGHT_CENTER,
-                        size_text,
-                        style::semibold(12.5),
-                        th.text,
-                    );
-                    if response.clicked() {
-                        if is_dir {
-                            actions.push(Action::Zoom(id));
-                        } else {
-                            actions.push(Action::Select(id));
-                        }
-                    }
-                    response.context_menu(|ui| entry_menu(ui, snapshot, id, &mut actions));
-                }
-            });
-        if children.is_empty() {
-            p.text(
-                list.center_top() + vec2(0.0, 30.0),
-                Align2::CENTER_TOP,
-                "Empty",
-                style::regular(13.0),
-                th.faint,
-            );
+        let parent_of = |at: usize| snapshot.entries[at].parent_id;
+        let issues = snapshot.summary.issue_count > 0;
+        let notice = (!entry.fully_listed).then(|| nav::Notice {
+            text: if issues {
+                "Not fully read, so sizes here are partial. See Issues".to_string()
+            } else {
+                "Not fully read, so sizes here are partial".to_string()
+            },
+            action: issues,
+        });
+        let spec = nav::Panel {
+            places,
+            summary: if self.size_unknown(snapshot, self.zoom) && rows.is_empty() {
+                "Contents unknown".to_string()
+            } else {
+                format!(
+                    "{} · {}",
+                    style::plural(entry.file_count, "file"),
+                    style::plural(rows.len() as u64, "item")
+                )
+            },
+            notice,
+            rows: rows.len(),
+            empty: if entry.fully_listed {
+                "This folder is empty"
+            } else {
+                "Nothing could be listed here"
+            },
+            selected: self.selected,
+            hovered: self
+                .hovered
+                .and_then(|id| nav::child_under(parent_of, id, self.zoom)),
+            reveal: self
+                .reveal
+                .take()
+                .and_then(|id| rows.iter().position(|&r| r as usize == id)),
+        };
+        let row = |index: usize| {
+            let id = rows[index] as usize;
+            let child = &snapshot.entries[id];
+            let path = snapshot.path(id).display().to_string();
+            let folder = child.kind == EntryKind::Directory;
+            nav::Row {
+                id,
+                name: snapshot.name(id).into_owned(),
+                size: self.size_text(snapshot, id),
+                folder,
+                dot: colors.get(&(id as u32)).copied().unwrap_or(th.faint),
+                mark: data
+                    .candidate_of
+                    .get(&id)
+                    .map(|&c| style::safety_color(data.reclaim.candidates[c].safety)),
+                partial: !child.fully_listed,
+                tip: if folder {
+                    format!("{path}\nClick to open · right-click for more")
+                } else {
+                    format!("{path}\nRight-click for more")
+                },
+            }
+        };
+        let mut menus = Vec::new();
+        let result = nav::panel(ui, body, spec, row, |response, row| {
+            response.context_menu(|ui| entry_menu(ui, snapshot, row.id, &mut menus));
+        });
+        actions.append(&mut menus);
+        self.list_hover = result.hovered;
+        if let Some(id) = result.go {
+            actions.push(Action::Zoom(id));
         }
-        self.list_hover = row_hover;
+        match result.clicked {
+            Some((id, true)) => actions.push(Action::Zoom(id)),
+            Some((id, false)) => actions.push(Action::Select(id)),
+            None => {}
+        }
+        if result.notice_clicked {
+            actions.push(Action::Tab(Tab::Issues));
+        }
         // Footer: path and a copy button.
         let footer = Rect::from_min_max(
             pos2(inner.left(), rect.bottom() - footer_h + 8.0),
@@ -2274,7 +2367,7 @@ impl RillApp {
             Stroke::new(1.0, style::alpha(th.faint, 50)),
         );
         let path = snapshot
-            .path(self.selected.unwrap_or(focus))
+            .path(self.selected.unwrap_or(self.zoom))
             .display()
             .to_string();
         let mut row = ui.new_child(
@@ -2285,10 +2378,12 @@ impl RillApp {
         if w::icon_button(&mut row, Icon::Copy, "Copy path (Ctrl+C)").clicked() {
             actions.push(Action::Copy(path.clone(), "path"));
         }
-        let galley = w::fit(&p, path, style::mono(11.5), th.faint, footer.width() - 40.0);
-        p.galley(
-            pos2(footer.left(), footer.center().y - galley.size().y / 2.0),
-            galley,
+        let shown = nav::fit_path(&row, &path, style::mono(11.5), footer.width() - 40.0);
+        p.text(
+            pos2(footer.left(), footer.center().y),
+            Align2::LEFT_CENTER,
+            shown,
+            style::mono(11.5),
             th.faint,
         );
         actions
@@ -3097,9 +3192,6 @@ impl RillApp {
                     });
                     ui.add_space(18.0);
                     crate::assistants::panel(ui, &mut self.assistants, width);
-                    if let Some(action) = self.update_card(ui) {
-                        actions.push(action);
-                    }
                     ui.add_space(24.0);
                     ui.vertical_centered(|ui| {
                         ui.label(
@@ -3119,112 +3211,132 @@ impl RillApp {
         actions
     }
 
-    /// Offer for a newer release; nothing installs until the user clicks.
-    fn update_card(&self, ui: &mut Ui) -> Option<Action> {
-        let th = t();
-        let mut action = None;
-        if self.available.is_none() && self.update_error.is_none() {
-            return None;
-        }
-        ui.add_space(10.0);
-        Frame::new()
-            .fill(style::alpha(th.accent, if th.dark { 34 } else { 26 }))
-            .corner_radius(12)
-            .inner_margin(Margin::same(12))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                if let Some(error) = &self.update_error {
-                    ui.label(
-                        RichText::new("Update failed")
-                            .font(style::semibold(13.0))
-                            .color(th.danger),
-                    );
-                    ui.label(
-                        RichText::new(error)
-                            .font(style::regular(11.5))
-                            .color(th.dim),
-                    );
-                    return;
-                }
-                let Some(release) = &self.available else {
-                    return;
-                };
-                ui.label(
-                    RichText::new(format!("RillDisk {} is available", release.version))
-                        .font(style::semibold(13.0)),
+    /// The picture of the running scan, for scripted tours.
+    pub(crate) fn live_view(&self) -> Option<Arc<LiveView>> {
+        self.running.as_ref()?.live()
+    }
+
+    /// Show the live dashboard of `root` with scripted views: real scans of a
+    /// fixture finish before a recording can browse them. The sender keeps the
+    /// pretend scan running; `stop_scan_preview` ends it.
+    pub(crate) fn preview_scan(
+        &mut self,
+        root: &str,
+        views: HashMap<usize, Arc<LiveView>>,
+    ) -> mpsc::Sender<Result<Data, String>> {
+        let (tx, rx) = mpsc::channel();
+        self.live_anim.reset();
+        self.running = Some(Running {
+            control: Arc::new(ScanControl::default()),
+            root: root.to_string(),
+            started: Instant::now(),
+            rx,
+            preview: Some(views),
+        });
+        tx
+    }
+
+    pub(crate) fn scan_control(&self) -> Option<&ScanControl> {
+        self.running.as_ref().map(|running| &*running.control)
+    }
+
+    pub(crate) fn stop_scan_preview(&mut self) {
+        self.running = None;
+    }
+
+    pub(crate) fn preview_update(
+        &mut self,
+        preview: update::Preview,
+    ) -> Option<mpsc::Sender<Result<(), String>>> {
+        self.available = Some(update::preview_release());
+        self.update_error = None;
+        self.installing = None;
+        let (phase, done, total) = match preview {
+            update::Preview::Available => return None,
+            update::Preview::Downloading => (update::Phase::Downloading, 524288, 1048576),
+            update::Preview::UnknownLength => (update::Phase::Downloading, 524288, 0),
+            update::Preview::Verifying => (update::Phase::Verifying, 1048576, 1048576),
+            update::Preview::Permission => (update::Phase::WaitingPermission, 1048576, 1048576),
+            update::Preview::Declined => {
+                self.update_error = Some(
+                    "Administrator consent was declined (preview). Nothing was installed.".into(),
                 );
-                if let Some(install) = &self.installing {
-                    let (bar, _) =
-                        ui.allocate_exact_size(vec2(ui.available_width(), 6.0), Sense::hover());
-                    w::progress(
-                        ui.painter(),
-                        bar,
-                        install.progress().unwrap_or(0.05),
-                        th.accent,
-                    );
-                    ui.label(
-                        RichText::new("Downloading and verifying…")
-                            .font(style::regular(11.5))
-                            .color(th.dim),
-                    );
-                    return;
+                return None;
+            }
+            update::Preview::BadChecksum => {
+                self.update_error = Some(
+                    "Download checksum did not match (preview). Nothing was installed.".into(),
+                );
+                return None;
+            }
+        };
+        let (install, sender) = update::preview_install(phase, done, total);
+        self.installing = Some(install);
+        Some(sender)
+    }
+
+    pub(crate) fn updating(&self) -> bool {
+        self.installing.is_some()
+    }
+
+    /// Persistent update access, including the welcome screen.
+    fn update_bar(&self, ui: &mut Ui) -> Vec<Action> {
+        let mut actions = Vec::new();
+        let th = t();
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(concat!("RillDisk ", env!("CARGO_PKG_VERSION"))).small().color(th.dim));
+            ui.separator();
+            if let Some(install) = &self.installing {
+                ui.label(RichText::new(install.phase().label()).color(th.accent));
+                let (received, total) = install.bytes();
+                let (bar, _) = ui.allocate_exact_size(vec2(220.0, 6.0), Sense::hover());
+                if let Some(progress) = install.progress() {
+                    w::progress(ui.painter(), bar, progress, th.accent);
+                    ui.label(format!("{:.0}% | {} / {}", progress.clamp(0.0, 1.0) * 100.0, style::bytes(received), style::bytes(total)));
+                } else {
+                    live::sweep(ui.painter(), bar, ui.input(|i| i.time), th.accent);
+                    if received > 0 { ui.label(format!("{} received", style::bytes(received))); }
                 }
-                if let Some(reason) = &release.blocked {
-                    ui.label(
-                        RichText::new(reason)
-                            .font(style::regular(11.5))
-                            .color(th.dim),
-                    );
-                    if w::button(ui, Kind::Soft, None, "Open the release page").clicked() {
-                        ui.ctx()
-                            .open_url(egui::OpenUrl::new_tab(&release.notes_url));
-                    }
-                    return;
-                }
-                if let Some(command) = &release.update_command {
-                    let owner = release.managed_by.as_deref().unwrap_or("a package manager");
-                    ui.label(
-                        RichText::new(format!("Installed with {owner}. To update, {command}."))
-                            .font(style::regular(11.5))
-                            .color(th.dim),
-                    );
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        if let Some(url) = &release.download_url {
-                            let file = url.rsplit('/').next().unwrap_or(url);
-                            if w::button(ui, Kind::Primary, None, "Download")
-                                .on_hover_text(file)
-                                .clicked()
-                            {
-                                ui.ctx().open_url(egui::OpenUrl::new_tab(url));
-                            }
-                        }
-                        if w::button(ui, Kind::Ghost, None, "What's new").clicked() {
-                            ui.ctx()
-                                .open_url(egui::OpenUrl::new_tab(&release.notes_url));
-                        }
-                    });
-                    return;
-                }
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    if w::button(ui, Kind::Primary, None, "Install and restart")
-                        .on_hover_text(
-                            "Downloads the release, checks its SHA-256 and replaces both programs",
-                        )
-                        .clicked()
-                    {
-                        action = Some(Action::Install(Box::new(release.clone())));
-                    }
-                    if w::button(ui, Kind::Ghost, None, "What's new").clicked() {
-                        ui.ctx()
-                            .open_url(egui::OpenUrl::new_tab(&release.notes_url));
-                    }
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+                return;
+            }
+            if let Some(error) = &self.update_error {
+                ui.label(RichText::new("Update needs attention").color(th.danger)).on_hover_text(error);
+                ui.menu_button("Details", |ui| {
+                    ui.set_max_width(500.0);
+                    ui.label(error);
+                    if ui.button("Copy details").clicked() { ui.ctx().copy_text(error.clone()); }
                 });
-            });
-        action
+                if w::button(ui, Kind::Soft, None, "Retry").on_hover_text(error).clicked() {
+                    actions.push(match &self.available {
+                        Some(release) if release.blocked.is_none() && (release.update_command.is_none() || release.msi) => Action::Install(Box::new(release.clone())),
+                        _ => Action::CheckUpdates,
+                    });
+                }
+            } else if let Some(release) = &self.available {
+                ui.label(RichText::new(format!("Update {} available", release.version)).color(th.accent));
+                if release.blocked.is_none() && (release.update_command.is_none() || release.msi) {
+                    let allowed = self.running.is_none() && !self.cleanup.modal_open();
+                    let button = ui.add_enabled_ui(allowed, |ui| w::button(ui, Kind::Primary, None, "Update and restart")).inner;
+                    if self.tour.is_some() { ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("update-install-button"), button.rect)); }
+                    if button.on_disabled_hover_text("Finish the scan or cleanup before restarting")
+                        .on_hover_text(if release.msi { "Downloads and verifies the MSI, then asks Windows to install it. RillDisk restarts afterward." } else { "Downloads, verifies and replaces both programs, then restarts RillDisk." }).clicked() {
+                        actions.push(Action::Install(Box::new(release.clone())));
+                    }
+                } else {
+                    if let Some(url) = &release.download_url
+                        && w::button(ui, Kind::Soft, None, "Download package").clicked() { ui.ctx().open_url(egui::OpenUrl::new_tab(url)); }
+                    if let Some(reason) = release.blocked.as_ref().or(release.update_command.as_ref()) { ui.label(reason); }
+                }
+                if ui.link("What's new").clicked() { ui.ctx().open_url(egui::OpenUrl::new_tab(&release.notes_url)); }
+            } else {
+                if let Some(notice) = &self.update_notice { ui.label(RichText::new(notice).color(th.good)); }
+                let checking = self.update_check.is_some();
+                if checking { ui.spinner(); ui.label("Checking for updates..."); }
+                else if w::button(ui, Kind::Ghost, Some(Icon::Refresh), "Check for updates").clicked() { actions.push(Action::CheckUpdates); }
+            }
+        });
+        actions
     }
 
     fn paint_toast(&mut self, ctx: &egui::Context) {
@@ -3272,7 +3384,14 @@ impl eframe::App for RillApp {
         self.elevate.poll(&ctx);
         let title = match (&self.running, &self.data) {
             (Some(running), _) => format!("Scanning {} · RillDisk", running.root),
-            (None, Some(data)) => format!("{} · RillDisk", data.snapshot.path(self.zoom).display()),
+            (None, Some(data)) => {
+                let shown = if self.tab == Tab::Explore {
+                    self.zoom
+                } else {
+                    0
+                };
+                format!("{} · RillDisk", data.snapshot.path(shown).display())
+            }
             (None, None) => "RillDisk".to_string(),
         };
         if self.title != title {
@@ -3287,10 +3406,23 @@ impl eframe::App for RillApp {
         {
             self.dark = system == egui::Theme::Dark;
         }
+        let update_bar = egui::Panel::bottom("update-status")
+            .resizable(false)
+            .show_separator_line(true)
+            .frame(
+                Frame::new()
+                    .fill(th.sidebar)
+                    .inner_margin(Margin::symmetric(18, 10)),
+            )
+            .show(ui, |ui| self.update_bar(ui));
+        actions.extend(update_bar.inner);
         if self.data.is_none() && self.running.is_none() {
             let central = egui::CentralPanel::default()
                 .frame(Frame::new().fill(th.bg).inner_margin(Margin::same(24)))
                 .show(ui, |ui| {
+                    if self.installing.is_some() {
+                        ui.disable();
+                    }
                     if self.settings_open {
                         self.settings_page(ui)
                     } else {
@@ -3319,6 +3451,9 @@ impl eframe::App for RillApp {
                     bottom: 20,
                 }))
                 .show(ui, |ui| {
+                    if self.installing.is_some() {
+                        ui.disable();
+                    }
                     if self.settings_open {
                         self.settings_page(ui)
                     } else {
@@ -3452,6 +3587,15 @@ fn ancestors(snapshot: &Snapshot, id: usize) -> Vec<usize> {
     chain
 }
 
+/// Why a folder's chart is blank.
+fn nothing_to_draw(snapshot: &Snapshot, id: usize) -> &'static str {
+    if snapshot.entries[id].fully_listed {
+        "Nothing with a size here"
+    } else {
+        "This folder could not be fully read"
+    }
+}
+
 fn usage_color(share: f32) -> Color32 {
     let th = t();
     if share > 0.9 {
@@ -3551,38 +3695,6 @@ fn logo(p: &egui::Painter, rect: Rect) {
     p.rect_filled(r(0.60, 0.18, 0.82, 0.46), radius, stops[2]);
     p.rect_filled(r(0.60, 0.51, 0.82, 0.66), radius, stops[3]);
     p.rect_filled(r(0.60, 0.71, 0.82, 0.82), radius, stops[5]);
-}
-
-fn crumb(ui: &mut Ui, text: &str, last: bool) -> egui::Response {
-    let th = t();
-    let font = if last {
-        style::semibold(14.0)
-    } else {
-        style::regular(14.0)
-    };
-    let color = if last { th.text } else { th.dim };
-    let galley = w::fit(ui.painter(), text.to_string(), font, color, 280.0);
-    let (rect, response) =
-        ui.allocate_exact_size(vec2(galley.size().x + 14.0, 30.0), Sense::click());
-    if response.hovered() && !last {
-        ui.painter().rect_filled(rect, 8, th.hover);
-    }
-    ui.painter().galley(
-        pos2(rect.left() + 7.0, rect.center().y - galley.size().y / 2.0),
-        galley,
-        color,
-    );
-    response
-}
-
-fn crumb_separator(ui: &mut Ui) {
-    let (rect, _) = ui.allocate_exact_size(vec2(12.0, 30.0), Sense::hover());
-    icons::paint(
-        ui.painter(),
-        Rect::from_center_size(rect.center(), vec2(10.0, 10.0)),
-        Icon::Chevron,
-        t().faint,
-    );
 }
 
 fn place_row(
@@ -3840,7 +3952,556 @@ pub fn pointer_for(app: &RillApp, id: usize) -> Option<Pos2> {
 
 #[cfg(test)]
 mod tests {
-    use super::{covers, relative, same_path};
+    use super::{Data, RillApp, Tab, covers, nav, relative, same_path};
+    use eframe::{App, egui};
+    use rilldisk_core::{ScanControl, ScanOptions, Snapshot, scan};
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    /// The whole app, driven by the input events a window would deliver.
+    struct Driver {
+        ctx: egui::Context,
+        app: RillApp,
+        frame: eframe::Frame,
+        pointer: egui::Pos2,
+        root: PathBuf,
+        /// Widget names reported to assistive technology.
+        announced: Vec<String>,
+    }
+
+    /// A unique, empty folder holding the fixture and the unused capture directory.
+    fn workspace(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("rilldisk-nav-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // TEMP can use an 8.3 alias on Windows or a symlink on macOS. Match
+        // the canonical, familiar paths returned by the scanner.
+        rilldisk_core::simplify(dir.canonicalize().unwrap())
+    }
+
+    /// Projects/atlas-web/src/app.ts, a zero-byte file and an empty folder.
+    fn fixture(root: &Path) {
+        let web = root.join("Projects").join("atlas-web");
+        std::fs::create_dir_all(web.join("src")).unwrap();
+        std::fs::create_dir_all(web.join("empty-folder")).unwrap();
+        std::fs::write(web.join("src").join("app.ts"), vec![1; 4096]).unwrap();
+        std::fs::write(web.join("zero-bytes.txt"), b"").unwrap();
+        std::fs::write(root.join("notes.txt"), vec![1; 512]).unwrap();
+    }
+
+    impl Drop for Driver {
+        fn drop(&mut self) {
+            if let Some(workspace) = self.root.parent() {
+                let _ = std::fs::remove_dir_all(workspace);
+            }
+        }
+    }
+
+    fn snapshot(root: &Path) -> Snapshot {
+        scan(
+            root,
+            ScanOptions::default(),
+            Arc::new(ScanControl::default()),
+        )
+        .unwrap()
+    }
+
+    impl Driver {
+        fn new(name: &str) -> Self {
+            let dir = workspace(name);
+            let root = dir.join("home");
+            fixture(&root);
+            let mut driver = Self::empty(&dir, root.clone());
+            driver.app.path = root.display().to_string();
+            driver.app.install(Data::analyze(snapshot(&root)));
+            driver.app.tab = Tab::Explore;
+            driver.run(Vec::new());
+            driver
+        }
+
+        fn empty(dir: &Path, root: PathBuf) -> Self {
+            let ctx = egui::Context::default();
+            let cc = eframe::CreationContext::_new_kittest(ctx.clone());
+            // A tour keeps the app away from the network.
+            let tour = crate::capture::Tour::idle(dir.join("capture"));
+            let mut app = RillApp::new(&cc, None, Some(false), None, Some(tour));
+            app.allocated = false;
+            Self {
+                ctx,
+                app,
+                frame: eframe::Frame::_new_kittest(),
+                pointer: egui::pos2(5.0, 5.0),
+                root,
+                announced: Vec::new(),
+            }
+        }
+
+        fn run(&mut self, events: Vec<egui::Event>) {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1480.0, 920.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let (app, frame) = (&mut self.app, &mut self.frame);
+            let output = self.ctx.run_ui(input, |ui| app.ui(ui, frame));
+            for event in &output.platform_output.events {
+                if let egui::output::OutputEvent::Clicked(info) = event {
+                    self.announced.extend(info.label.clone());
+                }
+            }
+            output.drop_without_applying_deltas();
+        }
+
+        fn settle(&mut self) {
+            for _ in 0..3 {
+                self.run(Vec::new());
+            }
+        }
+
+        fn id(&self, path: &str) -> usize {
+            let data = self.app.data.as_ref().unwrap();
+            let target = self.root.join(path);
+            (0..data.snapshot.entries.len())
+                .find(|&id| data.snapshot.path(id) == target)
+                .unwrap_or_else(|| panic!("no entry for {path}"))
+        }
+
+        fn hits(&self, key: &str) -> Vec<(usize, egui::Rect)> {
+            self.ctx
+                .data(|d| d.get_temp(egui::Id::unique(key)))
+                .unwrap_or_default()
+        }
+
+        fn click_at(&mut self, pos: egui::Pos2) {
+            self.pointer = pos;
+            self.run(vec![egui::Event::PointerMoved(pos)]);
+            self.run(
+                [true, false]
+                    .map(|pressed| egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: Default::default(),
+                    })
+                    .to_vec(),
+            );
+            self.settle();
+        }
+
+        fn click_hit(&mut self, key: &str, id: usize) {
+            let rect = self
+                .hits(key)
+                .into_iter()
+                .find(|hit| hit.0 == id)
+                .unwrap_or_else(|| panic!("{key} does not show entry {id}"))
+                .1;
+            self.click_at(rect.center());
+        }
+
+        fn click_row(&mut self, path: &str) {
+            self.click_hit(nav::PANEL_HITS, self.id(path));
+        }
+
+        fn click_parent(&mut self) {
+            let rect: egui::Rect = self
+                .ctx
+                .data(|d| d.get_temp(egui::Id::unique(nav::PARENT_BUTTON)))
+                .unwrap();
+            self.click_at(rect.center());
+        }
+
+        fn press(&mut self, key: egui::Key) {
+            let event = |pressed| egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers: Default::default(),
+            };
+            self.run(vec![event(true), event(false)]);
+            self.settle();
+        }
+    }
+
+    #[test]
+    fn parent_row_breadcrumb_and_keys_walk_the_tree_and_mark_the_way_back() {
+        let mut d = Driver::new("walk");
+        let (projects, web) = (d.id("Projects"), d.id("Projects/atlas-web"));
+        d.click_row("Projects");
+        assert_eq!(d.app.zoom, projects);
+        d.click_row("Projects/atlas-web");
+        assert_eq!(d.app.zoom, web);
+        d.click_row("Projects/atlas-web/src");
+        assert_eq!(d.app.zoom, d.id("Projects/atlas-web/src"));
+
+        // Parent goes up exactly one level and marks the folder just left.
+        d.click_parent();
+        assert_eq!(d.app.zoom, web);
+        assert_eq!(d.app.selected, Some(d.id("Projects/atlas-web/src")));
+
+        // The breadcrumb jumps several levels; the branch taken stays marked.
+        d.click_hit(nav::CRUMB_HITS, 0);
+        assert_eq!(d.app.zoom, 0);
+        assert_eq!(d.app.selected, Some(projects));
+
+        // Enter opens the marked folder; Left and Backspace come back.
+        d.press(egui::Key::Enter);
+        assert_eq!(d.app.zoom, projects);
+        d.press(egui::Key::ArrowLeft);
+        assert_eq!(d.app.zoom, 0);
+        d.click_row("Projects");
+        d.press(egui::Key::Backspace);
+        assert_eq!(d.app.zoom, 0);
+
+        // The top of the scan is a floor, not an error.
+        d.press(egui::Key::Backspace);
+        d.click_parent();
+        assert_eq!(d.app.zoom, 0);
+    }
+
+    #[test]
+    fn rows_trail_and_breadcrumbs_are_named_for_assistive_technology() {
+        let mut d = Driver::new("names");
+        d.click_row("Projects");
+        d.click_row("Projects/atlas-web");
+        d.click_row("Projects/atlas-web/src");
+        let heard = |d: &Driver, text: &str| d.announced.iter().any(|l| l.starts_with(text));
+        assert!(
+            heard(&d, "atlas-web, "),
+            "rows state name and size: {:?}",
+            d.announced
+        );
+        d.click_row("Projects");
+        assert!(
+            d.announced.last().is_some_and(|l| l == "Projects"),
+            "trail row"
+        );
+        d.click_hit(nav::CRUMB_HITS, 0);
+        assert!(
+            d.announced.last().is_some_and(|l| l == "home"),
+            "breadcrumb"
+        );
+    }
+
+    #[test]
+    fn on_disk_order_is_largest_first_with_unknown_sizes_last() {
+        let dir = workspace("order");
+        let root = dir.join("home");
+        fixture(&root);
+        let mut d = Driver::empty(&dir, root.clone());
+        let mut scanned = snapshot(&root);
+        let path_of = |s: &Snapshot, name: &str| {
+            (0..s.entries.len())
+                .find(|&id| s.path(id).ends_with(name))
+                .unwrap()
+        };
+        let notes = path_of(&scanned, "notes.txt");
+        let projects = path_of(&scanned, "Projects");
+        scanned.entries[notes].allocated_bytes = Some(10);
+        scanned.entries[projects].allocated_bytes = None;
+        let hidden = scanned.children(0).len();
+        d.app.install(Data::analyze(scanned));
+        d.app.allocated = true;
+        let data = d.app.data.clone().unwrap();
+        let rows = d.app.children_of_zoom(&data.snapshot);
+        assert_eq!(rows.len(), hidden, "unknown sizes are listed, not dropped");
+        assert_eq!(rows.first().copied(), Some(notes as u32));
+        assert_eq!(rows.last().copied(), Some(projects as u32));
+    }
+
+    #[test]
+    fn the_trail_returns_to_any_ancestor() {
+        let mut d = Driver::new("trail");
+        d.click_row("Projects");
+        d.click_row("Projects/atlas-web");
+        d.click_row("Projects/atlas-web/src");
+        // Root and parent are trail rows of the panel; the current folder is not.
+        let trail = d.hits(nav::PANEL_HITS);
+        assert!(trail.iter().any(|hit| hit.0 == 0));
+        assert!(!trail.iter().any(|hit| hit.0 == d.app.zoom));
+        d.click_row("Projects");
+        assert_eq!(d.app.zoom, d.id("Projects"));
+    }
+
+    #[test]
+    fn hidden_levels_stay_reachable_from_the_trail_and_the_breadcrumb() {
+        let dir = workspace("levels");
+        let root = dir.join("home");
+        let chain = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"];
+        let deepest = chain
+            .iter()
+            .fold(root.clone(), |path, name| path.join(name));
+        std::fs::create_dir_all(&deepest).unwrap();
+        std::fs::write(deepest.join("x.bin"), vec![1; 64]).unwrap();
+        let mut d = Driver::empty(&dir, root.clone());
+        d.app.install(Data::analyze(snapshot(&root)));
+        d.app.tab = Tab::Explore;
+        d.settle();
+        let target = d.id("a/b/c/d/e");
+        d.app.zoom = d.id("a/b/c/d/e/f/g/h/i/j/k/l");
+        d.settle();
+
+        d.click_hit(nav::PANEL_HITS, nav::MORE_LEVELS);
+        d.click_hit(nav::PANEL_HITS, target);
+        assert_eq!(d.app.zoom, target, "the trail menu opens a hidden level");
+
+        d.app.zoom = d.id("a/b/c/d/e/f/g/h/i/j/k/l");
+        d.settle();
+        let crumbs = d.hits(nav::CRUMB_HITS);
+        if crumbs.iter().any(|hit| hit.0 == nav::MORE_LEVELS) {
+            d.click_hit(nav::CRUMB_HITS, nav::MORE_LEVELS);
+        }
+        d.click_hit(nav::CRUMB_HITS, target);
+        assert_eq!(d.app.zoom, target, "the breadcrumb reaches a hidden level");
+    }
+
+    #[test]
+    fn the_panel_keeps_the_shown_folder_while_the_pointer_crosses_the_chart() {
+        let mut d = Driver::new("hover");
+        d.click_row("Projects");
+        d.click_row("Projects/atlas-web");
+        let listed = |d: &Driver| {
+            let mut ids: Vec<usize> = d.hits(nav::PANEL_HITS).iter().map(|h| h.0).collect();
+            ids.sort_unstable();
+            ids
+        };
+        let before = listed(&d);
+        let src = d.id("Projects/atlas-web/src");
+        let tile = d
+            .app
+            .map
+            .tile_of(src)
+            .expect("src has a tile")
+            .rect
+            .center();
+        d.pointer = tile;
+        d.run(vec![egui::Event::PointerMoved(tile)]);
+        d.settle();
+        assert!(d.app.hovered.is_some(), "the pointer is on the chart");
+        assert_eq!(listed(&d), before);
+    }
+
+    #[test]
+    fn every_child_is_listed_and_reachable_including_zero_sized_ones() {
+        let mut d = Driver::new("zero");
+        d.click_row("Projects");
+        d.click_row("Projects/atlas-web");
+        let (empty, zero) = (
+            d.id("Projects/atlas-web/empty-folder"),
+            d.id("Projects/atlas-web/zero-bytes.txt"),
+        );
+        let hits = d.hits(nav::PANEL_HITS);
+        assert!(hits.iter().any(|hit| hit.0 == empty));
+        assert!(hits.iter().any(|hit| hit.0 == zero));
+        // Arrow keys walk the same list the panel shows.
+        for _ in 0..3 {
+            d.press(egui::Key::ArrowDown);
+        }
+        assert!(d.app.selected == Some(empty) || d.app.selected == Some(zero));
+        d.click_hit(nav::PANEL_HITS, zero);
+        assert_eq!(d.app.selected, Some(zero));
+        assert_eq!(
+            d.app.zoom,
+            d.id("Projects/atlas-web"),
+            "a file is not entered"
+        );
+        d.click_hit(nav::PANEL_HITS, empty);
+        assert_eq!(d.app.zoom, empty);
+        assert!(d.hits(nav::PANEL_HITS).iter().all(|hit| hit.0 != empty));
+    }
+
+    #[test]
+    fn going_up_is_only_possible_where_a_folder_is_shown() {
+        let mut d = Driver::new("tabs");
+        d.click_row("Projects");
+        let projects = d.app.zoom;
+        d.app.tab = Tab::Overview;
+        d.settle();
+        d.press(egui::Key::Backspace);
+        assert_eq!(
+            d.app.zoom, projects,
+            "Overview must not move the hidden folder"
+        );
+        d.app.tab = Tab::Explore;
+        d.app.settings_open = true;
+        d.settle();
+        d.press(egui::Key::Backspace);
+        assert_eq!(
+            d.app.zoom, projects,
+            "Settings must not move the hidden folder"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_folder_says_so_and_links_to_issues() {
+        let dir = workspace("unreadable");
+        let root = dir.join("home");
+        fixture(&root);
+        let mut d = Driver::empty(&dir, root.clone());
+        let mut scanned = snapshot(&root);
+        let denied = (0..scanned.entries.len())
+            .find(|&id| scanned.path(id) == root.join("Projects"))
+            .unwrap();
+        scanned.entries[denied].fully_listed = false;
+        scanned.summary.issue_count = 1;
+        // A partly read folder keeps what was found; a complete empty one is 0 B.
+        let unread = (0..scanned.entries.len())
+            .find(|&id| scanned.path(id) == root.join("Projects").join("atlas-web").join("src"))
+            .unwrap();
+        scanned.entries[unread].fully_listed = false;
+        d.app.install(Data::analyze(scanned));
+        let data = d.app.data.clone().unwrap();
+        assert_ne!(d.app.size_text(&data.snapshot, unread), "unknown");
+        assert_ne!(d.app.size_text(&data.snapshot, denied), "unknown");
+        let empty = (0..data.snapshot.entries.len())
+            .find(|&id| {
+                data.snapshot.path(id)
+                    == root.join("Projects").join("atlas-web").join("empty-folder")
+            })
+            .unwrap();
+        assert_ne!(d.app.size_text(&data.snapshot, empty), "unknown");
+        d.app.tab = Tab::Explore;
+        d.settle();
+        d.click_row("Projects");
+        // Below the current-folder row of a root-level folder, under the trail.
+        let panel = d.hits(nav::PANEL_HITS);
+        let top = panel
+            .iter()
+            .map(|hit| hit.1)
+            .find(|r| r.height() < 32.0)
+            .unwrap();
+        d.click_at(egui::pos2(top.center().x, top.bottom() + 48.0 + 12.0));
+        assert_eq!(d.app.tab, Tab::Issues);
+    }
+
+    #[test]
+    fn a_folder_that_listed_nothing_has_no_size_to_state() {
+        let dir = workspace("unknown");
+        let root = dir.join("home");
+        fixture(&root);
+        let mut d = Driver::empty(&dir, root.clone());
+        let mut scanned = snapshot(&root);
+        let empty = (0..scanned.entries.len())
+            .find(|&id| scanned.path(id).ends_with("empty-folder"))
+            .unwrap();
+        scanned.entries[empty].fully_listed = false;
+        scanned.entries[0].allocated_bytes = None;
+        d.app.install(Data::analyze(scanned));
+        let data = d.app.data.clone().unwrap();
+        assert_eq!(d.app.size_text(&data.snapshot, empty), "unknown");
+        assert_ne!(d.app.size_text(&data.snapshot, 0), "unknown");
+        d.app.allocated = true;
+        assert_eq!(d.app.size_text(&data.snapshot, 0), "unknown");
+    }
+
+    #[test]
+    fn a_running_scan_is_browsed_with_the_same_controls() {
+        let mut d = Driver::new("live");
+        let _scan = d.app.preview_scan(r"D:\", crate::capture::preview_views());
+        d.settle();
+        let shown = |d: &Driver| {
+            d.app
+                .live_view()
+                .and_then(|view| view.ancestors.last().map(|a| a.1.clone()))
+                .unwrap_or_default()
+        };
+        d.click_hit(nav::PANEL_HITS, 1);
+        assert_eq!(shown(&d), "Archive");
+        let row = d.hits(nav::PANEL_HITS).last().copied().unwrap();
+        d.click_at(row.1.center());
+        let deep = shown(&d);
+        assert_ne!(deep, "Archive");
+
+        // Parent goes up one level and marks the folder left, then keys do too.
+        d.click_parent();
+        assert_eq!(shown(&d), "Archive");
+        assert!(
+            d.hits(nav::PANEL_HITS).iter().any(|hit| hit.0 == row.0),
+            "the folder left is listed again"
+        );
+        d.press(egui::Key::Backspace);
+        assert_eq!(shown(&d), "");
+        d.click_hit(nav::PANEL_HITS, 1);
+        d.press(egui::Key::ArrowLeft);
+        assert_eq!(shown(&d), "");
+
+        // Live keyboard selection follows the same visible row order.
+        let view = d.app.live_view().unwrap();
+        let first = view.folders[0].id;
+        let second = view.folders[1].id;
+        assert_eq!(
+            d.app.live_anim.selection(),
+            Some(first),
+            "going up remembered the branch"
+        );
+        d.press(egui::Key::ArrowDown);
+        assert_eq!(d.app.live_anim.selection(), Some(second));
+        d.press(egui::Key::ArrowUp);
+        assert_eq!(d.app.live_anim.selection(), Some(first));
+        d.press(egui::Key::Enter);
+        assert_eq!(d.app.scan_control().unwrap().live_focus(), first);
+        d.press(egui::Key::Backspace);
+        assert_eq!(shown(&d), "");
+
+        // Breadcrumbs jump straight back to the scan root.
+        d.click_hit(nav::PANEL_HITS, 1);
+        d.click_hit(nav::CRUMB_HITS, 0);
+        assert_eq!(shown(&d), "");
+    }
+
+    #[test]
+    fn sidebar_follows_the_retained_folder_during_a_same_root_rescan() {
+        let mut d = Driver::new("rescan-sidebar");
+        d.click_row("Projects");
+        let shown = d.root.join("Projects").display().to_string();
+        let root = d.root.display().to_string();
+        let _scan = d.app.preview_scan(&root, crate::capture::preview_views());
+        assert!(d.app.rescanning());
+        assert_eq!(d.app.viewing_path(), shown);
+        d.app.stop_scan_preview();
+        let _new_scan = d
+            .app
+            .preview_scan("another-root", crate::capture::preview_views());
+        assert_eq!(d.app.viewing_path(), "another-root");
+    }
+
+    #[test]
+    fn a_rescan_keeps_the_location_and_says_when_it_is_gone() {
+        let mut d = Driver::new("rescan");
+        d.click_row("Projects");
+        d.click_row("Projects/atlas-web");
+        let finish = |d: &mut Driver| {
+            for _ in 0..4000 {
+                d.run(Vec::new());
+                if d.app.running.is_none() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            panic!("the rescan did not finish");
+        };
+        // The results stay usable while the same folder is scanned again.
+        d.press(egui::Key::F5);
+        finish(&mut d);
+        assert_eq!(d.app.tab, Tab::Explore);
+        assert_eq!(d.app.zoom, d.id("Projects/atlas-web"));
+
+        std::fs::remove_dir_all(d.root.join("Projects")).unwrap();
+        d.press(egui::Key::F5);
+        finish(&mut d);
+        assert_eq!(d.app.zoom, 0);
+        assert!(
+            d.app
+                .toast
+                .as_ref()
+                .unwrap()
+                .0
+                .contains("not in the new results")
+        );
+    }
 
     #[test]
     fn places_resolve_inside_a_scan_root() {
