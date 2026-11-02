@@ -375,7 +375,9 @@ fn fixup(record: &mut [u8]) -> bool {
         return false;
     };
     let (offset, count) = (offset as usize, count as usize);
-    if count < 2 || (count - 1) * FIXUP_STRIDE > record.len() || offset + count * 2 > record.len() {
+    // One check value plus one saved pair per 512-byte stride: the array must
+    // cover the whole record, or a damaged sector could go unnoticed.
+    if count != record.len() / FIXUP_STRIDE + 1 || offset + count * 2 > record.len() {
         return false;
     }
     let check = [record[offset], record[offset + 1]];
@@ -401,14 +403,28 @@ struct Attribute<'a> {
     raw: &'a [u8],
 }
 
+/// The record's attributes in order. `Some(None)` (then the end) marks a
+/// malformed record: an attribute out of bounds, `bytes_in_use` beyond the
+/// record, or no end marker within the bytes in use.
 fn attributes(record: &[u8]) -> impl Iterator<Item = Option<Attribute<'_>>> {
-    let used = u32_at(record, 0x18).map_or(0, |u| (u as usize).min(record.len()));
+    let used = u32_at(record, 0x18)
+        .map(|u| u as usize)
+        .filter(|&u| u <= record.len());
     let mut offset = u16_at(record, 0x14).map_or(usize::MAX, usize::from);
+    let mut done = false;
     std::iter::from_fn(move || {
-        let kind = u32_at(&record[..used], offset)?;
-        if kind == ATTR_END {
+        if done {
             return None;
         }
+        let Some(kind) = used.and_then(|used| u32_at(&record[..used], offset)) else {
+            done = true;
+            return Some(None);
+        };
+        if kind == ATTR_END {
+            done = true;
+            return None;
+        }
+        let used = used.expect("checked above");
         let parse = || {
             let length = u32_at(record, offset + 4)? as usize;
             if length < 0x18 || offset.checked_add(length)? > used || !length.is_multiple_of(8) {
@@ -444,7 +460,7 @@ fn attributes(record: &[u8]) -> impl Iterator<Item = Option<Attribute<'_>>> {
                 Some(Some(attribute))
             }
             None => {
-                offset = usize::MAX;
+                done = true;
                 Some(None)
             }
         }
@@ -455,11 +471,9 @@ fn attributes(record: &[u8]) -> impl Iterator<Item = Option<Attribute<'_>>> {
 /// not start at VCN 0 (sizes live in the first fragment only).
 fn data_sizes(attribute: &Attribute<'_>) -> Option<(u64, u64)> {
     if let Some(value) = attribute.value {
-        // Resident: the data lives in the record itself. A directory listing reports
-        // the 8-byte-rounded length as its allocation; the caller treats anything
-        // below one cluster as zero, as it does for listings.
-        let len = value.len() as u64;
-        return Some((len, len.div_ceil(8) * 8));
+        // Resident: the data lives inside the MFT record and has no clusters of
+        // its own, whatever the cluster size.
+        return Some((value.len() as u64, 0));
     }
     let raw = attribute.raw;
     if u64_at(raw, 0x10)? != 0 {
@@ -651,8 +665,11 @@ pub(crate) struct Mft {
 impl Mft {
     /// Read and index every record. `stop` is polled between blocks; `progress`
     /// receives the files and folders found in each block.
+    /// Tables with more than `max_records` records are refused before anything
+    /// is allocated for them (parsing needs ~90 bytes per record).
     pub(crate) fn read(
         source: &dyn ReadAt,
+        max_records: u64,
         stop: &(dyn Fn() -> bool + Sync),
         progress: &(dyn Fn(u64, u64) + Sync),
     ) -> io::Result<Self> {
@@ -665,6 +682,12 @@ impl Mft {
         let records = valid / geometry.record;
         if records > u64::from(u32::MAX) || records <= FIRST_USER_RECORD {
             return Err(io::Error::other("implausible MFT size"));
+        }
+        if records > max_records {
+            return Err(io::Error::other(format!(
+                "the MFT has {records} records, more than the entry limit allows reading \
+                 ({max_records}); raise --max-entries or scan with --backend dir"
+            )));
         }
         let unit = geometry.record.max(geometry.cluster);
         let chunk_bytes = CHUNK_BYTES.div_ceil(unit) * unit;
@@ -889,6 +912,15 @@ fn mft_extents(source: &dyn ReadAt, geometry: &Geometry) -> io::Result<(Vec<Exte
         extents.sort_by_key(|e| e.vcn_byte);
         extents.dedup();
     }
+    // The runs must cover the file from offset 0 without gaps or overlaps;
+    // anything else would silently hide (or invent) records.
+    let mut expected = 0;
+    for extent in &extents {
+        if extent.vcn_byte != expected || extent.bytes == 0 {
+            return Err(invalid("runs do not cover the table continuously"));
+        }
+        expected += extent.bytes;
+    }
     // Only records below the valid data length hold anything. Reads still cover
     // whole clusters, as unbuffered I/O requires.
     let mut remaining = valid.div_ceil(geometry.cluster) * geometry.cluster;
@@ -947,6 +979,7 @@ fn read_mapped(
     buffer: &mut [u8],
 ) -> io::Result<()> {
     let end = start + buffer.len() as u64;
+    let mut filled = 0;
     for extent in extents {
         let from = extent.vcn_byte.max(start);
         let to = (extent.vcn_byte + extent.bytes).min(end);
@@ -958,6 +991,12 @@ fn read_mapped(
             Some(disk) => source.read_at(disk + (from - extent.vcn_byte), piece)?,
             None => piece.fill(0),
         }
+        filled += to - from;
+    }
+    // Extents never overlap (checked when they are built), so this means every
+    // requested byte came from the volume rather than a previous block.
+    if filled != buffer.len() as u64 {
+        return Err(io::Error::other("$MFT runs do not cover a requested block"));
     }
     Ok(())
 }
@@ -1115,7 +1154,7 @@ mod tests {
             ],
         );
         let (slot, _) = parse(&mut r, 30);
-        assert_eq!((slot.logical, slot.allocated), (17, 24));
+        assert_eq!((slot.logical, slot.allocated), (17, 0));
         let mut r = record(
             1024,
             RECORD_IN_USE,
@@ -1172,6 +1211,62 @@ mod tests {
         garbage[0..4].copy_from_slice(FILE_MAGIC);
         let (slot, _) = parse(&mut garbage, 43);
         assert!(!slot.in_use());
+    }
+
+    #[test]
+    fn rejects_truncated_attribute_lists_and_partial_fixups() {
+        let attrs = [
+            standard(0, 0),
+            file_name(5, 5, 1, "a"),
+            resident(ATTR_DATA, &[1; 40], &[]),
+        ];
+        // bytes_in_use ends right after $FILE_NAME: no $DATA and no end marker.
+        let mut r = record(1024, RECORD_IN_USE, 1, 0, &attrs);
+        let first = u16_at(&r, 0x14).unwrap() as usize;
+        let cut = first + attrs[0].len() + attrs[1].len();
+        r[0x18..0x1C].copy_from_slice(&(cut as u32).to_le_bytes());
+        let (slot, chunk) = parse(&mut r, 50);
+        assert!(!slot.in_use());
+        assert_eq!((chunk.torn, chunk.names.len()), (1, 0));
+        // bytes_in_use beyond the record.
+        let mut r = record(1024, RECORD_IN_USE, 1, 0, &attrs);
+        r[0x18..0x1C].copy_from_slice(&2048_u32.to_le_bytes());
+        assert_eq!(parse(&mut r, 51).1.torn, 1);
+        // A fixup array that only covers the first sector.
+        let mut r = record(1024, RECORD_IN_USE, 1, 0, &attrs);
+        r[6..8].copy_from_slice(&2_u16.to_le_bytes());
+        assert_eq!(parse(&mut r, 52).1.torn, 1);
+    }
+
+    #[test]
+    fn mapped_reads_must_cover_every_byte() {
+        struct Zeros;
+        impl ReadAt for Zeros {
+            fn read_at(&self, _offset: u64, buffer: &mut [u8]) -> io::Result<()> {
+                buffer.fill(1);
+                Ok(())
+            }
+        }
+        let gap = [
+            Extent {
+                vcn_byte: 0,
+                bytes: 4096,
+                disk: Some(0),
+            },
+            Extent {
+                vcn_byte: 8192,
+                bytes: 4096,
+                disk: Some(65536),
+            },
+        ];
+        let mut buffer = vec![0_u8; 12288];
+        assert!(read_mapped(&Zeros, &gap, 0, &mut buffer).is_err());
+        let whole = [Extent {
+            vcn_byte: 0,
+            bytes: 12288,
+            disk: Some(0),
+        }];
+        assert!(read_mapped(&Zeros, &whole, 0, &mut buffer).is_ok());
     }
 
     #[test]

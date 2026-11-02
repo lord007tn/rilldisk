@@ -719,7 +719,11 @@ fn emit_mft(
         }
     };
     let mut phase = std::time::Instant::now();
-    let table = match mft::Mft::read(source, &|| control.should_stop(), &progress) {
+    // Parsing needs ~90 bytes per record whatever the scan keeps, so the entry
+    // limit (the memory bound) also bounds the table this backend will read.
+    let max_entries = control.remaining_entries.load(Ordering::Relaxed) as u64 + 1;
+    let max_records = max_entries.saturating_mul(2);
+    let table = match mft::Mft::read(source, max_records, &|| control.should_stop(), &progress) {
         Err(error) if error.kind() == io::ErrorKind::Interrupted && control.should_stop() => {
             return Ok(());
         }
@@ -769,6 +773,10 @@ fn emit_mft(
             break;
         }
         for index in table.children(record) {
+            // A folder with millions of names must not delay cancellation.
+            if index % 4096 == 0 && control.should_stop() {
+                break 'plan;
+            }
             let name = table.name_at(index);
             let slot = &table.slots[name.record as usize];
             let kind = kind_of(slot);

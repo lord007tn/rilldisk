@@ -64,21 +64,27 @@ fn reads_names_sizes_links_and_extension_records() {
 #[test]
 fn image_scans_honor_the_entry_budget_and_cancellation() {
     let image = image();
-    let limited = scan_ntfs_image(
-        image.path(),
-        ScanOptions {
-            max_entries: 20,
-            ..Default::default()
-        },
-        Arc::default(),
-    )
-    .unwrap();
+    let budget = |max_entries| {
+        scan_ntfs_image(
+            image.path(),
+            ScanOptions {
+                max_entries,
+                ..Default::default()
+            },
+            Arc::default(),
+        )
+    };
+    // Parsing the table costs memory per record, so a budget far below the
+    // table's size is refused up front rather than ignored.
+    let refused = format!("{:#}", budget(20).unwrap_err());
+    assert!(refused.contains("raise --max-entries"), "{refused}");
+    let limited = budget(300).unwrap();
     assert!(!limited.summary.complete);
-    assert_eq!(limited.entries.len(), 20);
+    assert_eq!(limited.entries.len(), 300);
     assert!(
         limited.summary.issues[0]
             .message
-            .contains("entry limit of 20")
+            .contains("entry limit of 300")
     );
     let control = Arc::new(ScanControl::default());
     control.cancel();
