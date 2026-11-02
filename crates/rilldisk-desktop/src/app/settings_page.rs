@@ -138,11 +138,12 @@ impl RillApp {
                 }
                 ui.add_space(10.0);
                 // Restarting reopens the folder shown, if any.
-                let root = self.data.as_ref().map(|d| d.snapshot.summary.root.clone());
+                let data = self.data.clone();
                 let scanning = self.running.is_some();
                 let status = self.elevate.status();
                 row(ui, "Administrator access", &status, |ui| {
-                    self.elevate.settings_control(ui, root.as_deref(), scanning);
+                    let summary = data.as_ref().map(|d| &d.snapshot.summary);
+                    self.elevate.settings_control(ui, summary, scanning);
                 });
                 if let Some(note) = self.elevate.note() {
                     ui.add_space(4.0);

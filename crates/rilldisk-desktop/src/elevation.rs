@@ -4,8 +4,8 @@
 //!
 //! Nothing here elevates on its own. Every route starts from a click and goes
 //! through the OS's own consent UI (UAC, polkit) or settings page (macOS Full Disk
-//! Access). The current window closes only after Windows reports that the elevated
-//! instance started.
+//! Access). On Windows the current window closes only after the elevated instance
+//! started; on Linux it stays open while `pkexec` runs and the user closes it.
 use crate::icons::{self, Icon};
 use crate::style::{self, t};
 use crate::widgets::{self as w, Kind};
@@ -32,8 +32,12 @@ pub enum Offer {
     None,
     /// Windows UAC, or Linux `pkexec`: restart this app elevated on the same folder.
     Restart,
-    /// macOS privacy protection: open the Full Disk Access settings page.
-    FullDiskAccess,
+    /// macOS privacy protection: open the Full Disk Access settings page. `then`
+    /// is the elevation route for the other refused folders, which Full Disk
+    /// Access does not read, when there are any and one is available.
+    FullDiskAccess {
+        then: Option<Box<Offer>>,
+    },
     /// No graphical route here; a command the user can copy into a terminal.
     Command(String),
 }
@@ -66,7 +70,8 @@ pub struct Elevate {
     /// `pkexec` is installed and runnable (Unix). Checked once, not every frame.
     pkexec: bool,
     note: Option<Note>,
-    /// Linux: the `pkexec` launch, watched so a declined prompt can be reported.
+    /// Linux: the `pkexec` launch, watched (from the app's update loop, see
+    /// [`Elevate::poll`]) so a declined prompt can be reported.
     #[cfg(not(windows))]
     child: Option<std::process::Child>,
     /// Scripted captures: show the elevated look without elevating.
@@ -127,7 +132,6 @@ impl Elevate {
     /// the scan. `show_note` adds the last attempt's result in a few words; the
     /// Issues tab shows it in full instead.
     pub fn header(&mut self, ui: &mut Ui, summary: &Summary, scanning: bool, show_note: bool) {
-        self.poll(ui.ctx());
         if self.elevated() {
             badge(ui).on_hover_text(self.badge_tip());
             return;
@@ -141,7 +145,7 @@ impl Elevate {
                         "{folders} could not be read. Restart RillDisk with administrator rights and rescan {}.",
                         root.display()
                     ))
-                    .on_disabled_hover_text("Waiting for the administrator prompt.")
+                    .on_disabled_hover_text(PENDING)
                     .clicked();
                 if clicked {
                     self.restart(ui.ctx(), Some(&root));
@@ -166,7 +170,6 @@ impl Elevate {
     /// `scanning`, the restart is shown but disabled, since it would end the scan.
     pub fn issues(&mut self, ui: &mut Ui, summary: &Summary, scanning: bool) {
         let th = t();
-        self.poll(ui.ctx());
         let offer = self.offer(summary);
         if offer != Offer::None || self.elevated() {
             self.callout(ui, summary, &offer, scanning);
@@ -186,7 +189,7 @@ impl Elevate {
             .color(th.dim),
         );
         ui.add_space(8.0);
-        let groups = group(&summary.issues);
+        let groups = group(summary);
         egui::ScrollArea::vertical()
             .id_salt("issues")
             .auto_shrink(false)
@@ -237,8 +240,12 @@ impl Elevate {
                     ui.painter().rect_filled(tile, 11, style::alpha(tint, 48));
                     icons::paint(ui.painter(), tile.shrink(10.0), Icon::Shield, tint);
                     ui.add_space(8.0);
-                    // Leave room for the action button on the right.
-                    let button = if *offer == Offer::None { 0.0 } else { 270.0 };
+                    // Leave room for the action buttons on the right.
+                    let button = match offer {
+                        Offer::None => 0.0,
+                        Offer::FullDiskAccess { then: Some(_) } => 420.0,
+                        _ => 270.0,
+                    };
                     let text_width = (ui.available_width() - button).max(200.0);
                     ui.vertical(|ui| {
                         ui.set_max_width(text_width);
@@ -250,7 +257,7 @@ impl Elevate {
                         );
                         ui.label(RichText::new(title).font(style::semibold(15.0)));
                         ui.label(RichText::new(body).color(th.dim));
-                        if let Offer::Command(command) = offer {
+                        if let Some(command) = offer.command() {
                             ui.label(RichText::new(command).font(style::mono(12.0)));
                         }
                         if let Some(note) = &self.note {
@@ -274,7 +281,7 @@ impl Elevate {
                 ui.add_enabled_ui(!scanning && !pending, |ui| {
                     let clicked = w::button(ui, Kind::Primary, Some(Icon::Shield), restart_label())
                         .on_disabled_hover_text(if pending {
-                            "Waiting for the administrator prompt."
+                            PENDING
                         } else {
                             "Available when the scan finishes."
                         })
@@ -284,9 +291,13 @@ impl Elevate {
                     }
                 });
             }
-            Offer::FullDiskAccess => {
+            Offer::FullDiskAccess { then } => {
+                // Right-to-left layout: Full Disk Access ends up rightmost.
                 if w::button(ui, Kind::Primary, None, "Grant Full Disk Access").clicked() {
                     self.note = Some(open_full_disk_access());
+                }
+                if let Some(then) = then {
+                    self.action(ui, then, root, scanning);
                 }
             }
             Offer::Command(command) => {
@@ -313,7 +324,7 @@ impl Elevate {
         if cfg!(windows) {
             "Not running as administrator. Protected system folders are skipped and listed under Issues. Restart as administrator to read them; RillDisk only lists them and never changes permissions or files.".into()
         } else if cfg!(target_os = "macos") {
-            "Folders protected by macOS privacy controls need Full Disk Access for RillDisk. Other folders you cannot read are skipped and listed under Issues.".into()
+            "Folders protected by macOS privacy controls usually need Full Disk Access for RillDisk (it does not lift the sandbox of an app that started RillDisk). Other folders you cannot read are skipped and listed under Issues.".into()
         } else if self.state.can_elevate {
             "Not running as root. Folders you cannot read are skipped and listed under Issues. Restart with administrator rights to read them; RillDisk never changes permissions or files.".into()
         } else {
@@ -322,15 +333,18 @@ impl Elevate {
         }
     }
 
-    /// Settings > Privacy: the route to more rights, if any, reopening `root`.
-    pub fn settings_control(&mut self, ui: &mut Ui, root: Option<&Path>, scanning: bool) {
-        self.poll(ui.ctx());
-        if self.elevated() {
+    /// Settings > Privacy: the route to more rights, if any, reopening the root of
+    /// `summary` (the scan shown). On macOS, Full Disk Access stays offered while
+    /// elevated when that scan hit privacy protection, which root does not lift.
+    pub fn settings_control(&mut self, ui: &mut Ui, summary: Option<&Summary>, scanning: bool) {
+        let root = summary.map(|s| s.root.as_path());
+        let privacy = summary.is_some_and(|s| s.privacy_denied_count > 0);
+        if self.elevated() && !(cfg!(target_os = "macos") && privacy) {
             badge(ui).on_hover_text(self.badge_tip());
             return;
         }
         let offer = if cfg!(target_os = "macos") {
-            Offer::FullDiskAccess
+            Offer::FullDiskAccess { then: None }
         } else if !self.state.can_elevate {
             Offer::None
         } else if cfg!(windows) || self.pkexec {
@@ -391,9 +405,11 @@ impl Elevate {
             {
                 Ok(child) => {
                     self.child = Some(child);
+                    // pkexec only exits when the elevated app does, so there is no
+                    // signal for "authenticated": say what is known.
                     self.note = Some(Note::new(
-                        "Waiting for authentication…",
-                        "Waiting for authentication. When the administrator window opens, you can close this one.",
+                        "Started pkexec",
+                        "pkexec is running: authenticate if it asks, and the administrator window opens. You can close this one then. A declined prompt is reported here.",
                     ));
                     ctx.request_repaint();
                 }
@@ -407,10 +423,11 @@ impl Elevate {
         }
     }
 
-    /// Linux: report how the `pkexec` launch ended. Its exit status is the elevated
-    /// app's own once authentication succeeded.
+    /// Linux: report how the `pkexec` launch ended (and reap it). Its exit status is
+    /// the elevated app's own once authentication succeeded. Called from the app's
+    /// update loop on every frame, so it runs whichever view is open.
     #[cfg_attr(windows, allow(unused_variables))]
-    fn poll(&mut self, ctx: &egui::Context) {
+    pub fn poll(&mut self, ctx: &egui::Context) {
         #[cfg(not(windows))]
         if let Some(child) = &mut self.child {
             let status = match child.try_wait() {
@@ -436,6 +453,21 @@ impl Elevate {
                     format!("Could not follow the administrator instance: {error}"),
                 )),
             };
+        }
+    }
+}
+
+/// Hover text for a restart that is disabled because one is already under way.
+const PENDING: &str =
+    "pkexec is still running: the administrator prompt, or the administrator window it opened.";
+
+impl Offer {
+    /// The command to show for copying, also when it follows Full Disk Access.
+    fn command(&self) -> Option<&str> {
+        match self {
+            Offer::Command(command) => Some(command),
+            Offer::FullDiskAccess { then: Some(then) } => then.command(),
+            _ => None,
         }
     }
 }
@@ -567,16 +599,31 @@ fn callout_text(offer: &Offer, count: u64, privacy: u64, elevated: bool) -> (Str
             format!("{folders} could not be read"),
             "Restart with administrator rights (you will be asked to authenticate) to read them; the scan reruns on the same folder. RillDisk only lists them and never changes permissions or files.".into(),
         ),
-        Offer::FullDiskAccess => (
+        Offer::FullDiskAccess { then } => (
             if privacy == 1 {
-                "1 folder is protected by macOS privacy controls".to_string()
+                "1 folder is likely protected by macOS privacy controls".to_string()
             } else {
                 format!(
-                    "{} folders are protected by macOS privacy controls",
+                    "{} folders are likely protected by macOS privacy controls",
                     style::count(privacy)
                 )
             },
-            "Grant RillDisk Full Disk Access in System Settings > Privacy & Security, then quit and reopen RillDisk and rescan. Administrator rights alone do not lift this protection.".into(),
+            {
+                let mut body = String::from(
+                    "Full Disk Access usually lifts this: grant it to RillDisk in System Settings > Privacy & Security, then quit and reopen RillDisk and rescan. Administrator rights alone do not. If RillDisk was started from a sandboxed app, that app's sandbox can refuse these folders too, and Full Disk Access does not change it.",
+                );
+                let others = style::plural(count.saturating_sub(privacy), "other protected folder");
+                match then.as_deref() {
+                    Some(Offer::Restart) => body.push_str(&format!(
+                        "\n{others} need administrator rights: restart with them to read those."
+                    )),
+                    Some(Offer::Command(_)) => body.push_str(&format!(
+                        "\n{others} need administrator rights: run this in a terminal to read those."
+                    )),
+                    _ => {}
+                }
+                body
+            },
         ),
         Offer::Command(_) => (
             format!("{folders} could not be read"),
@@ -593,39 +640,53 @@ fn callout_text(offer: &Offer, count: u64, privacy: u64, elevated: bool) -> (Str
     }
 }
 
-/// Issues grouped by kind in [`ORDER`]; empty groups are left out.
-pub fn group(issues: &[ScanIssue]) -> Vec<(IssueKind, Vec<&ScanIssue>)> {
+/// Listed issues grouped by kind in [`ORDER`]; empty groups are left out, except
+/// Access denied while the scan counted denials: those may all lie past the listing
+/// cap, and the group's total and help still apply.
+pub fn group(summary: &Summary) -> Vec<(IssueKind, Vec<&ScanIssue>)> {
     ORDER
         .iter()
-        .map(|&kind| (kind, issues.iter().filter(|i| i.kind == kind).collect()))
-        .filter(|(_, list): &(IssueKind, Vec<&ScanIssue>)| !list.is_empty())
+        .map(|&kind| {
+            let list: Vec<&ScanIssue> = summary.issues.iter().filter(|i| i.kind == kind).collect();
+            (kind, list)
+        })
+        .filter(|(kind, list)| {
+            !list.is_empty()
+                || (*kind == IssueKind::AccessDenied && summary.access_denied_count > 0)
+        })
         .collect()
 }
 
 /// What to offer for `summary`. `privacy_denied_count` is counted by the scanner
 /// before the issue list is capped, so the Full Disk Access offer holds even when
 /// none of those folders is among the listed issues.
+///
+/// macOS privacy protection refuses with EPERM even for root, so Full Disk Access
+/// comes first; the elevation route follows for the remaining (`EACCES`) denials.
 fn offer(summary: &Summary, elevated: bool, can_elevate: bool, pkexec: bool, dark: bool) -> Offer {
     if summary.access_denied_count == 0 {
         return Offer::None;
     }
-    // macOS privacy protection refuses with EPERM even for root.
-    if summary.privacy_denied_count > 0 {
-        return Offer::FullDiskAccess;
+    let privacy = summary.privacy_denied_count;
+    let elevate = if elevated || !can_elevate || summary.access_denied_count <= privacy {
+        None
+    } else if cfg!(windows) || pkexec {
+        Some(Offer::Restart)
+    } else {
+        let exe = std::env::current_exe().unwrap_or_else(|_| "rilldisk-desktop".into());
+        Some(Offer::Command(sudo_command(
+            &exe,
+            Some(&absolute(&summary.root)),
+            dark,
+            &|key| std::env::var_os(key),
+        )))
+    };
+    if privacy > 0 {
+        return Offer::FullDiskAccess {
+            then: elevate.map(Box::new),
+        };
     }
-    if elevated || !can_elevate {
-        return Offer::None;
-    }
-    if cfg!(windows) || pkexec {
-        return Offer::Restart;
-    }
-    let exe = std::env::current_exe().unwrap_or_else(|_| "rilldisk-desktop".into());
-    Offer::Command(sudo_command(
-        &exe,
-        Some(&absolute(&summary.root)),
-        dark,
-        &|key| std::env::var_os(key),
-    ))
+    elevate.unwrap_or(Offer::None)
 }
 
 fn absolute(root: &Path) -> PathBuf {
@@ -752,10 +813,14 @@ pub fn quote_windows_arg(arg: &str) -> String {
 fn open_full_disk_access() -> Note {
     const URL: &str = "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles";
     match std::process::Command::new("open").arg(URL).spawn() {
-        Ok(_) => Note::new(
-            "Settings opened",
-            "Turn on RillDisk in the list (use + to add it if missing), then quit and reopen RillDisk and rescan.",
-        ),
+        Ok(mut child) => {
+            // `open` exits at once; wait off the UI thread so it is reaped.
+            std::thread::spawn(move || child.wait());
+            Note::new(
+                "Settings opened",
+                "Turn on RillDisk in the list (use + to add it if missing), then quit and reopen RillDisk and rescan.",
+            )
+        }
         Err(error) => Note::new(
             "Settings not opened",
             format!(
@@ -929,13 +994,21 @@ mod tests {
             ScanIssue::new("/c", IssueKind::InUse, "busy"),
             ScanIssue::new("/d", IssueKind::AccessDenied, "denied"),
         ];
-        let groups = group(&issues);
+        let all = summary(issues);
+        let groups = group(&all);
         let kinds: Vec<_> = groups.iter().map(|g| g.0).collect();
         assert_eq!(
             kinds,
             [IssueKind::AccessDenied, IssueKind::InUse, IssueKind::Other]
         );
         assert_eq!(groups[0].1.len(), 2);
+        // Denials counted past the listing cap keep their group, with no rows.
+        let mut capped = summary(vec![ScanIssue::new("/a", IssueKind::Other, "x")]);
+        capped.access_denied_count = 3;
+        let groups = group(&capped);
+        assert_eq!(groups[0].0, IssueKind::AccessDenied);
+        assert!(groups[0].1.is_empty());
+        assert!(group(&summary(Vec::new())).is_empty());
     }
 
     #[test]
@@ -966,7 +1039,7 @@ mod tests {
         if cfg!(target_os = "macos") {
             assert_eq!(
                 offer(&tcc, true, false, false, false),
-                Offer::FullDiskAccess
+                Offer::FullDiskAccess { then: None }
             );
         } else {
             assert_eq!(offer(&tcc, true, false, false, false), Offer::None);
@@ -981,7 +1054,20 @@ mod tests {
         capped.privacy_denied_count = 1;
         assert_eq!(
             offer(&capped, true, false, false, false),
-            Offer::FullDiskAccess
+            Offer::FullDiskAccess { then: None }
+        );
+        // Unelevated with other denials: the elevation route follows, for them.
+        assert_eq!(
+            offer(&capped, false, true, true, false),
+            Offer::FullDiskAccess {
+                then: Some(Box::new(Offer::Restart))
+            }
+        );
+        // Every denial is privacy protection: elevating would not read any.
+        capped.privacy_denied_count = 150;
+        assert_eq!(
+            offer(&capped, false, true, true, false),
+            Offer::FullDiskAccess { then: None }
         );
     }
 }

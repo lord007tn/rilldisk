@@ -403,8 +403,33 @@ pub(crate) fn is_elevated() -> bool {
 
 /// Windows offers elevation through UAC; this only serves the shared API.
 pub(crate) fn executable_on_path(program: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
+    let pathext = std::env::var("PATHEXT").ok();
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| launchable_in(&dir, program, pathext.as_deref()))
+    })
+}
+
+/// A file in `dir` that Windows would start for `program`: `program` itself when
+/// it already ends in a `PATHEXT` extension, otherwise `program` plus one of them
+/// (`.COM;.EXE;.BAT;.CMD` when `PATHEXT` is unset). An extensionless file is never
+/// launchable, so it does not count.
+fn launchable_in(dir: &Path, program: &str, pathext: Option<&str>) -> bool {
+    let extensions: Vec<&str> = pathext
+        .unwrap_or(".COM;.EXE;.BAT;.CMD")
+        .split(';')
+        .map(str::trim)
+        .filter(|ext| ext.len() > 1 && ext.starts_with('.'))
+        .collect();
+    let lower = program.to_ascii_lowercase();
+    if extensions
+        .iter()
+        .any(|ext| lower.ends_with(&ext.to_ascii_lowercase()))
+    {
+        return dir.join(program).is_file();
+    }
+    extensions
+        .iter()
+        .any(|ext| dir.join(format!("{program}{ext}")).is_file())
 }
 
 pub(crate) fn elevation() -> crate::Elevation {
@@ -461,6 +486,23 @@ pub(crate) fn enable_backup_privilege() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_launchable_path_files_count() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("pkexec"), b"").unwrap();
+        std::fs::write(dir.path().join("tool.exe"), b"").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"").unwrap();
+        let default = |program| launchable_in(dir.path(), program, None);
+        // An extensionless file is not something Windows can start.
+        assert!(!default("pkexec"));
+        assert!(default("tool"));
+        assert!(default("TOOL.EXE"));
+        assert!(!default("notes.txt"));
+        assert!(!default("missing"));
+        assert!(launchable_in(dir.path(), "notes", Some(".EXE;.TXT")));
+        assert!(!launchable_in(dir.path(), "tool", Some(".COM")));
+    }
 
     #[test]
     fn elevation_is_consistent() {
