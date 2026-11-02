@@ -192,6 +192,7 @@ pub struct RillApp {
     pub injected: Vec<egui::Event>,
     /// Selection removal: confirmation, progress and results (cleanup_ui.rs).
     pub cleanup: crate::cleanup_ui::CleanupUi,
+    assistants: crate::assistants::State,
 }
 
 pub fn now_ms() -> u64 {
@@ -334,6 +335,7 @@ impl RillApp {
             tour,
             injected: Vec::new(),
             cleanup: Default::default(),
+            assistants: Default::default(),
         };
         if path.is_some() {
             app.start_scan(&cc.egui_ctx);
@@ -2970,7 +2972,9 @@ impl RillApp {
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             let width = (ui.available_width() - 80.0).clamp(420.0, 820.0);
             let left = (ui.available_width() - width) / 2.0;
-            let content = 470.0 + self.volumes.len() as f32 * 88.0;
+            let content = 470.0
+                + self.volumes.len() as f32 * 88.0
+                + crate::assistants::extra_height(&self.assistants);
             ui.add_space(((ui.available_height() - content) / 2.0).max(28.0));
             ui.horizontal(|ui| {
                 ui.add_space(left);
@@ -3052,31 +3056,7 @@ impl RillApp {
                         }
                     });
                     ui.add_space(18.0);
-                    w::card_frame().show(ui, |ui| {
-                        ui.set_width(width - 32.0);
-                        ui.horizontal(|ui| {
-                            let (tile, _) = ui.allocate_exact_size(vec2(34.0, 34.0), Sense::hover());
-                            ui.painter().rect_filled(tile, 10, th.field);
-                            icons::paint(ui.painter(), tile.shrink(9.0), Icon::Terminal, th.dim);
-                            ui.add_space(6.0);
-                            ui.vertical(|ui| {
-                                ui.label(RichText::new("Also a CLI and an MCP server").font(style::semibold(13.5)));
-                                ui.label(
-                                    RichText::new("The same scanner for scripts and AI agents: rilldisk reclaim ~   ·   rilldisk mcp")
-                                        .font(style::regular(12.0))
-                                        .color(th.dim),
-                                );
-                            });
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if w::button(ui, Kind::Soft, Some(Icon::Copy), "Copy").on_hover_text("Copy an MCP config snippet").clicked() {
-                                    actions.push(Action::Copy(
-                                        "{\n  \"mcpServers\": {\n    \"rilldisk\": { \"command\": \"rilldisk\", \"args\": [\"mcp\"] }\n  }\n}".into(),
-                                        "MCP config",
-                                    ));
-                                }
-                            });
-                        });
-                    });
+                    crate::assistants::panel(ui, &mut self.assistants, width);
                     if let Some(action) = self.update_card(ui) {
                         actions.push(action);
                     }

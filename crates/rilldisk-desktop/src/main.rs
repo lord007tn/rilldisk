@@ -3,6 +3,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod assistants;
 mod capture;
 mod cleanup_ui;
 mod icons;
