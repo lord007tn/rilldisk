@@ -190,7 +190,7 @@ fn an_unopenable_root_says_access_was_denied() {
         Arc::default(),
     );
     fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
-    let message = format!("{:#}", result.err().expect("the root cannot be opened"));
+    let message = format!("{:#}", result.expect_err("the root cannot be opened"));
     assert!(message.contains("access denied"), "{message}");
     assert!(message.contains("administrator rights"), "{message}");
 }
