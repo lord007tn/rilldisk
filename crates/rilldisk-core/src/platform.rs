@@ -7,14 +7,18 @@ mod windows;
 #[cfg(windows)]
 pub use windows::volumes;
 #[cfg(windows)]
-pub(crate) use windows::{BACKEND, VolumeInfo, read_directory, volume_info};
+pub(crate) use windows::{
+    BACKEND, VolumeInfo, elevation, enable_backup_privilege, read_directory, volume_info,
+};
 
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
 pub use unix::volumes;
 #[cfg(unix)]
-pub(crate) use unix::{BACKEND, VolumeInfo, read_directory, volume_info};
+pub(crate) use unix::{
+    BACKEND, VolumeInfo, elevation, enable_backup_privilege, read_directory, volume_info,
+};
 
 #[cfg(not(any(windows, unix)))]
 compile_error!("RillDisk supports Windows and Unix (Linux, macOS) targets");

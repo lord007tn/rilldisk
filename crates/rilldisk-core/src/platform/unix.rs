@@ -15,7 +15,10 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::OsStr,
     fs, io,
-    os::unix::{ffi::OsStrExt, fs::MetadataExt},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
 };
 
@@ -153,10 +156,7 @@ pub(crate) fn read_directory(path: &Path, control: &ScanControl, volume: &Volume
     let mut batch = Batch::default();
     match enumerate(path, control, volume, &mut batch) {
         Ok(complete) => batch.complete = complete,
-        Err(error) => batch.issues.push(ScanIssue {
-            path: path.into(),
-            message: error.to_string(),
-        }),
+        Err(error) => batch.issues.push(ScanIssue::from_error(path, &error)),
     }
     batch
 }
@@ -178,10 +178,9 @@ fn enumerate(
         let listed = match item.file_type() {
             Ok(value) => value,
             Err(error) => {
-                batch.issues.push(ScanIssue {
-                    path: path.join(&name),
-                    message: error.to_string(),
-                });
+                batch
+                    .issues
+                    .push(ScanIssue::from_error(path.join(&name), &error));
                 continue;
             }
         };
@@ -202,10 +201,9 @@ fn enumerate(
             let metadata = match item.metadata() {
                 Ok(value) => value,
                 Err(error) => {
-                    batch.issues.push(ScanIssue {
-                        path: path.join(&*entry.name),
-                        message: error.to_string(),
-                    });
+                    batch
+                        .issues
+                        .push(ScanIssue::from_error(path.join(&*entry.name), &error));
                     continue;
                 }
             };
@@ -577,6 +575,33 @@ pub fn volumes() -> Vec<crate::Volume> {
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
 pub fn volumes() -> Vec<crate::Volume> {
     Vec::new()
+}
+
+/// Root (effective UID 0) is elevated. `sudo` or `pkexec` on `PATH` is a way to get there.
+pub(crate) fn elevation() -> crate::Elevation {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let is_elevated = unsafe { libc::geteuid() } == 0;
+    crate::Elevation {
+        is_elevated,
+        can_elevate: !is_elevated && (on_path("sudo") || on_path("pkexec")),
+        backup_privilege_enabled: false,
+    }
+}
+
+/// Unix has no backup privilege: root already lists every folder except macOS
+/// privacy-protected ones, which need Full Disk Access instead.
+pub(crate) fn enable_backup_privilege() -> bool {
+    false
+}
+
+/// Whether an executable named `program` exists in a `PATH` directory.
+pub(crate) fn on_path(program: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| {
+            fs::metadata(dir.join(program))
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+    })
 }
 
 #[cfg(test)]
