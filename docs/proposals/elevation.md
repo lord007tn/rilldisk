@@ -91,12 +91,21 @@ or a CLI the user started from an elevated terminal or with `sudo`. Elevated, it
 does exactly what it does unelevated: list directory metadata and show it. With
 the backup privilege it can list folders whose ACLs deny the user.
 
+Removing reclaim candidates ([cleanup.md](cleanup.md)) interacts with this. An
+elevated removal could reach folders in other users' profiles. So the elevated
+desktop window turns removal off: Clean up still shows candidates and copies the
+plan, but its remove buttons are disabled with an explanation. The CLI's
+`reclaim --delete` is left to the person who chose to open an elevated terminal
+or type `sudo`. cleanup.md's guards (system folders, the home folder and roots
+refused; confirmation required unless `--yes`) apply there unchanged.
+
 ## What never happens
 
 * No automatic elevation, from any program. No elevation prompt without a click.
 * No ACL changes, no taking ownership, no `SeRestorePrivilege`,
-  `SeTakeOwnershipPrivilege` or `SeSecurityPrivilege`, and no writes except the
-  report file a user explicitly asks for with `--output`.
+  `SeTakeOwnershipPrivilege` or `SeSecurityPrivilege`. The only writes are the
+  report file a user explicitly asks for with `--output` and, from an elevated
+  CLI only, a confirmed `reclaim --delete` (see above).
 * No file contents are read. The backup privilege is used only through the
   existing directory-listing open; files are never opened.
 * No elevated helper, service, scheduled task or persistent setting. Closing the

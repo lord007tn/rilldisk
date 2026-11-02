@@ -293,8 +293,12 @@ async fn main() -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Scan { args, format, top } => {
-            let table = matches!(format, Format::Table);
-            run(args, table, |writer, snapshot| {
+            let hint = if matches!(format, Format::Table) {
+                Hint::Output
+            } else {
+                Hint::Stderr
+            };
+            run(args, hint, |writer, snapshot| {
                 write_scan(writer, snapshot, format, top as usize)
             })
             .await
@@ -309,7 +313,8 @@ async fn main() -> Result<ExitCode> {
             yes,
         } if delete => {
             let code = std::cell::Cell::new(None);
-            let scan_code = run(args, |writer, snapshot| {
+            // No elevation hint: it would suggest removing folders as root.
+            let scan_code = run(args, Hint::Off, |writer, snapshot| {
                 let safety = safety.unwrap_or(vec![SafetyArg::Regenerable, SafetyArg::Cache]);
                 let mut report = find_reclaimable(snapshot, now_ms());
                 report.retain(|c| {
@@ -337,8 +342,12 @@ async fn main() -> Result<ExitCode> {
             safety,
             ..
         } => {
-            let table = matches!(format, ReportFormat::Table);
-            run(args, table, |writer, snapshot| {
+            let hint = if matches!(format, ReportFormat::Table) {
+                Hint::Output
+            } else {
+                Hint::Stderr
+            };
+            run(args, hint, |writer, snapshot| {
                 let mut report = find_reclaimable(snapshot, now_ms());
                 report.retain(|c| {
                     c.logical_bytes >= min_size
@@ -360,12 +369,22 @@ async fn main() -> Result<ExitCode> {
     }
 }
 
+/// Where the elevation hint goes, if anywhere.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Hint {
+    /// At the end of table output.
+    Output,
+    /// On stderr, so JSON stays parseable.
+    Stderr,
+    /// Not at all (`reclaim --delete`).
+    Off,
+}
+
 /// Scan with progress, Ctrl+C cancellation and safe output, then hand the
-/// snapshot to `write`. `table` output ends with its own elevation hint; other
-/// formats get it on stderr.
+/// snapshot to `write`, followed by the elevation hint where `hint` says.
 async fn run(
     args: ScanArgs,
-    table: bool,
+    hint_to: Hint,
     write: impl FnOnce(&mut dyn Write, &Snapshot) -> Result<()>,
 ) -> Result<ExitCode> {
     let control = Arc::new(ScanControl::default());
@@ -434,7 +453,9 @@ async fn run(
         None => Box::new(BufWriter::new(io::stdout().lock())),
     };
     let result = write(&mut writer, &snapshot).and_then(|()| {
-        if table && let Some(hint) = &hint {
+        if hint_to == Hint::Output
+            && let Some(hint) = &hint
+        {
             writeln!(writer, "\n{hint}")?;
         }
         Ok(writer.flush()?)
@@ -459,7 +480,9 @@ async fn run(
         for issue in &snapshot.summary.issues {
             eprintln!("{}: {}", issue.path.display(), issue.message);
         }
-        if !table && let Some(hint) = &hint {
+        if hint_to == Hint::Stderr
+            && let Some(hint) = &hint
+        {
             eprintln!("{hint}");
         }
     }

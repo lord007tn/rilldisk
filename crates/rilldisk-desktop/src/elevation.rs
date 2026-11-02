@@ -92,6 +92,13 @@ impl Elevate {
         self.state.is_elevated || self.preview_elevated
     }
 
+    /// An elevated window only lists (docs/proposals/elevation.md): removing
+    /// reclaim candidates with administrator rights could reach other users'
+    /// folders, so Clean up keeps its plan but offers no removal.
+    pub fn removal_blocked(&self) -> bool {
+        self.state.is_elevated
+    }
+
     /// A `pkexec` prompt, or the elevated app it started, is still running.
     #[cfg(not(windows))]
     fn pending(&self) -> bool {
