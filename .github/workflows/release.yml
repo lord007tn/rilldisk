@@ -373,9 +373,15 @@ jobs:
           if [[ "$PUBLISH" != "true" ]]; then to="$GITHUB_SHA"; fi
           # --output writes the markdown and skips changelogithub's own release creation.
           npx --yes changelogithub@15.0.5 --to "$to" --output changes.md
-          # Downloads table first, then the generated changelog.
-          sed "s/{version}/$VERSION/g; s/{tag}/$TAG/g" .github/release-downloads.md > release-notes.md
-          cat changes.md >> release-notes.md
+          # Intro, this release's highlights (.github/release-notes/<tag>.md, optional),
+          # downloads and install notes, then the generated changelog.
+          fill() { sed "s/{version}/$VERSION/g; s/{tag}/$TAG/g" "$1"; }
+          {
+            fill .github/release-intro.md
+            if [[ -f ".github/release-notes/$TAG.md" ]]; then fill ".github/release-notes/$TAG.md"; echo; fi
+            fill .github/release-downloads.md
+            cat changes.md
+          } > release-notes.md
           cat release-notes.md >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

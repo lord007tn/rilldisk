@@ -5,6 +5,7 @@
 mod app;
 mod capture;
 mod icons;
+mod live;
 mod settings;
 mod style;
 mod sunburst;
@@ -34,7 +35,8 @@ fn main() -> eframe::Result {
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--capture" => capture = value(&mut args).map(PathBuf::from),
+            "--capture" => capture = value(&mut args).map(|d| (PathBuf::from(d), false)),
+            "--capture-live" => capture = value(&mut args).map(|d| (PathBuf::from(d), true)),
             // Unknown values keep the saved or system theme.
             "--theme" => match value(&mut args).as_deref() {
                 Some("dark") => dark = Some(true),
@@ -66,7 +68,14 @@ fn main() -> eframe::Result {
             _ => path = Some(arg),
         }
     }
-    let tour = capture.map(|dir| capture::Tour::new(dir, path.is_none()));
+    let tour = capture.map(|(dir, live)| {
+        let kind = match (path.is_none(), live) {
+            (true, _) => capture::TourKind::Welcome,
+            (false, true) => capture::TourKind::Live,
+            (false, false) => capture::TourKind::Full,
+        };
+        capture::Tour::new(dir, kind)
+    });
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("RillDisk")

@@ -332,6 +332,13 @@ static IS_DARK: AtomicBool = AtomicBool::new(false);
 static IDENTITY: AtomicU8 = AtomicU8::new(0);
 
 /// The active color identity.
+impl Theme {
+    /// The chart gradient, for palette previews.
+    pub fn swatches(&self) -> &[Color32; 6] {
+        &self.stops
+    }
+}
+
 pub fn identity() -> Identity {
     Identity::ALL[IDENTITY.load(Ordering::Relaxed) as usize]
 }

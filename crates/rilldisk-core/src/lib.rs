@@ -14,10 +14,12 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::{Serialize, Serializer, ser::SerializeStruct};
 
+mod live;
 mod platform;
 mod reclaim;
 mod stats;
 
+pub use live::{LiveFolder, LiveView};
 pub use platform::{Volume, volumes};
 pub use reclaim::{Candidate, Category, ReclaimReport, Safety, find_reclaimable};
 pub use stats::{TypeStat, file_types, largest_files};
@@ -194,6 +196,8 @@ pub struct ScanControl {
     limit_reached: AtomicBool,
     /// Set when the scan stops waiting (stall or cancel grace) so leftover workers quit.
     abandoned: AtomicBool,
+    /// Latest picture of the scan in progress; see [`ScanControl::live`].
+    live: std::sync::Mutex<Option<Arc<LiveView>>>,
 }
 
 impl ScanControl {
@@ -202,6 +206,12 @@ impl ScanControl {
     }
     pub fn is_cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
+    }
+    /// Running totals of the largest folders one and two levels below the scan
+    /// root, refreshed a few times per second while the scan runs (None before
+    /// the first refresh). Draw it to show the scan growing.
+    pub fn live(&self) -> Option<Arc<LiveView>> {
+        self.live.lock().ok().and_then(|slot| slot.clone())
     }
     /// Workers stop on user cancellation or when the scan has stopped waiting.
     pub(crate) fn should_stop(&self) -> bool {
@@ -426,6 +436,10 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
         );
     }
     let mut first_link: HashMap<(u64, u64), usize, IdentityHasher> = HashMap::default();
+    let mut live = live::LiveTracker::new();
+    if let Ok(mut slot) = control.live.lock() {
+        *slot = None;
+    }
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(options.threads)
         .thread_name(|i| format!("rilldisk-scan-{i}"))
@@ -575,6 +589,7 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
                     EntryKind::Link => summary.skipped_links += 1,
                     EntryKind::Other => {}
                 }
+                live.add(id, parent, raw.kind, &raw.name, raw.logical, allocated);
                 entries.push(Entry {
                     id,
                     parent_id: Some(parent),
@@ -591,10 +606,12 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
                 });
             }
         }
+        live.publish(&control.live, false);
         if stop {
             break;
         }
     }
+    live.publish(&control.live, true);
     // Leftover workers (hung reads, cancelled tails) exit at their next check.
     control.abandoned.store(true, Ordering::Relaxed);
     drop(first_link);

@@ -1,13 +1,27 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Remembered appearance: palette and light/dark. A two-line text file next to
-//! the update preferences; anything unreadable falls back to defaults.
+//! Remembered preferences: palette, theme and the size metric. A small
+//! `key=value` text file next to the update preferences; anything unreadable
+//! falls back to defaults.
 use crate::style::Identity;
 use std::path::PathBuf;
 
+/// What was saved; `None` means "never chosen", so the caller's default applies.
 #[derive(Default)]
 pub struct Saved {
     pub identity: Option<Identity>,
-    pub dark: Option<bool>,
+    /// `Some(None)`: follow the system theme. `Some(Some(dark))`: a fixed choice.
+    pub theme: Option<Option<bool>>,
+    /// Show sizes as allocated "On disk" instead of logical "Size".
+    pub allocated: Option<bool>,
+}
+
+/// Everything the Settings page can change.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Prefs {
+    pub identity: Identity,
+    /// None follows the operating system.
+    pub theme: Option<bool>,
+    pub allocated: bool,
 }
 
 fn path() -> Option<PathBuf> {
@@ -23,9 +37,17 @@ pub fn load() -> Saved {
         match line.split_once('=') {
             Some(("palette", value)) => saved.identity = Identity::parse(value.trim()),
             Some(("theme", value)) => {
-                saved.dark = match value.trim() {
-                    "dark" => Some(true),
-                    "light" => Some(false),
+                saved.theme = match value.trim() {
+                    "dark" => Some(Some(true)),
+                    "light" => Some(Some(false)),
+                    "system" => Some(None),
+                    _ => None,
+                }
+            }
+            Some(("sizes", value)) => {
+                saved.allocated = match value.trim() {
+                    "on-disk" => Some(true),
+                    "size" => Some(false),
                     _ => None,
                 }
             }
@@ -36,17 +58,22 @@ pub fn load() -> Saved {
 }
 
 /// Best effort: a read-only profile simply keeps the defaults next time.
-pub fn save(identity: Identity, dark: bool) {
+pub fn save(prefs: &Prefs) {
     let Some(path) = path() else { return };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
+    let theme = match prefs.theme {
+        None => "system",
+        Some(true) => "dark",
+        Some(false) => "light",
+    };
     let _ = std::fs::write(
         path,
         format!(
-            "palette={}\ntheme={}\n",
-            identity.name().to_lowercase(),
-            if dark { "dark" } else { "light" }
+            "palette={}\ntheme={theme}\nsizes={}\n",
+            prefs.identity.name().to_lowercase(),
+            if prefs.allocated { "on-disk" } else { "size" }
         ),
     );
 }
