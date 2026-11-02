@@ -79,6 +79,8 @@ pub(crate) struct Slot {
     base_sequence: u16,
     /// Extension records: the base record number.
     base: u32,
+    /// Names (hard links) this record has in listed folders.
+    pub links: u16,
     /// Last write time, FILETIME (100 ns since 1601), or 0.
     pub modified: i64,
     pub logical: u64,
@@ -667,6 +669,7 @@ impl Mft {
         let unit = geometry.record.max(geometry.cluster);
         let chunk_bytes = CHUNK_BYTES.div_ceil(unit) * unit;
         let per_chunk = (chunk_bytes / geometry.record) as usize;
+        let mut phase = std::time::Instant::now();
         let mut slots = vec![Slot::default(); records as usize];
         let chunks: Vec<io::Result<Chunk>> = slots
             .par_chunks_mut(per_chunk)
@@ -707,6 +710,7 @@ impl Mft {
                 })
             })
             .collect();
+        crate::trace("mft read and parse", &mut phase);
         let mut texts = Vec::with_capacity(chunks.len());
         let mut names = Vec::new();
         let mut torn = 0;
@@ -748,6 +752,7 @@ impl Mft {
                     };
             }
         }
+        crate::trace("mft merge", &mut phase);
         // Keep links whose record and parent folder are live user entries.
         names.retain(|name| {
             let Some(slot) = slots.get(name.record as usize) else {
@@ -763,7 +768,12 @@ impl Mft {
                 && (u64::from(name.parent) >= FIRST_USER_RECORD
                     || u64::from(name.parent) == ROOT_RECORD)
         });
+        for name in &names {
+            let links = &mut slots[name.record as usize].links;
+            *links = links.saturating_add(1);
+        }
         names.par_sort_unstable_by_key(|name| (name.parent, name.record, name.chunk, name.offset));
+        crate::trace("mft filter and sort", &mut phase);
         let mut first = vec![0_u32; slots.len() + 1];
         for name in &names {
             first[name.parent as usize + 1] += 1;
@@ -782,12 +792,18 @@ impl Mft {
     }
 
     /// Links (names) directly inside folder `record`, in record order.
-    pub(crate) fn children(&self, record: u32) -> &[Name] {
+    /// Indexes into [`Mft::name_at`] of the links directly inside folder
+    /// `record`, in record order.
+    pub(crate) fn children(&self, record: u32) -> std::ops::Range<u32> {
         let record = record as usize;
         match (self.first.get(record), self.first.get(record + 1)) {
-            (Some(&a), Some(&b)) => &self.names[a as usize..b as usize],
-            _ => &[],
+            (Some(&a), Some(&b)) => a..b,
+            _ => 0..0,
         }
+    }
+
+    pub(crate) fn name_at(&self, index: u32) -> &Name {
+        &self.names[index as usize]
     }
 
     pub(crate) fn name(&self, name: &Name) -> &OsStr {

@@ -56,6 +56,8 @@ use windows_sys::Win32::System::WindowsProgramming::{DRIVE_FIXED, DRIVE_REMOVABL
 
 pub(crate) mod mft;
 
+use rayon::prelude::*;
+
 pub(crate) const BACKEND_MFT: &str = "ntfs-mft";
 const BACKEND_NT: &str = "nt-directory";
 const BACKEND_LEGACY: &str = "win32-batched-directory";
@@ -672,6 +674,7 @@ fn emit_mft(
             control.directories.fetch_add(folders, Ordering::Relaxed);
         }
     };
+    let mut phase = std::time::Instant::now();
     let table = match mft::Mft::read(source, &|| control.should_stop(), &progress) {
         Err(error) if error.kind() == io::ErrorKind::Interrupted && control.should_stop() => {
             return Ok(());
@@ -696,25 +699,77 @@ fn emit_mft(
             ),
         });
     }
-    let mut queue = std::collections::VecDeque::from([(root_record as u32, 0_usize)]);
-    while let Some((record, id)) = queue.pop_front() {
-        if control.should_stop() {
-            return Ok(());
+    crate::trace("mft read and index", &mut phase);
+    // Plan the breadth-first order on indexes only (ids, budget, hard links),
+    // then build the entries in parallel: names and sizes for millions of
+    // entries are the expensive part.
+    let kind_of = |slot: &mft::Slot| {
+        if slot.is_reparse() {
+            EntryKind::Link
+        } else if slot.is_directory() {
+            EntryKind::Directory
+        } else {
+            EntryKind::File
         }
-        for name in table.children(record) {
+    };
+    let base = collector.entries().len();
+    // (name index, parent id, hard-link duplicate)
+    let mut plan: Vec<(u32, u32, bool)> = Vec::new();
+    // Record -> first entry id + 1, for records with several names.
+    let mut first_link: Vec<u32> = Vec::new();
+    let mut multiple: Vec<usize> = Vec::new();
+    let mut listed: Vec<usize> = Vec::new();
+    let mut queue = std::collections::VecDeque::from([(root_record as u32, 0_usize)]);
+    'plan: while let Some((record, id)) = queue.pop_front() {
+        if control.should_stop() {
+            break;
+        }
+        for index in table.children(record) {
+            let name = table.name_at(index);
             let slot = &table.slots[name.record as usize];
-            let kind = if slot.is_reparse() {
-                EntryKind::Link
-            } else if slot.is_directory() {
-                EntryKind::Directory
-            } else {
-                EntryKind::File
-            };
+            let kind = kind_of(slot);
+            if !control.record(
+                kind,
+                if kind == EntryKind::File {
+                    slot.logical
+                } else {
+                    0
+                },
+            ) {
+                break 'plan;
+            }
+            let child = base + plan.len();
+            let mut duplicate = false;
+            if kind == EntryKind::File && slot.links > 1 {
+                if first_link.is_empty() {
+                    first_link = vec![0; table.slots.len()];
+                }
+                match first_link[name.record as usize] {
+                    0 => first_link[name.record as usize] = child as u32 + 1,
+                    first => {
+                        duplicate = true;
+                        multiple.push(first as usize - 1);
+                    }
+                }
+            }
+            plan.push((index, id as u32, duplicate));
+            if kind == EntryKind::Directory {
+                queue.push_back((name.record, child));
+            }
+        }
+        listed.push(id);
+    }
+    drop(first_link);
+    crate::trace("mft plan", &mut phase);
+    let entries: Vec<crate::Entry> = plan
+        .par_iter()
+        .enumerate()
+        .map(|(i, &(index, parent, duplicate))| {
+            let name = table.name_at(index);
+            let slot = &table.slots[name.record as usize];
+            let kind = kind_of(slot);
             let is_file = kind == EntryKind::File;
             let logical = if is_file { slot.logical } else { 0 };
-            if !control.record(kind, logical) {
-                return Ok(());
-            }
             // Same rule as the directory walk: data that fits in the record has
             // no clusters of its own.
             let allocated = if is_file && unit.is_none_or(|unit| slot.allocated >= unit) {
@@ -722,24 +777,31 @@ fn emit_mft(
             } else {
                 0
             };
-            let raw = RawEntry {
+            crate::Entry {
+                id: base + i,
+                parent_id: Some(parent as usize),
                 name: table.name(name).into(),
                 kind,
-                logical,
-                allocated: Some(allocated),
-                modified: filetime_to_unix_ms(slot.modified),
-                identity: is_file
-                    .then_some((0, (u64::from(slot.sequence) << 48) | u64::from(name.record))),
-                skipped: false,
-                key: None,
-            };
-            let child = collector.push(id, raw);
-            if kind == EntryKind::Directory {
-                queue.push_back((name.record, child));
+                logical_bytes: logical,
+                unique_logical_bytes: if duplicate { 0 } else { logical },
+                allocated_bytes: Some(if duplicate { 0 } else { allocated }),
+                modified_unix_ms: filetime_to_unix_ms(slot.modified),
+                file_count: u64::from(is_file),
+                hard_link_duplicate: duplicate,
+                multiple_links: duplicate,
+                fully_listed: kind != EntryKind::Directory,
             }
-        }
+        })
+        .collect();
+    drop(plan);
+    collector.append(entries);
+    for id in multiple {
+        collector.mark_multiple_links(id);
+    }
+    for id in listed {
         collector.set_fully_listed(id, true);
     }
+    crate::trace("mft emit", &mut phase);
     Ok(())
 }
 

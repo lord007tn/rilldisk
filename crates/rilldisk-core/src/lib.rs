@@ -373,45 +373,111 @@ impl std::hash::Hasher for IdentityHash {
 /// First entry seen for each file identity, to find hard-link duplicates.
 ///
 /// NTFS file IDs are a 48-bit MFT record number plus a 16-bit sequence number,
-/// and record numbers are dense, so they index a flat table directly: 8 bytes
-/// per record instead of a ~40-byte hash map slot, and no hashing. Identities
-/// that do not look like that (ReFS 128-bit IDs, Unix `(device, inode)` pairs,
-/// which are only recorded for files with several links) use a hash map.
+/// and record numbers are dense, so once a scan has seen many files a flat table
+/// indexed by record number is far smaller than a hash map (8 bytes per record
+/// instead of ~40 per file) and needs no hashing. Small scans keep the map: the
+/// table is sized by the highest record number on the volume, not by the scan.
+/// Identities that do not look like NTFS IDs (ReFS 128-bit IDs, Unix
+/// `(device, inode)` pairs, recorded only for files with several links) always
+/// use the map.
 #[derive(Default)]
 struct LinkTable {
     /// Record number -> (first entry id + 1, sequence number); 0 is empty.
     dense: Vec<(u32, u16)>,
+    dense_active: bool,
+    max_record: u64,
     map: HashMap<(u64, u64), usize, IdentityHasher>,
 }
 
-/// Record numbers above this go to the map (the dense table would be too large).
+/// Record numbers above this always go to the map.
 const DENSE_RECORDS: u64 = 1 << 27;
+const RECORD_MASK: u64 = 0xFFFF_FFFF_FFFF;
 
 impl LinkTable {
+    fn dense_key(identity: (u64, u64), id: usize) -> Option<(usize, u16)> {
+        let record = identity.1 & RECORD_MASK;
+        (identity.0 == 0 && record < DENSE_RECORDS && id < u32::MAX as usize)
+            .then_some((record as usize, (identity.1 >> 48) as u16))
+    }
+
     /// The first entry with this identity, or None after recording `id` as first.
     fn first(&mut self, identity: (u64, u64), id: usize) -> Option<usize> {
-        let record = identity.1 & 0xFFFF_FFFF_FFFF;
-        if identity.0 == 0 && record < DENSE_RECORDS && id < u32::MAX as usize {
-            let sequence = (identity.1 >> 48) as u16;
-            let record = record as usize;
-            if self.dense.len() <= record {
-                self.dense
-                    .resize((record + 1).next_power_of_two().max(1 << 16), (0, 0));
+        let dense = Self::dense_key(identity, id);
+        if let Some((record, sequence)) = dense {
+            self.max_record = self.max_record.max(record as u64);
+            if self.dense_active {
+                if self.dense.len() <= record {
+                    let len = (record + 1).next_power_of_two().min(DENSE_RECORDS as usize);
+                    self.dense.resize(len, (0, 0));
+                }
+                let slot = &mut self.dense[record];
+                if slot.0 != 0 && slot.1 == sequence {
+                    return Some(slot.0 as usize - 1);
+                }
+                *slot = (id as u32 + 1, sequence);
+                return None;
             }
-            let slot = &mut self.dense[record];
-            if slot.0 != 0 && slot.1 == sequence {
-                return Some(slot.0 as usize - 1);
-            }
-            *slot = (id as u32 + 1, sequence);
-            return None;
         }
-        match self.map.entry(identity) {
+        let first = match self.map.entry(identity) {
             std::collections::hash_map::Entry::Occupied(first) => Some(*first.get()),
             std::collections::hash_map::Entry::Vacant(slot) => {
                 slot.insert(id);
                 None
             }
+        };
+        // Switch once the table would be smaller than the map (~40 B per entry).
+        if dense.is_some()
+            && !self.dense_active
+            && self.map.len() > (1 << 20).max(self.max_record as usize / 5)
+        {
+            self.densify();
         }
+        first
+    }
+
+    fn densify(&mut self) {
+        let table = &mut self.dense;
+        *table = vec![(0, 0); self.max_record as usize + 1];
+        self.map
+            .retain(|&identity, &mut id| match Self::dense_key(identity, id) {
+                Some((record, sequence)) => {
+                    // A record reused during the scan: keep the newer file. The
+                    // deleted one has no names left to meet.
+                    if table[record].0 == 0 || table[record].1 < sequence {
+                        table[record] = (id as u32 + 1, sequence);
+                    }
+                    false
+                }
+                None => true,
+            });
+        self.map.shrink_to_fit();
+        self.dense_active = true;
+    }
+}
+
+#[cfg(test)]
+mod link_table_tests {
+    use super::LinkTable;
+
+    #[test]
+    fn finds_first_links_before_and_after_switching_to_the_dense_table() {
+        let mut table = LinkTable::default();
+        let ntfs = |record: u64, sequence: u64| (0, (sequence << 48) | record);
+        assert_eq!(table.first(ntfs(40, 1), 0), None);
+        assert_eq!(table.first(ntfs(40, 1), 5), Some(0));
+        // A reused record (new sequence number) is a different file.
+        assert_eq!(table.first(ntfs(40, 2), 6), None);
+        assert_eq!(table.first((7, 40), 7), None, "not an NTFS ID: the map");
+        for i in 0..(1_u64 << 20) + 2 {
+            table.first(ntfs(1000 + i, 1), 10 + i as usize);
+        }
+        assert!(table.dense_active);
+        assert!(table.map.len() <= 2);
+        assert_eq!(table.first(ntfs(40, 2), 99), Some(6));
+        assert_eq!(table.first(ntfs(1000, 1), 99), Some(10));
+        assert_eq!(table.first((7, 40), 99), Some(7));
+        assert_eq!(table.first(ntfs(1 << 26, 1), 3), None, "grows on demand");
+        assert_eq!(table.first(ntfs(1 << 26, 1), 4), Some(3));
     }
 }
 
@@ -455,8 +521,7 @@ pub(crate) struct Collector {
 }
 
 impl Collector {
-    /// Retain one entry below `parent` and return its id. This is the single
-    /// place where entries are created, with hard links resolved.
+    /// Retain one entry below `parent`, resolving hard links, and return its id.
     pub(crate) fn push(&mut self, parent: usize, raw: RawEntry) -> usize {
         let id = self.entries.len();
         let mut duplicate = false;
@@ -467,38 +532,71 @@ impl Collector {
             duplicate = true;
             self.entries[first].multiple_links = true;
         }
+        self.accept(
+            Entry {
+                id,
+                parent_id: Some(parent),
+                name: raw.name,
+                kind: raw.kind,
+                logical_bytes: raw.logical,
+                unique_logical_bytes: if duplicate { 0 } else { raw.logical },
+                allocated_bytes: if duplicate { Some(0) } else { raw.allocated },
+                modified_unix_ms: raw.modified,
+                file_count: u64::from(raw.kind == EntryKind::File),
+                hard_link_duplicate: duplicate,
+                multiple_links: duplicate,
+                fully_listed: raw.kind != EntryKind::Directory,
+            },
+            raw.skipped,
+        );
+        id
+    }
+
+    /// Append entries a backend built in parallel (ids already assigned in
+    /// order, parents first, hard links resolved).
+    #[cfg(windows)]
+    pub(crate) fn append(&mut self, entries: Vec<Entry>) {
+        self.entries.reserve(entries.len());
+        for entry in entries {
+            self.accept(entry, false);
+        }
+    }
+
+    /// The single place where every retained entry, of every backend, is
+    /// counted and stored, with its parent id, parents before children.
+    /// `skipped`: a folder that was deliberately not entered (a mount point).
+    fn accept(&mut self, entry: Entry, skipped: bool) {
+        debug_assert_eq!(entry.id, self.entries.len());
+        debug_assert!(entry.parent_id.is_some_and(|p| p < entry.id));
         let summary = &mut self.summary;
-        match raw.kind {
+        match entry.kind {
             EntryKind::Directory => {
                 summary.directories += 1;
                 // Never listed, so it stays `fully_listed: false`.
-                summary.skipped_mounts += u64::from(raw.skipped);
+                summary.skipped_mounts += u64::from(skipped);
             }
             EntryKind::File => {
                 summary.files += 1;
-                summary.hard_link_duplicates += u64::from(duplicate);
+                summary.hard_link_duplicates += u64::from(entry.hard_link_duplicate);
             }
             EntryKind::Link => summary.skipped_links += 1,
             EntryKind::Other => {}
         }
-        let allocated = if duplicate { Some(0) } else { raw.allocated };
-        self.live
-            .add(id, parent, raw.kind, &raw.name, raw.logical, allocated);
-        self.entries.push(Entry {
-            id,
-            parent_id: Some(parent),
-            name: raw.name,
-            kind: raw.kind,
-            logical_bytes: raw.logical,
-            unique_logical_bytes: if duplicate { 0 } else { raw.logical },
-            allocated_bytes: if duplicate { Some(0) } else { raw.allocated },
-            modified_unix_ms: raw.modified,
-            file_count: u64::from(raw.kind == EntryKind::File),
-            hard_link_duplicate: duplicate,
-            multiple_links: duplicate,
-            fully_listed: raw.kind != EntryKind::Directory,
-        });
-        id
+        let parent = entry.parent_id.expect("only the root has no parent");
+        self.live.add(
+            entry.id,
+            parent,
+            entry.kind,
+            &entry.name,
+            entry.logical_bytes,
+            entry.allocated_bytes,
+        );
+        self.entries.push(entry);
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn mark_multiple_links(&mut self, id: usize) {
+        self.entries[id].multiple_links = true;
     }
 
     #[cfg(windows)]
@@ -834,6 +932,7 @@ fn finish(
         mut live,
     } = collector;
     live.publish(&control.live, true);
+    let mut phase = Instant::now();
     control.abandoned.store(true, Ordering::Relaxed);
     drop(links);
     // Report the memory bound once rather than once per truncated directory.
@@ -868,6 +967,7 @@ fn finish(
             .zip(allocated)
             .map(|(a, b)| a.saturating_add(b));
     }
+    trace("rollup", &mut phase);
     summary.logical_bytes = entries[0].logical_bytes;
     summary.unique_logical_bytes = entries[0].unique_logical_bytes;
     summary.allocated_bytes = entries[0].allocated_bytes;
@@ -878,12 +978,26 @@ fn finish(
         .directories
         .store(summary.directories, Ordering::Relaxed);
     let children = ChildIndex::build(&entries);
+    trace("child index", &mut phase);
     summary.elapsed_ms = start.elapsed().as_millis();
     Snapshot {
         summary,
         entries,
         children,
     }
+}
+
+/// Profiling aid: with `RILLDISK_TRACE_PHASES=1`, print how long each scan phase
+/// took to stderr (local only; nothing is recorded or sent anywhere).
+pub(crate) fn trace(phase: &str, since: &mut Instant) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ENABLED.get_or_init(|| std::env::var_os("RILLDISK_TRACE_PHASES").is_some()) {
+        eprintln!(
+            "phase {phase}: {:.1} ms",
+            since.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+    *since = Instant::now();
 }
 
 /// Full path of `id`, rebuilt from the parent chain.
