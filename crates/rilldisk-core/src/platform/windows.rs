@@ -88,6 +88,8 @@ const LIST_BUFFER: usize = 64 << 10;
 struct Layout {
     class: FILE_INFORMATION_CLASS,
     name: usize,
+    /// Where a reparse point's tag is (IdBoth reuses `EaSize` for it).
+    tag: usize,
     id: usize,
     id_len: usize,
     min: usize,
@@ -96,6 +98,7 @@ struct Layout {
 const ID_BOTH: Layout = Layout {
     class: FileIdBothDirectoryInformation,
     name: offset_of!(FILE_ID_BOTH_DIR_INFO, FileName),
+    tag: offset_of!(FILE_ID_BOTH_DIR_INFO, EaSize),
     id: offset_of!(FILE_ID_BOTH_DIR_INFO, FileId),
     id_len: 8,
     // A record ends after its name: the last one need not be padded to the
@@ -106,6 +109,7 @@ const ID_BOTH: Layout = Layout {
 const ID_EXTD: Layout = Layout {
     class: FileIdExtdDirectoryInformation,
     name: offset_of!(FILE_ID_EXTD_DIR_INFORMATION, FileName),
+    tag: offset_of!(FILE_ID_EXTD_DIR_INFORMATION, ReparsePointTag),
     id: offset_of!(FILE_ID_EXTD_DIR_INFORMATION, FileId),
     id_len: 16,
     min: offset_of!(FILE_ID_EXTD_DIR_INFORMATION, FileName),
@@ -441,7 +445,7 @@ fn check_not_reparse(handle: &Handle) -> io::Result<()> {
     {
         return Err(io::Error::last_os_error());
     }
-    if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+    if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 && !mft::disguised(info.ReparseTag) {
         return Err(io::Error::other(
             "directory became a reparse point; skipped",
         ));
@@ -519,7 +523,9 @@ fn legacy_enumerate(
         .open(path)?;
     // Recheck the opened handle: a directory may have become a junction since discovery.
     let attributes: FILE_ATTRIBUTE_TAG_INFO = info(&directory, FileAttributeTagInfo)?;
-    if attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+    if attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        && !mft::disguised(attributes.ReparseTag)
+    {
         return Err(io::Error::other(
             "directory became a reparse point; skipped",
         ));
@@ -591,6 +597,11 @@ fn parse_record(bytes: &[u8], offset: usize, layout: Layout) -> io::Result<(Reco
     let next = u32_at(0) as usize;
     let length = u32_at(60) as usize;
     let attributes = u32_at(56);
+    // A reparse point is a link that is not followed, unless its filter driver
+    // presents it as an ordinary file or folder (WOF, dedup, cloud files, ProjFS):
+    // the same rule as the MFT backend, whether or not this listing disguises it.
+    let link =
+        attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 && !mft::disguised(u32_at(layout.tag));
     if length == 0
         || !length.is_multiple_of(2)
         || layout.name + length > rest.len()
@@ -607,12 +618,12 @@ fn parse_record(bytes: &[u8], offset: usize, layout: Layout) -> io::Result<(Reco
     if wide == [46] || wide == [46, 46] {
         return Ok((
             Record::Dot {
-                reparse: wide.len() == 1 && attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+                reparse: wide.len() == 1 && link,
             },
             next,
         ));
     }
-    let kind = if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+    let kind = if link {
         EntryKind::Link
     } else if attributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
         EntryKind::Directory
@@ -778,6 +789,7 @@ fn emit_mft(
     let mut first_link: Vec<u32> = Vec::new();
     let mut multiple: Vec<usize> = Vec::new();
     let mut listed: Vec<usize> = Vec::new();
+    let mut placeholders = 0_u64;
     let mut queue = std::collections::VecDeque::from([(root_record as u32, 0_usize)]);
     'plan: while let Some((record, id)) = queue.pop_front() {
         if control.should_stop() {
@@ -820,9 +832,24 @@ fn emit_mft(
                 queue.push_back((name.record, child));
             }
         }
-        listed.push(id);
+        if table.slots[record as usize].may_lack_children() {
+            placeholders += 1;
+        } else {
+            listed.push(id);
+        }
     }
     drop(first_link);
+    if placeholders > 0 {
+        let path = crate::entry_path(collector.entries(), 0);
+        collector.issue(ScanIssue::new(
+            path,
+            crate::IssueKind::Other,
+            format!(
+                "{placeholders} cloud or ProjFS placeholder folders keep some contents only at their provider; \
+                 the MFT shows what is on this disk (scan with --backend dir to ask the provider)"
+            ),
+        ));
+    }
     if crate::tracing() {
         // Which reparse tags became links (not followed): counts only.
         let mut tags = std::collections::BTreeMap::<u32, u64>::new();

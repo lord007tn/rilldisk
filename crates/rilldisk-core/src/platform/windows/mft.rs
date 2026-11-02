@@ -80,6 +80,10 @@ const SLOT_REPARSE: u8 = 0x04;
 const SLOT_EXTENSION: u8 = 0x08;
 const SLOT_HAS_DATA: u8 = 0x10;
 const SLOT_TORN: u8 = 0x20;
+/// `FILE_ATTRIBUTE_RECALL_ON_OPEN`: a placeholder folder whose contents are not
+/// all on this disk (the provider fills them in when it is listed).
+const SLOT_RECALL: u8 = 0x40;
+const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x0004_0000;
 
 /// One MFT record, after parsing. Indexed by record number.
 #[derive(Clone, Copy, Default)]
@@ -119,9 +123,21 @@ impl Slot {
     pub fn is_link(&self) -> bool {
         self.is_reparse() && !disguised(self.reparse_tag)
     }
+    /// A cloud or ProjFS placeholder folder that may have children which exist
+    /// only at the provider: the MFT cannot see them, so the folder must not be
+    /// reported as fully listed.
+    pub fn may_lack_children(&self) -> bool {
+        self.is_directory()
+            && self.is_reparse()
+            && !self.is_link()
+            && (self.reparse_tag == TAG_PROJFS || self.flags & SLOT_RECALL != 0)
+    }
 }
 
-fn disguised(tag: u32) -> bool {
+/// Reparse tags whose filter drivers present the file or folder as an ordinary
+/// one. Shared with the directory walks, so every backend classifies a reparse
+/// point the same way, whatever a listing exposes.
+pub(crate) fn disguised(tag: u32) -> bool {
     matches!(tag, TAG_WOF | TAG_DEDUP | TAG_PROJFS) || tag & TAG_CLOUD_MASK == TAG_CLOUD
 }
 
@@ -156,9 +172,56 @@ pub(crate) struct Name {
 #[derive(Default)]
 struct Chunk {
     names: Vec<Name>,
+    /// (record, allocation) of `WofCompressedData` streams; counted only once the
+    /// file's tag (possibly from an extension record) confirms WOF.
+    wof: Vec<(u32, u64)>,
     /// Names, each one either UTF-8 or bytes from `OsStr::as_encoded_bytes`.
     text: Vec<u8>,
     torn: u64,
+}
+
+/// Fold extension records into their base record: what did not fit there.
+/// Overflow names are remapped separately; this takes the first `$DATA`
+/// fragment of very fragmented files, `$REPARSE_POINT`, and allocation. Then a
+/// WOF file's compressed stream (wherever it was) is added, once the base
+/// record's final tag says the file is WOF-compressed.
+fn fold_extensions(slots: &mut [Slot], wof: &[(u32, u64)]) {
+    let base_of = |slots: &[Slot], index: usize| -> Option<usize> {
+        let slot = slots.get(index)?;
+        if slot.flags & SLOT_EXTENSION == 0 {
+            return slot.in_use().then_some(index);
+        }
+        let base = slots.get(slot.base as usize)?;
+        (slot.flags & SLOT_IN_USE != 0 && base.in_use() && base.sequence == slot.base_sequence)
+            .then_some(slot.base as usize)
+    };
+    for index in 0..slots.len() {
+        let slot = slots[index];
+        if slot.flags & SLOT_EXTENSION == 0 {
+            continue;
+        }
+        let Some(base) = base_of(slots, index) else {
+            continue;
+        };
+        let target = &mut slots[base];
+        if slot.flags & SLOT_HAS_DATA != 0 && target.flags & SLOT_HAS_DATA == 0 {
+            target.flags |= SLOT_HAS_DATA;
+            target.logical = slot.logical;
+        }
+        // Only the unnamed stream's VCN-0 fragment reports sizes, so this adds
+        // that fragment's allocation once, wherever it lives.
+        target.allocated += slot.allocated;
+        if target.reparse_tag == 0 {
+            target.reparse_tag = slot.reparse_tag;
+        }
+    }
+    for &(record, allocated) in wof {
+        if let Some(base) = base_of(slots, record as usize)
+            && slots[base].reparse_tag == TAG_WOF
+        {
+            slots[base].allocated += allocated;
+        }
+    }
 }
 
 /// Size facts from the boot sector and `$MFT`'s own record.
@@ -617,8 +680,12 @@ fn parse_record(record: &mut [u8], index: u64, slot: &mut Slot, chunk: &mut Chun
             ATTR_STANDARD_INFORMATION => {
                 if let Some(value) = attribute.value {
                     slot.modified = u64_at(value, 0x08).unwrap_or(0) as i64;
-                    if u32_at(value, 0x20).unwrap_or(0) & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    let attributes = u32_at(value, 0x20).unwrap_or(0);
+                    if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
                         slot.flags |= SLOT_REPARSE;
+                    }
+                    if attributes & FILE_ATTRIBUTE_RECALL_ON_OPEN != 0 {
+                        slot.flags |= SLOT_RECALL;
                     }
                 }
             }
@@ -660,7 +727,7 @@ fn parse_record(record: &mut [u8], index: u64, slot: &mut Slot, chunk: &mut Chun
             // unnamed stream and its data here: count what this stream occupies.
             ATTR_DATA if attribute_named(attribute.raw, WOF_STREAM) => {
                 if let Some((_, allocated)) = data_sizes(&attribute) {
-                    slot.allocated += allocated;
+                    chunk.wof.push((index as u32, allocated));
                 }
             }
             ATTR_REPARSE_POINT => {
@@ -790,41 +857,16 @@ impl Mft {
         crate::trace("mft read and parse", &mut phase);
         let mut texts = Vec::with_capacity(chunks.len());
         let mut names = Vec::new();
+        let mut wof = Vec::new();
         let mut torn = 0;
         for chunk in chunks {
             let chunk = chunk?;
             torn += chunk.torn;
+            wof.extend_from_slice(&chunk.wof);
             names.extend_from_slice(&chunk.names);
             texts.push(chunk.text);
         }
-        // Extension records carry what did not fit in the base record: overflow
-        // names (heavily hard-linked files), the first `$DATA` fragment of very
-        // fragmented files, a WOF file's compressed stream, `$REPARSE_POINT`.
-        // Fold them into their base record.
-        for index in 0..slots.len() {
-            let slot = slots[index];
-            if slot.flags & SLOT_EXTENSION == 0 || slot.flags & SLOT_IN_USE == 0 {
-                continue;
-            }
-            let Some(base) = slots.get(slot.base as usize).copied() else {
-                continue;
-            };
-            if !base.in_use() || base.sequence != slot.base_sequence {
-                continue;
-            }
-            let target = &mut slots[slot.base as usize];
-            if slot.flags & SLOT_HAS_DATA != 0 && target.flags & SLOT_HAS_DATA == 0 {
-                target.flags |= SLOT_HAS_DATA;
-                target.logical = slot.logical;
-            }
-            // Allocation of the unnamed stream's first fragment and of a WOF
-            // stream, whichever this record holds (each is counted once: only the
-            // fragment that starts at VCN 0 reports sizes).
-            target.allocated += slot.allocated;
-            if target.reparse_tag == 0 {
-                target.reparse_tag = slot.reparse_tag;
-            }
-        }
+        fold_extensions(&mut slots, &wof);
         for name in &mut names {
             let slot = slots[name.record as usize];
             if slot.flags & SLOT_EXTENSION != 0 {
@@ -1377,7 +1419,11 @@ mod tests {
                 reparse(TAG_WOF),
             ],
         );
-        let (slot, _) = parse(&mut r, 60);
+        let mut slots = vec![Slot::default(); 61];
+        let mut chunk = Chunk::default();
+        parse_record(&mut r, 60, &mut slots[60], &mut chunk, 0);
+        fold_extensions(&mut slots, &chunk.wof);
+        let slot = slots[60];
         assert!(slot.is_reparse() && !slot.is_link());
         assert_eq!((slot.logical, slot.allocated), (900_000, 61_440));
         for (tag, link) in [
@@ -1403,12 +1449,38 @@ mod tests {
         }
     }
 
+    /// A named `$DATA` attribute (for the WOF stream).
+    fn named_stream(name: &str, allocated: u64) -> Vec<u8> {
+        let wide: Vec<u16> = name.encode_utf16().collect();
+        let mut a = nonresident(0, 0, allocated, allocated, 0, &[])[..0x48].to_vec();
+        a[9] = wide.len() as u8;
+        a[0x0A..0x0C].copy_from_slice(&0x48_u16.to_le_bytes());
+        for c in &wide {
+            a.extend_from_slice(&c.to_le_bytes());
+        }
+        while !a.len().is_multiple_of(8) {
+            a.push(0);
+        }
+        let runs_at = a.len();
+        a.extend_from_slice(&[0x11, 0x0F, 0x20, 0x00, 0, 0, 0, 0]);
+        a[0x20..0x22].copy_from_slice(&(runs_at as u16).to_le_bytes());
+        let len = a.len() as u32;
+        a[4..8].copy_from_slice(&len.to_le_bytes());
+        a
+    }
+
+    fn reparse_point(tag: u32) -> Vec<u8> {
+        let mut v = vec![0_u8; 8];
+        v[0..4].copy_from_slice(&tag.to_le_bytes());
+        resident(ATTR_REPARSE_POINT, &v, &[])
+    }
+
     #[test]
     fn extension_records_bring_the_reparse_tag_and_wof_allocation() {
-        let mut v = vec![0_u8; 8];
-        v[0..4].copy_from_slice(&TAG_WOF.to_le_bytes());
-        let reparse = resident(ATTR_REPARSE_POINT, &v, &[]);
-        let base = record(
+        // A hard-linked, WOF-compressed system file: the base record holds the
+        // names and the sparse unnamed stream; the extension record (base
+        // reference: record 70, sequence 3) holds the WOF stream and the tag.
+        let mut base = record(
             1024,
             RECORD_IN_USE,
             3,
@@ -1426,27 +1498,69 @@ mod tests {
                 ),
             ],
         );
-        // The extension record (base reference: record 70, sequence 3) holds the
-        // reparse point, as for files whose names fill the base record.
-        let extension = record(1024, RECORD_IN_USE, 1, (3_u64 << 48) | 70, &[reparse]);
-        let (base_slot, _) = parse(&mut base.clone(), 70);
-        assert_eq!(base_slot.reparse_tag, 0);
-        assert!(base_slot.is_link(), "unknown tag on its own: a link");
-        let (extension_slot, _) = parse(&mut extension.clone(), 71);
-        assert_eq!(extension_slot.reparse_tag, TAG_WOF);
-        // Fold as Mft::read does.
+        let mut extension = record(
+            1024,
+            RECORD_IN_USE,
+            1,
+            (3_u64 << 48) | 70,
+            &[named_stream(WOF_STREAM, 61_440), reparse_point(TAG_WOF)],
+        );
         let mut slots = vec![Slot::default(); 72];
-        slots[70] = base_slot;
-        slots[71] = extension_slot;
-        let slot = slots[71];
-        let target = &mut slots[slot.base as usize];
-        target.allocated += slot.allocated;
-        if target.reparse_tag == 0 {
-            target.reparse_tag = slot.reparse_tag;
-        }
+        let mut chunk = Chunk::default();
+        parse_record(&mut base, 70, &mut slots[70], &mut chunk, 0);
+        parse_record(&mut extension, 71, &mut slots[71], &mut chunk, 0);
+        assert!(slots[70].is_link(), "unknown tag on its own: a link");
+        fold_extensions(&mut slots, &chunk.wof);
         assert!(
             !slots[70].is_link(),
             "a WOF file once its extension is folded in"
+        );
+        assert_eq!((slots[70].logical, slots[70].allocated), (900_000, 61_440));
+    }
+
+    #[test]
+    fn a_wof_named_stream_alone_does_not_change_allocation() {
+        let mut ordinary = record(
+            1024,
+            RECORD_IN_USE,
+            1,
+            0,
+            &[
+                standard(0, 0),
+                file_name(5, 5, 1, "plain.bin"),
+                nonresident(0, 0, 8192, 5000, 0, &[0x11, 0x02, 0x10, 0x00]),
+                named_stream(WOF_STREAM, 61_440),
+            ],
+        );
+        let mut slots = vec![Slot::default(); 81];
+        let mut chunk = Chunk::default();
+        parse_record(&mut ordinary, 80, &mut slots[80], &mut chunk, 0);
+        fold_extensions(&mut slots, &chunk.wof);
+        assert_eq!(slots[80].allocated, 8192);
+    }
+
+    #[test]
+    fn placeholder_folders_with_children_elsewhere_are_flagged() {
+        let folder = |tag: u32, attributes: u32| {
+            let mut r = record(
+                4096,
+                RECORD_IN_USE | RECORD_IS_DIRECTORY,
+                1,
+                0,
+                &[
+                    standard(FILE_ATTRIBUTE_REPARSE_POINT | attributes, 0),
+                    file_name(5, 5, 1, "folder"),
+                    reparse_point(tag),
+                ],
+            );
+            parse(&mut r, 90).0
+        };
+        assert!(folder(0x9000_701A, FILE_ATTRIBUTE_RECALL_ON_OPEN).may_lack_children());
+        assert!(!folder(0x9000_701A, 0).may_lack_children(), "fully on disk");
+        assert!(folder(TAG_PROJFS, 0).may_lack_children());
+        assert!(
+            !folder(0xA000_0003, FILE_ATTRIBUTE_RECALL_ON_OPEN).may_lack_children(),
+            "a junction"
         );
     }
 

@@ -780,7 +780,7 @@ impl Collector {
         for (name, error) in errors {
             let mut path = entry_path(&self.entries, id);
             match name {
-                Some(name) if IssueKind::of(error) == IssueKind::AccessDenied => {
+                Some(_) if IssueKind::of(error) == IssueKind::AccessDenied => {
                     if !std::mem::replace(&mut denied, true) {
                         let mut issue = ScanIssue::from_error(path, error);
                         issue.message = format!("entries could not be examined: {error}");

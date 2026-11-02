@@ -271,8 +271,13 @@ def main():
         if args.verify_allocation:
             start = time.perf_counter()
             allocated, unreadable = true_allocation(target)
+            # Only the generator's own locked folder may be missing from the truth,
+            # and only when its manifest says what that folder holds.
+            locked = os.path.normcase(verbatim(os.path.join(str(target), "locked")) if os.name == "nt"
+                                      else os.path.join(os.path.abspath(target), "locked"))
             report["truth"] = {"allocated_bytes": allocated, "unreadable_folders": len(unreadable),
-                               "only_the_locked_folder": all(os.path.basename(p) == "locked" for p in unreadable)}
+                               "only_the_locked_folder": manifest is not None
+                               and all(os.path.normcase(p) == locked for p in unreadable)}
             print(f"true allocation measured in {time.perf_counter() - start:.0f} s", file=sys.stderr)
     finally:
         if created and not args.keep:
@@ -391,6 +396,9 @@ def summarize(report, args):
             verdict("UNVERIFIED", "the allocation truth could not read some folders besides the locked one")
             truth = None
             expected.clear()
+    for backend in allocations:
+        if truth is not None and backend not in expected:
+            verdict("UNVERIFIED", f"{backend}: no expected allocation could be derived from the truth")
     stable_exact = True
     for backend, values in sorted(allocations.items()):
         listing = backend in LISTING_ALLOCATION
