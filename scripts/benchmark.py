@@ -23,17 +23,20 @@ value), hard-link duplicates, links and mounts not followed, issue counts.
 Each check ends in one of:
 
   IDENTICAL                    every run of every backend reports the same value
-  VALIDATED DIFFERING COVERAGE backends read different folders (an elevated MFT
-                               scan reads the fixture's locked folder; a walk
-                               reports it as one issue) and each matches the
-                               generator's manifest for what it read
+  VALIDATED DIFFERING COVERAGE backends read different folders and each matches
+                               the generator's manifest for what it read. Shown,
+                               but not a pass: when elevated, every backend runs
+                               with backup privilege so all of them read the
+                               locked folder and must be IDENTICAL
   VALIDATED EXCEPTION          NTFS directory listings report the allocation
                                cached in each folder entry, which lags some files'
-                               MFT records (it can change from run to run). Only
-                               accepted when --verify-allocation measured the true
-                               allocation file by file and a backend that reads
-                               records (the MFT) or Unix walks match it exactly;
-                               the walks' deviation is printed
+                               MFT records (it can change from run to run) and is
+                               0 for WOF-compressed files. Accepted only for the
+                               Windows walks, only against the allocation that
+                               --verify-allocation measured file by file, and only
+                               within 0.25 % of it; the deviation is printed.
+                               Backends that read records (the MFT) and the Unix
+                               walks must match the truth exactly
   UNVERIFIED                   a difference that could be the exception above, but
                                no ground truth was measured
   MISMATCH / FAILED            anything else, or a requested run that failed
@@ -61,6 +64,8 @@ COUNTS = ["files", "directories", "logical_bytes", "unique_logical_bytes",
 TOTALS = COUNTS + ["allocated_bytes"]
 # Walks whose allocation comes from NTFS folder entries.
 LISTING_ALLOCATION = ("nt-directory", "win32-batched-directory")
+# Largest accepted deviation of listing-derived allocation from the truth.
+LISTING_TOLERANCE = 0.0025
 
 
 def exe(directory, name):
@@ -77,12 +82,16 @@ def elevated():
     return os.geteuid() == 0
 
 
-def run(bench, target, backend, threads, image=False):
+def run(bench, target, backend, threads, image=False, backup=False):
     args = [bench] + (["--ntfs-image", str(target)] if image else [str(target), "--backend", backend])
+    if backup:
+        args.append("--backup-privilege")
     if threads:
         args += ["--threads", str(threads)]
     started = time.perf_counter()
     result = subprocess.run(args, capture_output=True, text=True, encoding="utf-8")
+    if os.environ.get("RILLDISK_TRACE_PHASES") and result.stderr:
+        print(result.stderr.rstrip(), file=sys.stderr)
     if result.returncode != 0:
         return {"requested_backend": backend, "error": (result.stderr or result.stdout).strip()[-400:]}
     report = json.loads(result.stdout.strip().splitlines()[-1])
@@ -124,15 +133,18 @@ def true_allocation(root):
             _fields_ = [("allocation", ctypes.c_longlong), ("end", ctypes.c_longlong),
                         ("links", wintypes.DWORD), ("delete", ctypes.c_bool), ("directory", ctypes.c_bool)]
 
-        drive = os.path.splitdrive(os.path.abspath(root))[0] + "\\"
+        drive = os.path.splitdrive(plain(root))[0] + "\\"
         sectors, size, free, count = (wintypes.DWORD() for _ in range(4))
         kernel.GetDiskFreeSpaceW(drive, ctypes.byref(sectors), ctypes.byref(size), ctypes.byref(free),
                                  ctypes.byref(count))
         cluster = sectors.value * size.value
+        # Below one cluster means "inside the MFT record" only when a cluster is at
+        # least as large as a record (4 KiB covers both 1 KiB and 4 KiB records).
+        if cluster < 4096:
+            raise SystemExit(f"--verify-allocation needs clusters of at least 4 KiB (this volume: {cluster} bytes)")
 
         def query(path):
-            verbatim = path if path.startswith("\\\\?\\") else "\\\\?\\" + os.path.abspath(path)
-            handle = kernel.CreateFileW(verbatim, 0x80, 7, None, 3,
+            handle = kernel.CreateFileW(verbatim(path), 0x80, 7, None, 3,
                                         0x02000000 | 0x00200000, None)
             if handle in (None, wintypes.HANDLE(-1).value):
                 raise OSError(ctypes.get_last_error(), path)
@@ -143,11 +155,11 @@ def true_allocation(root):
             if not ok:
                 raise OSError(ctypes.get_last_error(), path)
             return info.allocation if info.allocation >= cluster else 0
-    stack = [os.path.abspath(root)]
+    stack = [plain(root)]
     while stack:
         folder = stack.pop()
         try:
-            entries = list(os.scandir("\\\\?\\" + folder if os.name == "nt" else folder))
+            entries = list(os.scandir(verbatim(folder) if os.name == "nt" else folder))
         except OSError:
             unreadable += 1
             continue
@@ -165,6 +177,27 @@ def true_allocation(root):
                 seen.add(key)
                 total += query(entry.path) if query else info.st_blocks * 512
     return total, unreadable
+
+
+def plain(path):
+    r"""An absolute path without a `\\?\` prefix (the form os.path works with)."""
+    path = os.path.abspath(str(path))
+    if path.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + path[8:]
+    if path.startswith("\\\\?\\"):
+        return path[4:]
+    return path
+
+
+def verbatim(path):
+    r"""The `\\?\` (or `\\?\UNC\`) form, so paths beyond MAX_PATH open."""
+    path = str(path)
+    if path.startswith("\\\\?\\"):
+        return path
+    path = plain(path)
+    if path.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + path[2:]
+    return "\\\\?\\" + path
 
 
 def median(values):
@@ -213,15 +246,18 @@ def main():
     sidecar = pathlib.Path(str(target) + ".manifest.json")
     if not args.path and sidecar.exists():
         manifest = json.loads(sidecar.read_text())
+    # Elevated Windows: every backend reads with backup privilege, so walks and
+    # the MFT cover the same folders and must agree exactly.
+    backup = os.name == "nt" and elevated()
     report = {"platform": platform.platform(), "processor": platform.processor(), "cpus": os.cpu_count(),
               "elevated": elevated(), "target": "real tree" if args.path else "synthetic fixture",
-              "backends": backends, "manifest": manifest, "runs": [], "image_runs": [], "truth": None}
+              "backends": backends, "backup_privilege": backup, "manifest": manifest, "runs": [], "image_runs": [], "truth": None}
     try:
         for threads in args.threads:
             for run_index in range(args.runs):
                 order = backends[run_index % len(backends):] + backends[:run_index % len(backends)]
                 for backend in order:
-                    result = run(bench, target, backend, threads)
+                    result = run(bench, target, backend, threads, backup=backup)
                     result.update(run=run_index, threads_requested=threads)
                     report["runs"].append(result)
                     print(json.dumps(result), file=sys.stderr)
@@ -283,7 +319,7 @@ def summarize(report, args):
         image = {}
         for r in report["image_runs"]:
             if "error" in r:
-                print(f"  error: {r['error']}")
+                verdict("FAILED", f"NTFS image run {r['run']}: {r['error']}")
             else:
                 image.setdefault(("image", r["threads"]), []).append(r)
         if image:
@@ -327,7 +363,7 @@ def summarize(report, args):
                 value = next(iter(values))
                 coverage[backend] = "full" if value == full else "without the locked folder" if value == partial else None
         if coverage and all(coverage.values()):
-            verdict("VALIDATED DIFFERING COVERAGE",
+            verdict("VALIDATED DIFFERING COVERAGE" if not args.require_identical else "MISMATCH",
                     "; ".join(f"{b}: matches the manifest {c}" for b, c in sorted(coverage.items())))
         else:
             verdict("MISMATCH", "backends disagree on counts: " +
@@ -351,10 +387,12 @@ def summarize(report, args):
         shown = ", ".join("unknown" if v is None else f"{v:,}" for v in values)
         if want is not None and values == [want]:
             verdict("IDENTICAL", f"{backend} allocated {shown} equals the measured truth")
-        elif listing and want is not None and None not in values:
-            spread = ", ".join(f"{(v - want) / want * 100:+.3f}%" for v in values) if want else "n/a"
+        elif (listing and want and None not in values
+              and all(abs(v - want) <= want * LISTING_TOLERANCE for v in values)):
+            spread = ", ".join(f"{(v - want) / want * 100:+.3f}%" for v in values)
             verdict("VALIDATED EXCEPTION",
-                    f"{backend} allocated {shown}; truth {want:,} ({spread}): NTFS folder entries lag the MFT")
+                    f"{backend} allocated {shown}; truth {want:,} ({spread}, within "
+                    f"{LISTING_TOLERANCE:.2%}): NTFS folder entries lag the MFT")
         elif want is not None:
             stable_exact = False
             verdict("MISMATCH", f"{backend} allocated {shown}, measured truth {want:,}")

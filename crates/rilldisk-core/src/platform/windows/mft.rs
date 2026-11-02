@@ -971,11 +971,12 @@ fn mft_extents(source: &dyn ReadAt, geometry: &Geometry) -> io::Result<(Vec<Exte
         extents.sort_by_key(|e| e.vcn_byte);
         extents.dedup();
     }
-    // The runs must cover the file from offset 0 without gaps or overlaps;
-    // anything else would silently hide (or invent) records.
+    // The runs must cover the file from offset 0 without gaps or overlaps, and
+    // every run must be on disk ($MFT is never sparse); anything else would
+    // silently hide (or invent) records.
     let mut expected = 0;
     for extent in &extents {
-        if extent.vcn_byte != expected || extent.bytes == 0 {
+        if extent.vcn_byte != expected || extent.bytes == 0 || extent.disk.is_none() {
             return Err(invalid("runs do not cover the table continuously"));
         }
         expected += extent.bytes;

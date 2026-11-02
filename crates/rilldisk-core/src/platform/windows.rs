@@ -823,6 +823,19 @@ fn emit_mft(
         listed.push(id);
     }
     drop(first_link);
+    if crate::tracing() {
+        // Which reparse tags became links (not followed): counts only.
+        let mut tags = std::collections::BTreeMap::<u32, u64>::new();
+        for &(index, ..) in &plan {
+            let slot = &table.slots[table.name_at(index).record as usize];
+            if slot.is_link() {
+                *tags.entry(slot.reparse_tag).or_default() += 1;
+            }
+        }
+        for (tag, count) in tags {
+            eprintln!("mft link tag {tag:#010x}: {count}");
+        }
+    }
     crate::trace("mft plan", &mut phase);
     let entries: Vec<crate::Entry> = plan
         .par_iter()

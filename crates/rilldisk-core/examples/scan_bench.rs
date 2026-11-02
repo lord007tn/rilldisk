@@ -18,6 +18,7 @@ fn main() {
     let mut options = ScanOptions::default();
     let mut path = None;
     let mut image = None;
+    let mut backup = false;
     let mut list = 0_usize;
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -35,6 +36,9 @@ fn main() {
                 options.max_entries = args.next().and_then(|v| v.parse().ok()).unwrap()
             }
             "--ntfs-image" => image = args.next().map(PathBuf::from),
+            // Elevated Windows: enable SeBackupPrivilege (as the CLI does when
+            // elevated), so walks read folders whose ACL denies this user.
+            "--backup-privilege" => backup = rilldisk_core::enable_backup_privilege(),
             // Debugging synthetic fixtures only: print entries this many levels deep.
             "--list-depth" => list = args.next().and_then(|v| v.parse().ok()).unwrap(),
             other => path = Some(PathBuf::from(other)),
@@ -79,7 +83,7 @@ fn main() {
             "\"files_per_s\":{:.0},\"entries\":{},\"files\":{},\"directories\":{},\"logical_bytes\":{},",
             "\"unique_logical_bytes\":{},\"allocated_bytes\":{},\"hard_link_duplicates\":{},",
             "\"skipped_links\":{},\"skipped_mounts\":{},\"issue_count\":{},\"complete\":{},",
-            "\"peak_rss_bytes\":{},\"peak_commit_bytes\":{}}}"
+            "\"peak_rss_bytes\":{},\"peak_commit_bytes\":{},\"backup_privilege\":{}}}"
         ),
         s.backend,
         options.backend,
@@ -101,6 +105,7 @@ fn main() {
         s.complete,
         peak_working_set,
         peak_commit,
+        backup,
     );
     // Freeing tens of millions of names is not part of the scan.
     std::mem::forget(snapshot);

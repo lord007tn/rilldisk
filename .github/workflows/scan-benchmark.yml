@@ -51,6 +51,9 @@ jobs:
       - name: Whole system drive (Windows)
         if: runner.os == 'Windows'
         shell: bash
+        env:
+          # Phase timings and the reparse tags the MFT treats as links (counts).
+          RILLDISK_TRACE_PHASES: '1'
         run: |
           python scripts/benchmark.py target/release/examples --path 'C:\' --runs 2 \
             --backends directory mft --json bench-volume.json | tee bench-volume.md

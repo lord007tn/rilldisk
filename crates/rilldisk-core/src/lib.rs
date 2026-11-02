@@ -1171,9 +1171,13 @@ fn finish(
 
 /// Profiling aid: with `RILLDISK_TRACE_PHASES=1`, print how long each scan phase
 /// took to stderr (local only; nothing is recorded or sent anywhere).
-pub(crate) fn trace(phase: &str, since: &mut Instant) {
+pub(crate) fn tracing() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *ENABLED.get_or_init(|| std::env::var_os("RILLDISK_TRACE_PHASES").is_some()) {
+    *ENABLED.get_or_init(|| std::env::var_os("RILLDISK_TRACE_PHASES").is_some())
+}
+
+pub(crate) fn trace(phase: &str, since: &mut Instant) {
+    if tracing() {
         eprintln!(
             "phase {phase}: {:.1} ms",
             since.elapsed().as_secs_f64() * 1000.0
