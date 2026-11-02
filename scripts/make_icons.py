@@ -50,8 +50,35 @@ def main():
                      append_images=[render(s) for s in ico_sizes])
     # 100 / 1024 margin on each side: Apple's grid for Big Sur style app icons.
     render(1024, margin=100 / 1024).save(OUT / "rilldisk.icns")
-    for f in sorted(OUT.iterdir()):
+    installer_art()
+    for f in sorted([*OUT.iterdir(), *WINDOWS.glob("*.bmp")]):
         print(f"{f.stat().st_size:>8}  {f.relative_to(REPO).as_posix()}")
+
+
+WINDOWS = REPO / "packaging" / "windows"
+INK = (11, 16, 24)
+
+
+def installer_art():
+    """Setup wizard art for the MSI (WixUI sizes): the dialog's left panel and
+    the top banner. Windows Installer draws text on the white areas."""
+    # Welcome / finish pages: 493 x 312, art in the left 164 px.
+    dialog = Image.new("RGB", (493, 312), "white")
+    panel = Image.new("RGB", (164, 312), INK)
+    draw = ImageDraw.Draw(panel)
+    # A soft band of the brand's tile colors along the bottom.
+    for i, (x0, x1, color) in enumerate([(0, 70, "#30DEC4"), (74, 110, "#3B8DF7"),
+                                         (114, 140, "#6366F1"), (144, 164, "#C084FC")]):
+        draw.rounded_rectangle([x0 - (8 if i == 0 else 0), 284, x1 + (8 if i == 3 else 0), 330], radius=6, fill=color)
+    logo = render(96)
+    panel.paste(logo, ((164 - 96) // 2, 92), logo)
+    dialog.paste(panel, (0, 0))
+    dialog.save(WINDOWS / "dialog.bmp")
+    # Inner pages: 493 x 58 banner, title text on the left, logo on the right.
+    banner = Image.new("RGB", (493, 58), "white")
+    logo = render(40)
+    banner.paste(logo, (493 - 40 - 12, 9), logo)
+    banner.save(WINDOWS / "banner.bmp")
 
 
 if __name__ == "__main__":

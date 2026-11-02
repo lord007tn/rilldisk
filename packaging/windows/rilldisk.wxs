@@ -96,6 +96,9 @@
                   BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" />
 
     <WixVariable Id="WixUILicenseRtf" Value="$(PackagingDir)\windows\license.rtf" />
+    <!-- Branded wizard art, rendered by scripts/make_icons.py. -->
+    <WixVariable Id="WixUIDialogBmp" Value="$(PackagingDir)\windows\dialog.bmp" />
+    <WixVariable Id="WixUIBannerBmp" Value="$(PackagingDir)\windows\banner.bmp" />
     <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
     <UI>
       <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchRillDisk"
