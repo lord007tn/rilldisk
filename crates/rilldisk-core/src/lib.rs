@@ -1604,7 +1604,7 @@ mod entry_limit_tests {
 
     #[test]
     fn the_limit_follows_installed_memory() {
-        // Unknown or small memory keeps the 0.1.3 default as a floor.
+        // Unknown or small memory keeps the old fixed default as a floor.
         assert_eq!(max_entries_for_memory(None, None), DEFAULT_MAX_ENTRIES);
         assert_eq!(
             max_entries_for_memory(Some(4 * GIB), None),
