@@ -9,24 +9,6 @@ use crate::widgets::{self as w, Kind};
 use eframe::egui::{Color32, Frame, Margin, RichText, Sense, Ui, vec2};
 use rilldisk_core::{Category, git::Verdict, memory_for};
 
-/// Physical memory available now, where the platform says.
-pub fn available_memory() -> Option<u64> {
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-        // SAFETY: the struct is zeroed with its length set, as the API requires.
-        unsafe {
-            let mut status: MEMORYSTATUSEX = std::mem::zeroed();
-            status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-            (GlobalMemoryStatusEx(&mut status) != 0).then_some(status.ullAvailPhys)
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        None
-    }
-}
-
 /// "60M", "142M".
 pub fn short_limit(limit: usize) -> String {
     format!("{}M", limit.div_ceil(1_000_000))
@@ -67,7 +49,7 @@ impl RillApp {
                         return;
                     };
                     let need = memory_for(next);
-                    let free = available_memory();
+                    let free = rilldisk_core::free_physical_memory();
                     let enough = free.is_none_or(|f| f >= need);
                     let label = format!("Rescan with a {} limit", short_limit(next));
                     let button = ui

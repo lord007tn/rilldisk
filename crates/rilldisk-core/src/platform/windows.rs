@@ -1064,15 +1064,31 @@ pub(crate) fn is_elevated() -> bool {
     Token::open(TOKEN_QUERY).is_ok_and(|token| token.is_elevated())
 }
 
-/// Installed physical memory in bytes.
-pub(crate) fn physical_memory() -> Option<u64> {
+fn memory_status() -> Option<windows_sys::Win32::System::SystemInformation::MEMORYSTATUSEX> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // SAFETY: the struct is zeroed with its length set, as the API requires.
     unsafe {
         let mut status: MEMORYSTATUSEX = std::mem::zeroed();
         status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-        (GlobalMemoryStatusEx(&mut status) != 0).then_some(status.ullTotalPhys)
+        (GlobalMemoryStatusEx(&mut status) != 0).then_some(status)
     }
+}
+
+/// Installed physical memory in bytes.
+pub(crate) fn physical_memory() -> Option<u64> {
+    memory_status().map(|s| s.ullTotalPhys)
+}
+
+/// Memory this process can still allocate: the commit charge left (RAM plus
+/// page file not yet promised). Past free RAM, Windows pages rather than fails;
+/// an allocation fails only when this runs out.
+pub(crate) fn available_memory() -> Option<u64> {
+    memory_status().map(|s| s.ullAvailPageFile)
+}
+
+/// Physical memory free now (free and standby), in bytes.
+pub(crate) fn free_physical_memory() -> Option<u64> {
+    memory_status().map(|s| s.ullAvailPhys)
 }
 
 /// Windows offers elevation through UAC; this only serves the shared API.

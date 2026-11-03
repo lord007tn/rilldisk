@@ -2806,7 +2806,6 @@ impl RillApp {
                 }
             }
         }
-        let known_all = allocation_known(listed_in(view, None));
         let list_rect = ui.available_rect_before_wrap();
         egui::ScrollArea::vertical()
             .id_salt(("cleanup", view))
@@ -2826,7 +2825,8 @@ impl RillApp {
                                 .copied()
                                 .filter(|&i| report.candidates[i].category == *cat)
                                 .collect();
-                            self.group_header(ui, *cat, *n, *bytes, known_all, &members);
+                            let known = allocation_known(listed_in(view, Some(*cat)));
+                            self.group_header(ui, *cat, *n, *bytes, known, &members);
                         }
                         Row::Item(i) => {
                             let (rect, response) = ui.allocate_exact_size(

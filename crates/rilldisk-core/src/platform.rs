@@ -11,9 +11,9 @@ mod windows;
 pub use windows::volumes;
 #[cfg(windows)]
 pub(crate) use windows::{
-    BACKEND_MFT, Listing, Target, VolumeInfo, elevation, enable_backup_privilege,
-    executable_on_path, is_elevated, mft_source, physical_memory, read_directory, root_target,
-    scan_mft, scan_ntfs_image, volume_info,
+    BACKEND_MFT, Listing, Target, VolumeInfo, available_memory, elevation, enable_backup_privilege,
+    executable_on_path, free_physical_memory, is_elevated, mft_source, physical_memory,
+    read_directory, root_target, scan_mft, scan_ntfs_image, volume_info,
 };
 
 #[cfg(unix)]
@@ -22,9 +22,9 @@ mod unix;
 pub use unix::volumes;
 #[cfg(unix)]
 pub(crate) use unix::{
-    BACKEND_MFT, Listing, Target, VolumeInfo, elevation, enable_backup_privilege,
-    executable_on_path, is_elevated, mft_source, physical_memory, read_directory, root_target,
-    scan_mft, volume_info,
+    BACKEND_MFT, Listing, Target, VolumeInfo, available_memory, elevation, enable_backup_privilege,
+    executable_on_path, free_physical_memory, is_elevated, mft_source, physical_memory,
+    read_directory, root_target, scan_mft, volume_info,
 };
 
 #[cfg(not(any(windows, unix)))]

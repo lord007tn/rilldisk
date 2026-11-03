@@ -86,7 +86,6 @@ impl RillApp {
                         .iter()
                         .copied()
                         .filter(|&l| l > auto || self.prefs.max_entries == Some(l))
-                        .take(3)
                         .map(Some),
                 );
                 let estimates = limits
@@ -102,13 +101,18 @@ impl RillApp {
                     .collect::<Vec<_>>()
                     .join(", ");
                 let installed = rilldisk_core::physical_memory()
-                    .map(|m| format!(" (half of this computer's {})", style::bytes(m)))
+                    .map(|m| {
+                        format!(
+                            " (half of this computer's {}, or less when memory runs short as a scan starts)",
+                            style::bytes(m)
+                        )
+                    })
                     .unwrap_or_default();
                 row(
                     ui,
                     "Scan limit",
                     &format!(
-                        "Entries one scan may hold. Automatic allows {} entries, up to about {} of memory{installed}, enough for whole drives. A scan that reaches its limit stops and says so. {estimates}.",
+                        "Entries one scan may hold. Automatic allows {} entries now, up to about {} of memory{installed}, enough for whole drives. A scan that reaches its limit stops and says so. {estimates}.",
                         style::count(auto as u64),
                         style::bytes(rilldisk_core::memory_for(auto)),
                     ),

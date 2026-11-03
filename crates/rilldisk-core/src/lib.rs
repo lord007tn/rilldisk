@@ -50,27 +50,48 @@ pub fn memory_for(entries: usize) -> u64 {
     entries as u64 * BYTES_PER_ENTRY
 }
 
-/// Installed physical memory, where the platform reports it.
+/// Memory this process may use, where the platform reports it: installed
+/// memory, lowered to a Linux container's (cgroup) limit.
 pub fn physical_memory() -> Option<u64> {
     platform::physical_memory()
 }
 
-/// The entry limit for `physical` bytes of installed memory: as many entries as
-/// fit in half of it, never fewer than [`DEFAULT_MAX_ENTRIES`]. A 16 GB computer
-/// gets about 35 million entries and a 64 GB one about 140 million, so whole
-/// drives with tens of millions of files finish instead of stopping part way.
-pub fn max_entries_for_memory(physical: Option<u64>) -> usize {
-    let fit = physical.map_or(0, |bytes| bytes / 2 / BYTES_PER_ENTRY);
-    usize::try_from(fit)
+/// Memory a scan can still allocate without failing, where the platform
+/// reports it. Windows: the commit charge left (RAM plus page file); Linux:
+/// `MemAvailable`, within a container's limit, since the OOM killer acts on
+/// RAM. None on macOS.
+pub fn available_memory() -> Option<u64> {
+    platform::available_memory()
+}
+
+/// Physical memory free now, where the platform reports it (Windows: free and
+/// standby RAM; Linux: `MemAvailable`). Above it a scan may page.
+pub fn free_physical_memory() -> Option<u64> {
+    platform::free_physical_memory()
+}
+
+/// The entry limit for `physical` bytes of usable memory with `available`
+/// bytes free: as many entries as fit in half of the usable memory or in what
+/// is free, whichever is less, never fewer than [`DEFAULT_MAX_ENTRIES`]. A
+/// 16 GB computer gets up to about 35 million entries and a 64 GB one up to
+/// about 140 million, so whole drives with tens of millions of files finish
+/// instead of stopping part way.
+pub fn max_entries_for_memory(physical: Option<u64>, available: Option<u64>) -> usize {
+    let budget = match (physical, available) {
+        (Some(physical), Some(available)) => (physical / 2).min(available),
+        (Some(physical), None) => physical / 2,
+        (None, _) => 0,
+    };
+    usize::try_from(budget / BYTES_PER_ENTRY)
         .unwrap_or(usize::MAX)
         .max(DEFAULT_MAX_ENTRIES)
 }
 
-/// The default entry limit on this computer ([`max_entries_for_memory`] of the
-/// installed memory). CLI, MCP and desktop scans use it unless told otherwise.
+/// The default entry limit on this computer right now ([`max_entries_for_memory`]
+/// of the usable and free memory). CLI, MCP and desktop scans use it unless
+/// told otherwise; it is read when each scan starts.
 pub fn auto_max_entries() -> usize {
-    static AUTO: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *AUTO.get_or_init(|| max_entries_for_memory(physical_memory()))
+    max_entries_for_memory(physical_memory(), available_memory())
 }
 
 /// One scanned name. Only the final component is stored; use [`Snapshot::path`] or
@@ -1574,17 +1595,23 @@ impl Snapshot {
 
 #[cfg(test)]
 mod entry_limit_tests {
-    use super::{DEFAULT_MAX_ENTRIES, auto_max_entries, max_entries_for_memory, memory_for};
+    use super::{
+        DEFAULT_MAX_ENTRIES, auto_max_entries, available_memory, max_entries_for_memory,
+        memory_for, physical_memory,
+    };
 
     const GIB: u64 = 1 << 30;
 
     #[test]
     fn the_limit_follows_installed_memory() {
         // Unknown or small memory keeps the 0.1.3 default as a floor.
-        assert_eq!(max_entries_for_memory(None), DEFAULT_MAX_ENTRIES);
-        assert_eq!(max_entries_for_memory(Some(4 * GIB)), DEFAULT_MAX_ENTRIES);
-        let sixteen = max_entries_for_memory(Some(16 * GIB));
-        let sixty_four = max_entries_for_memory(Some(64 * GIB));
+        assert_eq!(max_entries_for_memory(None, None), DEFAULT_MAX_ENTRIES);
+        assert_eq!(
+            max_entries_for_memory(Some(4 * GIB), None),
+            DEFAULT_MAX_ENTRIES
+        );
+        let sixteen = max_entries_for_memory(Some(16 * GIB), None);
+        let sixty_four = max_entries_for_memory(Some(64 * GIB), Some(48 * GIB));
         assert!((35_000_000..36_000_000).contains(&sixteen), "{sixteen}");
         assert!(
             (143_000_000..144_000_000).contains(&sixty_four),
@@ -1592,7 +1619,22 @@ mod entry_limit_tests {
         );
         // The estimate never exceeds half of the memory it was derived from.
         assert!(memory_for(sixty_four) <= 32 * GIB);
-        assert!(auto_max_entries() >= DEFAULT_MAX_ENTRIES);
+        // Little free memory lowers the limit, never below the floor.
+        let busy = max_entries_for_memory(Some(64 * GIB), Some(12 * GIB));
+        assert!((53_000_000..54_000_000).contains(&busy), "{busy}");
+        assert_eq!(
+            max_entries_for_memory(Some(64 * GIB), Some(GIB)),
+            DEFAULT_MAX_ENTRIES
+        );
+        // CI platforms report memory, and the automatic limit follows it.
+        let physical = physical_memory();
+        assert!(physical.is_some(), "installed memory is not readable");
+        let auto = auto_max_entries();
+        assert!(auto >= DEFAULT_MAX_ENTRIES);
+        assert!(auto <= max_entries_for_memory(physical, None));
+        if cfg!(any(windows, target_os = "linux")) {
+            assert!(available_memory().is_some(), "free memory is not readable");
+        }
     }
 }
 
