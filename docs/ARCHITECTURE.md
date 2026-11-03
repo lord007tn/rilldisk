@@ -67,16 +67,20 @@ compact name arena and indexed queries should follow profiling, not precede it.
 
 ## Unix backend (Linux, macOS)
 
-`unix-readdir` (the default) plugs into the same parallel walk, so scheduling, the shared entry
-budget, cancellation and stall reporting are identical to Windows. Each directory
-is listed with `std::fs::read_dir` (`getdents64` on Linux, `readdir` on macOS).
-The listing's type (`d_type`) is enough for symlinks, sockets, FIFOs and devices,
-which therefore cost no further call. Regular files and directories get one
-no-follow metadata call each: `statx`/`fstatat` relative to the open directory
-handle on Linux, `lstat` on macOS. Symlinks are listed as links and never followed.
-`--backend dir` selects the descriptor-relative variant instead (`openat` from the
-parent's descriptor, `getdents64` on Linux, `fstatat` per entry); it measured no
-faster here (see PERFORMANCE.md), so it is not the default.
+`linux-getdents` / `unix-openat` (the default and `--backend dir`) plug into
+one parallel walk with shared budgets, cancellation and stall reporting. Queued
+directories open relative to their parent's descriptor with `O_NOFOLLOW`.
+Listings use `getdents64` on Linux and `readdir` on macOS; metadata uses
+`fstatat(AT_SYMLINK_NOFOLLOW)`. Parent descriptors remain open until queued
+children open. Under descriptor pressure, full-path reopens walk every component
+from `/` using no-follow directory opens; a replaced symlink ancestor becomes a
+scan issue rather than an outside traversal. Root opens use the same procedure.
+This trades extra opens under pressure for bounded descriptor retention.
+
+`Backend::Legacy` retains the old path-based walker for comparisons; it is not
+qualified against concurrent symlink replacement. Neither backend is an OS
+sandbox: mount changes, directory relocation and mutations between MCP path
+validation and scan startup remain outside the confinement guarantee.
 
 * **Allocation** is `st_blocks * 512` (512-byte units on both kernels), so sparse
   files report what they occupy. Directory blocks are excluded, as on Windows.

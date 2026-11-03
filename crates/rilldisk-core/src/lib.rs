@@ -464,8 +464,8 @@ impl ScanControl {
 pub enum Backend {
     /// Windows: read the NTFS Master File Table when the root is a whole NTFS
     /// volume and the process may read the volume (administrator); otherwise, and
-    /// whenever that fails, the `Directory` walk. Linux and macOS: the `Legacy`
-    /// (`std::fs::read_dir`) walk, which measured as fast as `Directory` there.
+    /// whenever that fails, the `Directory` walk. Linux and macOS use the
+    /// descriptor-relative `Directory` walk to reject symlink replacements.
     #[default]
     Auto,
     /// Windows only: read the NTFS Master File Table directly. Needs administrator
@@ -996,11 +996,9 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
                     control.set_backend_status(format!("Directory scan - MFT unavailable: {error}"))
                 }
             }
-            // Linux and macOS: the descriptor-relative walk measured no faster
-            // than `std::fs::read_dir` (docs/PERFORMANCE.md), so it stays opt-in.
+            // Preserve no-follow directory opens on Unix as well as Windows.
             if cfg!(unix) {
-                control.set_backend_status("Legacy directory scan".into());
-                walk_backend = Backend::Legacy;
+                control.set_backend_status("Directory scan".into());
             }
         }
         Backend::Directory => control.set_backend_status("Directory scan".into()),

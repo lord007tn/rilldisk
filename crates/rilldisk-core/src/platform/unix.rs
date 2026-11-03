@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Unix backend (Linux, macOS). `std::fs::read_dir` lists names with their type
-//! (`getdents64` on Linux, `readdir` on macOS); files and directories then need one
-//! metadata call each (`statx`/`fstatat` relative to the open directory on Linux,
-//! `lstat` on macOS) for size, blocks, identity and time. Symlinks and special files
-//! need nothing beyond the listing. Symlinks are never followed.
+//! Unix backend (Linux, macOS). The default opens directories relative to their
+//! parent's descriptor and reads metadata with fstatat(AT_SYMLINK_NOFOLLOW).
+//! Full-path reopens protect every ancestor with no-follow opens. Legacy retains
+//! std::fs::read_dir for reference comparisons, without this race protection.
 //!
 //! A scan stays on the root's filesystem by default: directories on another device
 //! and mount points listed by the kernel are recorded but not entered, and counted
@@ -409,6 +408,30 @@ fn descriptor_budget() -> usize {
 
 /// Open a folder for listing relative to its parent, never following a symlink.
 fn open_at(parent: Option<&DirFd>, name: &CStr) -> io::Result<DirFd> {
+    // O_NOFOLLOW protects only the final component. Full-path reopens under
+    // descriptor pressure must also protect every ancestor, including the root.
+    if parent.is_none() {
+        let path = Path::new(OsStr::from_bytes(name.to_bytes()));
+        if !path.is_absolute() {
+            return Err(io::Error::other("expected an absolute directory path"));
+        }
+        let mut dir = open_one(None, c"/")?;
+        for component in path.components() {
+            match component {
+                std::path::Component::RootDir => {}
+                std::path::Component::Normal(part) => {
+                    let part = CString::new(part.as_bytes())?;
+                    dir = open_at(Some(&dir), &part)?;
+                }
+                _ => return Err(io::Error::other("expected an absolute directory path")),
+            }
+        }
+        return Ok(dir);
+    }
+    open_one(parent, name)
+}
+
+fn open_one(parent: Option<&DirFd>, name: &CStr) -> io::Result<DirFd> {
     // SAFETY: name is terminated; the parent descriptor (if any) is open.
     let fd = unsafe {
         libc::openat(
@@ -1018,6 +1041,79 @@ pub fn volumes() -> Vec<crate::Volume> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queued_directory_replaced_with_symlink_is_not_followed() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("child")).unwrap();
+        fs::write(outside.path().join("outside-secret"), b"fictional").unwrap();
+        let volume = volume_info(root.path(), &ScanOptions::default(), Backend::Directory).unwrap();
+        let control = ScanControl::default();
+        crate::reset_progress(&control, &ScanOptions::default());
+        let listing = read_directory(
+            root_target(&root.path().canonicalize().unwrap(), &volume),
+            &control,
+            &volume,
+        );
+        let (_, child) = listing.children.into_iter().next().unwrap();
+        fs::remove_dir(root.path().join("child")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("child")).unwrap();
+        let result = read_directory(child, &control, &volume);
+        assert!(!result.batch.complete);
+        assert!(!result.batch.errors.is_empty());
+        assert!(result.batch.entries.is_empty());
+    }
+
+    #[test]
+    fn full_path_reopen_rejects_a_replaced_ancestor() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("ancestor/child")).unwrap();
+        fs::create_dir(outside.path().join("child")).unwrap();
+        fs::write(outside.path().join("child/outside-secret"), b"fictional").unwrap();
+        let path = root.path().canonicalize().unwrap().join("ancestor/child");
+        // This is the target queued when the descriptor budget is exhausted.
+        let target = Target::Relative {
+            parent: None,
+            name: CString::new(path.as_os_str().as_bytes()).unwrap(),
+            path,
+        };
+        fs::rename(root.path().join("ancestor"), root.path().join("original")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("ancestor")).unwrap();
+        let volume = volume_info(root.path(), &ScanOptions::default(), Backend::Directory).unwrap();
+        let result = read_directory(target, &ScanControl::default(), &volume);
+        assert!(!result.batch.complete);
+        assert!(!result.batch.errors.is_empty());
+        assert!(result.batch.entries.is_empty());
+    }
+
+    #[test]
+    fn relative_child_keeps_its_parent_after_ancestor_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("ancestor/child")).unwrap();
+        fs::write(root.path().join("ancestor/child/inside"), b"fictional").unwrap();
+        fs::create_dir(outside.path().join("child")).unwrap();
+        fs::write(outside.path().join("child/outside-secret"), b"fictional").unwrap();
+        let volume = volume_info(root.path(), &ScanOptions::default(), Backend::Directory).unwrap();
+        let control = ScanControl::default();
+        crate::reset_progress(&control, &ScanOptions::default());
+        let first = read_directory(
+            root_target(&root.path().canonicalize().unwrap(), &volume),
+            &control,
+            &volume,
+        );
+        let ancestor = first.children.into_iter().next().unwrap().1;
+        let second = read_directory(ancestor, &control, &volume);
+        let child = second.children.into_iter().next().unwrap().1;
+        fs::rename(root.path().join("ancestor"), root.path().join("original")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("ancestor")).unwrap();
+        let result = read_directory(child, &control, &volume);
+        assert!(result.batch.complete, "{:?}", result.batch.errors);
+        assert_eq!(result.batch.entries.len(), 1);
+        assert_eq!(&*result.batch.entries[0].name, OsStr::new("inside"));
+    }
 
     const MOUNTINFO: &[u8] = br"22 1 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw
 23 22 0:21 / /proc rw,nosuid - proc proc rw
