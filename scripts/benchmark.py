@@ -348,6 +348,19 @@ def summarize(report, args):
     for r in ok_runs:
         by_backend.setdefault(r["backend"], []).append(r)
     counts = {b: {tuple(r[k] for k in COUNTS) for r in rows} for b, rows in by_backend.items()}
+    manifest = report["manifest"]
+    if manifest:
+        hidden = manifest["unreadable"]
+        full = tuple(manifest[k] if k not in ("skipped_mounts", "issue_count") else 0 for k in COUNTS)
+        partial = (full[0] - hidden["files"], full[1] - hidden["directories"],
+                   full[2] - hidden["logical_bytes"], full[3] - hidden["logical_bytes"],
+                   full[4], full[5], 0, 1)
+        for backend, values in counts.items():
+            if not values.issubset({full, partial}):
+                verdict("MISMATCH", f"{backend}: counts do not match the fixture manifest")
+        for row in ok_runs:
+            if row.get("complete") != (row["issue_count"] == 0):
+                verdict("MISMATCH", f"{row['requested_backend']}: unexpected fixture completeness")
     allocations = {b: sorted({r["allocated_bytes"] for r in rows}, key=lambda v: (v is None, v or 0))
                    for b, rows in by_backend.items()}
     for backend, values in counts.items():
@@ -356,17 +369,11 @@ def summarize(report, args):
 
     # Counts across backends.
     distinct = {next(iter(v)) for v in counts.values() if len(v) == 1}
-    manifest = report["manifest"]
     if len(distinct) == 1:
         verdict("IDENTICAL", "counts " + ", ".join(f"{k}={v:,}" for k, v in zip(COUNTS, next(iter(distinct)))))
     elif distinct:
         coverage = {}
         if manifest:
-            hidden = manifest["unreadable"]
-            full = (manifest["files"], manifest["directories"], manifest["logical_bytes"],
-                    manifest["unique_logical_bytes"], manifest["hard_link_duplicates"], manifest["skipped_links"], 0, 0)
-            partial = (full[0] - hidden["files"], full[1] - hidden["directories"], full[2] - hidden["logical_bytes"],
-                       full[3] - hidden["logical_bytes"], full[4], full[5], 0, 1)
             for backend, values in counts.items():
                 value = next(iter(values))
                 coverage[backend] = "full" if value == full else "without the locked folder" if value == partial else None

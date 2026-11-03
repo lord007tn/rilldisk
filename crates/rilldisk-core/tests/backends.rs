@@ -21,8 +21,11 @@ fn auto_status_describes_the_unix_backend_that_actually_runs() {
     let root = tempfile::tempdir().unwrap();
     let control = Arc::new(ScanControl::default());
     let snapshot = scan(root.path(), ScanOptions::default(), control.clone()).unwrap();
-    assert_eq!(snapshot.summary.backend, "unix-readdir");
-    assert_eq!(control.backend_status(), "Legacy directory scan");
+    assert!(matches!(
+        snapshot.summary.backend,
+        "linux-getdents" | "unix-openat"
+    ));
+    assert_eq!(control.backend_status(), "Directory scan");
 }
 
 /// Totals that must not depend on the backend.
@@ -118,13 +121,9 @@ fn directory_and_legacy_walks_agree() {
     assert_eq!(new.summary.hard_link_duplicates, 2);
     assert_eq!(new.summary.skipped_links, 1);
     // `Auto` never reads the MFT for a folder: on Windows it is the NT walk; on
-    // Linux and macOS the std walk, which measured as fast there.
+    // Linux and macOS the descriptor-relative walk.
     let auto = scan_with(root.path(), Backend::Auto).summary.backend;
-    let expected = if cfg!(windows) {
-        new.summary.backend
-    } else {
-        old.summary.backend
-    };
+    let expected = new.summary.backend;
     assert_eq!(auto, expected);
 }
 

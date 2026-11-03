@@ -67,16 +67,24 @@ compact name arena and indexed queries should follow profiling, not precede it.
 
 ## Unix backend (Linux, macOS)
 
-`unix-readdir` (the default) plugs into the same parallel walk, so scheduling, the shared entry
-budget, cancellation and stall reporting are identical to Windows. Each directory
-is listed with `std::fs::read_dir` (`getdents64` on Linux, `readdir` on macOS).
-The listing's type (`d_type`) is enough for symlinks, sockets, FIFOs and devices,
-which therefore cost no further call. Regular files and directories get one
-no-follow metadata call each: `statx`/`fstatat` relative to the open directory
-handle on Linux, `lstat` on macOS. Symlinks are listed as links and never followed.
-`--backend dir` selects the descriptor-relative variant instead (`openat` from the
-parent's descriptor, `getdents64` on Linux, `fstatat` per entry); it measured no
-faster here (see PERFORMANCE.md), so it is not the default.
+`linux-getdents` / `unix-openat` (the default and `--backend dir`) plug into
+one parallel walk with shared budgets, cancellation and stall reporting. Queued
+directories open relative to their parent's descriptor with no-follow semantics.
+Listings use `getdents64` on Linux and `readdir` on macOS; metadata uses
+`fstatat(AT_SYMLINK_NOFOLLOW)`. Parent descriptors remain open until queued
+children open. Under descriptor pressure, full-path reopens reject symlinks in
+every component using Linux `openat2(RESOLVE_NO_SYMLINKS)` or macOS 11+ `O_NOFOLLOW_ANY`.
+These native opens need one free descriptor and only search permission on
+ancestors. Root opens use the same procedure. On Linux kernels without openat2
+(or where syscall filtering blocks it), a component walk uses `O_PATH` for
+ancestors and `O_RDONLY` for the final directory, with no-follow checks at every
+step. This fallback needs two free descriptors; if unavailable, the subtree is
+reported incomplete instead of retrying an unsafe path open.
+
+`Backend::Legacy` retains the old path-based walker for comparisons; it is not
+qualified against concurrent symlink replacement. Neither backend is an OS
+sandbox: mount changes, directory relocation and mutations between MCP path
+validation and scan startup remain outside the confinement guarantee.
 
 * **Allocation** is `st_blocks * 512` (512-byte units on both kernels), so sparse
   files report what they occupy. Directory blocks are excluded, as on Windows.
@@ -260,9 +268,11 @@ and partial results are shared. Measurements are in [PERFORMANCE.md](PERFORMANCE
   has opened.
 * **`win32-batched-directory`** (`Backend::Legacy`): RillDisk 0.1's walk, kept as
   a reference for benchmarks and backend comparisons.
-* **`unix-readdir`** (Linux and macOS default) and **`linux-getdents`** /
-  **`unix-openat`** (`--backend dir`): see the Unix section. Past half the soft
-  descriptor limit, the descriptor-relative walk opens children by path.
+* **`linux-getdents`** / **`unix-openat`** (Linux and macOS default, `--backend dir`):
+  see the Unix section. Past half the soft descriptor limit, the descriptor-relative
+  walk opens children by path using the no-symlink procedure described there.
+* **`unix-readdir`** (`Backend::Legacy`): the path-based reference walker, without
+  qualification against symlink replacement.
 * **`ntfs-mft`**: below.
 
 Hard links on NTFS start in a hash map keyed by file ID; once a scan has seen

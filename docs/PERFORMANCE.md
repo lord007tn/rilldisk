@@ -13,8 +13,8 @@ six-minute scan and Explorer size discrepancy.
 | `ntfs-mft` | Windows, NTFS, administrator | Reads the Master File Table raw, in parallel 4 MiB blocks |
 | `nt-directory` | Windows (default walk) | `NtCreateFile` relative to the parent's handle, `NtQueryDirectoryFile` into a reused 64 KiB buffer |
 | `win32-batched-directory` | Windows (`Legacy`, reference) | RillDisk 0.1: `CreateFileW` by full path, attribute check, `GetFileInformationByHandleEx` |
-| `unix-readdir` | Linux, macOS (default) | `std::fs::read_dir` + one no-follow `stat` per file and folder |
-| `linux-getdents` / `unix-openat` | Linux / macOS (`--backend dir`) | `openat` relative to the parent descriptor, `getdents64` (Linux) or `readdir`, `fstatat` |
+| `unix-readdir` | Linux, macOS (`Legacy`, reference) | `std::fs::read_dir` + one no-follow `stat` per file and folder |
+| `linux-getdents` / `unix-openat` | Linux / macOS (default, `--backend dir`) | `openat` relative to the parent descriptor, `getdents64` (Linux) or `readdir`, `fstatat` |
 
 `auto` uses `ntfs-mft` only for a **whole NTFS volume** when the process can
 read it (administrator), and falls back to `nt-directory` whenever that is not
@@ -40,10 +40,10 @@ measurements. Never publish personal filenames or raw inventories.
   128-bit file IDs (ReFS). The listing APIs themselves are within ~15 % of each
   other: the per-folder kernel cost (~63 µs per folder single-threaded, warm)
   sets the floor for any directory walk.
-* **Linux and macOS:** keep `std::fs::read_dir` (`unix-readdir`). The
-  descriptor-relative walk was 11 % faster on the GitHub Linux runner but not
-  faster in WSL2 (warm equal, cold median 8.6 s vs 7.6 s), and much slower on
-  the (noisy) macOS runner. It stays available as `--backend dir`.
+* **Linux and macOS:** use the descriptor-relative walk by default to reject
+  symlink replacements, including ancestors during full-path reopens. Historical
+  timing comparisons below predate this safety change. The legacy path walker
+  remains available through the Rust API for reference benchmarks.
 * **Cold caches dominate real-drive time on Windows.** A first scan of a real
   600k-file tree took 4.1 s, the second 0.63 s; the runner's whole drive took
   321 s cold and 6 s warm with the directory walk. Only the MFT avoids that:
