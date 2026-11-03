@@ -712,6 +712,18 @@ pub(crate) fn is_elevated() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+/// Installed physical memory in bytes.
+pub(crate) fn physical_memory() -> Option<u64> {
+    // SAFETY: sysconf has no preconditions; -1 or 0 means unknown.
+    let (pages, size) = unsafe {
+        (
+            libc::sysconf(libc::_SC_PHYS_PAGES),
+            libc::sysconf(libc::_SC_PAGESIZE),
+        )
+    };
+    (pages > 0 && size > 0).then(|| pages as u64 * size as u64)
+}
+
 /// `sudo` or `pkexec` on `PATH` is a way to get to root.
 pub(crate) fn elevation() -> crate::Elevation {
     let is_elevated = is_elevated();

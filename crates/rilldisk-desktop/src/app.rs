@@ -164,8 +164,9 @@ enum Action {
     GitChecks(bool),
     /// Settings: days without work before a clean worktree counts as idle.
     StaleDays(u64),
-    /// Use this entry limit from now on; rescan the shown root when `true`.
-    ScanLimit(usize, bool),
+    /// Use this entry limit (None: Automatic) from now on; rescan the shown
+    /// root when `true`.
+    ScanLimit(Option<usize>, bool),
 }
 
 /// Scan generation, folder and metric of a sorted child list.
@@ -202,7 +203,8 @@ pub struct RillApp {
     focus_search: bool,
     search_results: Option<(String, Vec<usize>)>,
     search_rx: Option<mpsc::Receiver<(String, Vec<usize>)>>,
-    pub safety_filter: Option<Safety>,
+    /// Clean up shows safe folders or Review-first ones.
+    pub cleanup_view: CleanupView,
     pub category_filter: Option<Category>,
     pub picked: HashSet<usize>,
     pub highlight: bool,
@@ -353,7 +355,7 @@ impl RillApp {
             focus_search: false,
             search_results: None,
             search_rx: None,
-            safety_filter: None,
+            cleanup_view: CleanupView::Safe,
             category_filter: None,
             picked: HashSet::new(),
             highlight: false,
@@ -368,7 +370,7 @@ impl RillApp {
                 stale_days: saved
                     .stale_days
                     .unwrap_or(rilldisk_core::git::DEFAULT_STALE_DAYS),
-                max_entries: saved.max_entries.unwrap_or(settings::SCAN_LIMITS[0]),
+                max_entries: saved.max_entries.unwrap_or(None),
             },
             settings_open: false,
             applied: Some((identity, dark)),
@@ -418,7 +420,7 @@ impl RillApp {
         let (thread_control, thread_root, repaint) =
             (control.clone(), PathBuf::from(&root), ctx.clone());
         let options = ScanOptions {
-            max_entries: self.prefs.max_entries,
+            max_entries: self.prefs.scan_limit(),
             ..ScanOptions::default()
         };
         std::thread::Builder::new()
@@ -577,7 +579,7 @@ impl RillApp {
             Some((tab, category)) => {
                 self.tab = tab;
                 self.category_filter = category;
-                self.safety_filter = None;
+                self.cleanup_view = CleanupView::for_category(category);
             }
             None if self.tab == Tab::Search || self.tab == Tab::Issues => self.tab = Tab::Overview,
             None => {}
@@ -1836,7 +1838,7 @@ impl RillApp {
             {
                 actions.push(Action::Tab(Tab::Cleanup));
                 self.category_filter = Some(Category::GitWorktree);
-                self.safety_filter = None;
+                self.cleanup_view = CleanupView::Review;
             }
         }
 
@@ -2571,7 +2573,18 @@ impl RillApp {
         let mut actions = Vec::new();
         let th = t();
         let report = &data.reclaim;
-        if report.candidates.is_empty() {
+        let listed_in = |view: CleanupView, category: Option<Category>| {
+            report.candidates.iter().filter(move |c| {
+                listed(c)
+                    && CleanupView::of(c.safety) == view
+                    && category.is_none_or(|cat| c.category == cat)
+            })
+        };
+        if listed_in(CleanupView::Safe, None)
+            .chain(listed_in(CleanupView::Review, None))
+            .next()
+            .is_none()
+        {
             empty_state(
                 ui,
                 Icon::Sparkle,
@@ -2580,136 +2593,203 @@ impl RillApp {
             );
             return actions;
         }
-        // Summary
+        // Never show an empty half or an empty kind when the other has folders.
+        let other = self.cleanup_view.other();
+        if listed_in(self.cleanup_view, self.category_filter)
+            .next()
+            .is_none()
+        {
+            if listed_in(other, self.category_filter).next().is_some() {
+                self.cleanup_view = other;
+            } else {
+                self.category_filter = None;
+                if listed_in(self.cleanup_view, None).next().is_none() {
+                    self.cleanup_view = other;
+                }
+            }
+        }
+        let view = self.cleanup_view;
+        // Folders not inside another shown in the same half: their sums count
+        // each byte once. Safe folders inside a Review-first worktree count here.
+        let outer = |view| listed_in(view, None).filter(move |c| top_in_view(data, c, view));
+
+        // ------------------------------------------------ summary and switch
         let head = ui.available_rect_before_wrap();
-        let narrow = head.width() < 820.0;
+        let narrow = head.width() < 860.0;
         let head = Rect::from_min_size(
             head.min,
-            vec2(head.width(), if narrow { 132.0 } else { 96.0 }),
+            vec2(head.width(), if narrow { 136.0 } else { 100.0 }),
         );
         ui.allocate_rect(head, Sense::hover());
         let p = ui.painter().clone();
         p.rect_filled(head, 16, th.card);
         let inner = head.shrink2(vec2(20.0, 16.0));
-        let total = frees_total(report);
-        let known = allocation_known(report.candidates.iter());
+        let total: u64 = outer(view).map(frees).sum();
+        let known = allocation_known(outer(view));
         let big = w::big_bytes(&p, inner.left_top(), Align2::LEFT_TOP, total, 32.0, th.text);
         p.text(
             pos2(big.right() + 12.0, big.bottom() - 8.0),
             Align2::LEFT_BOTTOM,
-            if known {
-                "freed on disk, at least"
-            } else {
-                "freed on disk, about (some sizes unknown)"
+            match view {
+                CleanupView::Safe => format!("safe to free, {}", floor_word(known)),
+                CleanupView::Review => format!("to check first, {}", floor_word(known)),
             },
             style::regular(13.0),
             th.dim,
         );
-        let outer = report.candidates.iter().filter(|c| c.nested_in.is_none());
-        let shared: u64 = outer.clone().map(|c| c.shared_bytes).sum();
-        let mut caption = format!(
-            "{} in size across {} folders.",
-            style::bytes(outer.clone().map(|c| size_metric(c, self.allocated)).sum()),
-            style::count(outer.count() as u64)
-        );
+        let folders = listed_in(view, None).count() as u64;
+        let mut caption = match view {
+            CleanupView::Safe => format!(
+                "{} that tools rebuild or re-download when needed. Tick what should go; nothing moves to the {} until you confirm.",
+                style::plural(folders, "folder"),
+                rilldisk_core::CleanupMode::trash_name()
+            ),
+            CleanupView::Review => format!(
+                "{} that may hold unique work, such as worktrees with changes. Check each one; none is ticked for you.",
+                style::plural(folders, "folder"),
+            ),
+        };
+        let shared: u64 = outer(view).map(|c| c.shared_bytes).sum();
         if shared > 0 {
             caption.push_str(&format!(
-                " {} is hard-linked elsewhere (pnpm, Cargo) and stays until every link is gone.",
+                " {} more is hard-linked elsewhere (pnpm, Cargo) and stays until every link is gone.",
                 style::bytes(shared)
             ));
         }
-        let galley = w::fit(
-            &p,
+        let caption_w = if narrow {
+            inner.width()
+        } else {
+            inner.width() - 420.0
+        };
+        let galley = p.layout(
             caption,
             style::regular(12.0),
             th.faint,
-            if narrow {
-                inner.width()
-            } else {
-                inner.width() * 0.55
-            },
+            caption_w.max(200.0),
         );
         p.galley(inner.left_top() + vec2(0.0, 44.0), galley, th.faint);
-        let filter_rect = if narrow {
+        let switch_rect = if narrow {
             Rect::from_min_max(pos2(inner.left(), inner.bottom() - 32.0), inner.max)
         } else {
-            Rect::from_min_max(pos2(inner.center().x, inner.top()), inner.max)
+            Rect::from_min_max(pos2(inner.right() - 400.0, inner.top()), inner.max)
         };
-        let mut filters = ui.new_child(UiBuilder::new().max_rect(filter_rect).layout(if narrow {
+        let mut switch = ui.new_child(UiBuilder::new().max_rect(switch_rect).layout(if narrow {
             Layout::left_to_right(Align::Min)
         } else {
             Layout::right_to_left(Align::Min)
         }));
-        let mut safety = self.safety_filter;
-        let count = |s: Safety| report.candidates.iter().filter(|c| c.safety == s).count();
         let labels = [
-            (None, "All".to_string()),
             (
-                Some(Safety::Regenerable),
-                format!("Rebuildable {}", count(Safety::Regenerable)),
+                CleanupView::Safe,
+                format!(
+                    "Safe to delete  {}",
+                    style::count(listed_in(CleanupView::Safe, None).count() as u64)
+                ),
             ),
             (
-                Some(Safety::Cache),
-                format!("Caches {}", count(Safety::Cache)),
-            ),
-            (
-                Some(Safety::Review),
-                format!("Review first {}", count(Safety::Review)),
+                CleanupView::Review,
+                format!(
+                    "Review first  {}",
+                    style::count(listed_in(CleanupView::Review, None).count() as u64)
+                ),
             ),
         ];
-        let options: Vec<(Option<Safety>, Option<Icon>, &str)> =
-            labels.iter().map(|(s, l)| (*s, None, l.as_str())).collect();
+        let options: Vec<(CleanupView, Option<Icon>, &str)> = labels
+            .iter()
+            .map(|(v, l)| (*v, Some(v.icon()), l.as_str()))
+            .collect();
+        let mut chosen = view;
         if w::segmented(
-            &mut filters,
-            &mut safety,
+            &mut switch,
+            &mut chosen,
             &options,
-            "Rebuildable: project tools recreate it. Caches: re-downloaded on demand. Review first: may hold unique work.",
+            "Safe to delete: rebuilt by project tools or re-downloaded on demand. Review first: may hold unique work.",
         ) {
-            self.safety_filter = safety;
+            self.cleanup_view = chosen;
+            if self
+                .category_filter
+                .is_some_and(|cat| listed_in(chosen, Some(cat)).next().is_none())
+            {
+                self.category_filter = None;
+            }
+            ui.ctx().request_repaint();
+            return actions;
         }
-        ui.add_space(10.0);
-        // Category chips
+        ui.add_space(12.0);
+
+        // ------------------------------------------- kind menu and selection
         let mut categories: Vec<(Category, usize, u64)> = Category::ALL
             .iter()
             .map(|&cat| {
-                let items = report.candidates.iter().filter(|c| {
-                    c.category == cat && self.safety_filter.is_none_or(|s| s == c.safety)
-                });
+                let items = listed_in(view, Some(cat));
                 (
                     cat,
                     items.clone().count(),
-                    items.filter(|c| c.nested_in.is_none()).map(frees).sum(),
+                    items
+                        .filter(|c| top_in_view(data, c, view))
+                        .map(frees)
+                        .sum(),
                 )
             })
             .filter(|c| c.1 > 0)
             .collect();
         categories.sort_by_key(|c| std::cmp::Reverse(c.2));
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
-            if filter_chip(ui, "Everything", None, self.category_filter.is_none()).clicked() {
+        let safe = crate::cleanup_ui::safe(self, data);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            let label = match self.category_filter {
+                Some(cat) => category_title(cat).to_string(),
+                None => "All kinds".to_string(),
+            };
+            let kinds = w::button(ui, Kind::Soft, Some(Icon::Grid), &label)
+                .on_hover_text("Show one kind of folder");
+            egui::Popup::menu(&kinds).show(|ui| {
+                ui.set_min_width(300.0);
+                if w::menu_item(ui, Icon::Grid, "All kinds", &style::bytes(total)).clicked() {
+                    self.category_filter = None;
+                }
+                w::menu_gap(ui);
+                for (cat, n, bytes) in &categories {
+                    let hint = format!("{}  ·  {}", style::bytes(*bytes), style::count(*n as u64));
+                    if w::menu_item(ui, category_kind_icon(*cat), category_title(*cat), &hint)
+                        .clicked()
+                    {
+                        self.category_filter = Some(*cat);
+                    }
+                }
+            });
+            if self.category_filter.is_some()
+                && w::button(ui, Kind::Ghost, None, "Show all")
+                    .on_hover_text("Show every kind of folder")
+                    .clicked()
+            {
                 self.category_filter = None;
             }
-            for (cat, n, bytes) in &categories {
-                let active = self.category_filter == Some(*cat);
-                if filter_chip(
-                    ui,
-                    &format!("{}  {}", category_title(*cat), style::bytes(*bytes)),
-                    Some(*n),
-                    active,
-                )
-                .clicked()
-                {
-                    self.category_filter = if active { None } else { Some(*cat) };
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                match view {
+                    CleanupView::Safe => {
+                        let shown: Vec<usize> = safe
+                            .iter()
+                            .copied()
+                            .filter(|&i| {
+                                self.category_filter
+                                    .is_none_or(|cat| report.candidates[i].category == cat)
+                            })
+                            .collect();
+                        crate::cleanup_ui::select_button(self, ui, &shown);
+                    }
+                    CleanupView::Review => crate::cleanup_ui::idle_button(self, ui, data),
                 }
-            }
+            });
         });
-        ui.add_space(6.0);
-        crate::cleanup_ui::toolbar(self, ui, data);
-        ui.add_space(8.0);
+        ui.add_space(4.0);
         if self.category_filter == Some(Category::GitWorktree) {
+            ui.add_space(6.0);
             self.worktree_inventory(ui, data);
         }
-        // Rows grouped by category, biggest group first.
+
+        // ------------------------------------ rows grouped by kind, biggest first
         enum Row {
             Group(Category, usize, u64),
             Item(usize),
@@ -2721,16 +2801,15 @@ impl RillApp {
             }
             rows.push(Row::Group(*cat, *n, *bytes));
             for (i, c) in report.candidates.iter().enumerate() {
-                if c.category == *cat && self.safety_filter.is_none_or(|s| s == c.safety) {
+                if c.category == *cat && listed(c) && CleanupView::of(c.safety) == view {
                     rows.push(Row::Item(i));
                 }
             }
         }
-        let now = now_ms();
-        let _ = now;
+        let known_all = allocation_known(listed_in(view, None));
         let list_rect = ui.available_rect_before_wrap();
         egui::ScrollArea::vertical()
-            .id_salt("cleanup")
+            .id_salt(("cleanup", view))
             .auto_shrink(false)
             .show_rows(ui, 64.0, rows.len() + 1, |ui, range| {
                 ui.spacing_mut().item_spacing.y = 0.0;
@@ -2740,47 +2819,20 @@ impl RillApp {
                         ui.allocate_exact_size(vec2(ui.available_width(), 64.0), Sense::hover());
                         continue;
                     };
-                    let (rect, response) =
-                        ui.allocate_exact_size(vec2(ui.available_width(), 64.0), Sense::click());
-                    let p = ui.painter();
                     match row {
                         Row::Group(cat, n, bytes) => {
-                            let y = rect.bottom() - 16.0;
-                            p.text(
-                                pos2(rect.left() + 4.0, y),
-                                Align2::LEFT_CENTER,
-                                category_title(*cat),
-                                style::semibold(15.0),
-                                th.text,
-                            );
-                            let w = p
-                                .layout_no_wrap(
-                                    category_title(*cat).into(),
-                                    style::semibold(15.0),
-                                    th.text,
-                                )
-                                .size()
-                                .x;
-                            p.text(
-                                pos2(rect.left() + 12.0 + w, y),
-                                Align2::LEFT_CENTER,
-                                style::count(*n as u64),
-                                style::regular(12.5),
-                                th.faint,
-                            );
-                            p.text(
-                                pos2(rect.right() - 8.0, y),
-                                Align2::RIGHT_CENTER,
-                                format!(
-                                    "frees {} {}",
-                                    floor_sign(allocation_known(report.candidates.iter())),
-                                    style::bytes(*bytes)
-                                ),
-                                style::regular(12.5),
-                                th.dim,
-                            );
+                            let members: Vec<usize> = safe
+                                .iter()
+                                .copied()
+                                .filter(|&i| report.candidates[i].category == *cat)
+                                .collect();
+                            self.group_header(ui, *cat, *n, *bytes, known_all, &members);
                         }
                         Row::Item(i) => {
+                            let (rect, response) = ui.allocate_exact_size(
+                                vec2(ui.available_width(), 64.0),
+                                Sense::click(),
+                            );
                             actions.extend(self.candidate_card(ui, data, *i, rect, response));
                         }
                     }
@@ -2788,6 +2840,71 @@ impl RillApp {
             });
         actions.extend(self.plan_bar(ui, data, list_rect));
         actions
+    }
+
+    /// A kind's heading in Clean up. With safe folders in it, its tick selects
+    /// or clears all of them at once.
+    fn group_header(
+        &mut self,
+        ui: &mut Ui,
+        cat: Category,
+        n: usize,
+        bytes: u64,
+        known: bool,
+        members: &[usize],
+    ) {
+        let th = t();
+        let sense = if members.is_empty() {
+            Sense::hover()
+        } else {
+            Sense::click()
+        };
+        let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 64.0), sense);
+        let p = ui.painter();
+        let y = rect.bottom() - 18.0;
+        let mut x = rect.left() + 4.0;
+        let all = !members.is_empty() && members.iter().all(|i| self.picked.contains(i));
+        if !members.is_empty() {
+            let check = w::check(p, pos2(rect.left() + 22.0, y), all, response.hovered());
+            x = check.right() + 12.0;
+        }
+        let title = p.layout_no_wrap(category_title(cat).into(), style::semibold(15.0), th.text);
+        let title_w = title.size().x;
+        p.galley(pos2(x, y - title.size().y / 2.0), title, th.text);
+        p.text(
+            pos2(x + title_w + 8.0, y),
+            Align2::LEFT_CENTER,
+            style::count(n as u64),
+            style::regular(12.5),
+            th.faint,
+        );
+        p.text(
+            pos2(rect.right() - 16.0, y),
+            Align2::RIGHT_CENTER,
+            format!("frees {} {}", floor_sign(known), style::bytes(bytes)),
+            style::regular(12.5),
+            th.dim,
+        );
+        if members.is_empty() {
+            return;
+        }
+        let response = response.on_hover_text(if all {
+            format!("Untick the {} folders", category_title(cat).to_lowercase())
+        } else {
+            format!(
+                "Tick the {} here that can be removed safely",
+                style::plural(members.len() as u64, "folder")
+            )
+        });
+        if response.clicked() {
+            if all {
+                for i in members {
+                    self.picked.remove(i);
+                }
+            } else {
+                self.picked.extend(members.iter().copied());
+            }
+        }
     }
 
     /// One reclaim suggestion as a card; a click toggles it in the cleanup plan.
@@ -2851,7 +2968,7 @@ impl RillApp {
         let mut chip_x = text_x + title_w + 8.0;
         let chip = w::chip_at(p, pos2(chip_x, card.top() + 20.0), c.safety.label(), color);
         chip_x = chip.right() + 6.0;
-        if c.nested_in.is_some() && chip_x + 60.0 < text_x + text_w {
+        if !top_in_view(data, c, CleanupView::of(c.safety)) && chip_x + 60.0 < text_x + text_w {
             w::chip_at(p, pos2(chip_x, card.top() + 20.0), "nested", th.faint);
         }
         // Worktrees: Git's verdict leads the second line, before the path.
@@ -2898,7 +3015,12 @@ impl RillApp {
         // What it frees on disk is the big number; its size, when that differs.
         let held = size_metric(c, self.allocated);
         let detail = if style::bytes(held) != style::bytes(size) {
-            format!("of {} · {}", style::bytes(held), idle)
+            let metric = if self.allocated { "on disk" } else { "size" };
+            [format!("{} {metric}", style::bytes(held)), idle]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(" · ")
         } else {
             idle
         };
@@ -3725,6 +3847,69 @@ pub(crate) fn floor_sign(known: bool) -> &'static str {
     if known { "≥" } else { "≈" }
 }
 
+/// Which half of Clean up is shown.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum CleanupView {
+    /// Rebuildable and Cache folders.
+    Safe,
+    /// Review-first folders.
+    Review,
+}
+
+impl CleanupView {
+    pub fn of(safety: Safety) -> Self {
+        if safety == Safety::Review {
+            Self::Review
+        } else {
+            Self::Safe
+        }
+    }
+
+    /// Worktrees are Review first; every other kind opens on the safe half.
+    pub fn for_category(category: Option<Category>) -> Self {
+        if category == Some(Category::GitWorktree) {
+            Self::Review
+        } else {
+            Self::Safe
+        }
+    }
+
+    fn other(self) -> Self {
+        match self {
+            Self::Safe => Self::Review,
+            Self::Review => Self::Safe,
+        }
+    }
+
+    fn icon(self) -> Icon {
+        match self {
+            Self::Safe => Icon::Check,
+            Self::Review => Icon::Eye,
+        }
+    }
+}
+
+/// No enclosing candidate is listed in the same half of Clean up as this one.
+fn top_in_view(data: &Data, candidate: &Candidate, view: CleanupView) -> bool {
+    let mut cursor = candidate.nested_in;
+    while let Some(id) = cursor {
+        let Some(&index) = data.candidate_of.get(&id) else {
+            break;
+        };
+        let parent = &data.reclaim.candidates[index];
+        if listed(parent) && CleanupView::of(parent.safety) == view {
+            return false;
+        }
+        cursor = parent.nested_in;
+    }
+    true
+}
+
+/// A candidate Clean up lists: an empty folder frees nothing, so it is left out.
+pub(crate) fn listed(candidate: &Candidate) -> bool {
+    candidate.logical_bytes > 0 || candidate.allocated_bytes.is_some_and(|b| b > 0)
+}
+
 fn size_metric(candidate: &Candidate, allocated: bool) -> u64 {
     if allocated {
         candidate.allocated_bytes.unwrap_or(0)
@@ -3815,15 +4000,22 @@ fn category_title(category: Category) -> &'static str {
     }
 }
 
-fn category_icon(candidate: &Candidate) -> Icon {
-    match candidate.category {
-        Category::GitWorktree if candidate.agent.is_some() => Icon::Agent,
+/// A kind's icon in the Clean up kind menu.
+fn category_kind_icon(category: Category) -> Icon {
+    match category {
         Category::GitWorktree => Icon::Code,
         Category::BuildOutput => Icon::Grid,
         Category::Dependencies => Icon::Folder,
         Category::PackageCache | Category::AppCache => Icon::Download,
         Category::Temporary => Icon::Refresh,
         Category::RecycleBin => Icon::Document,
+    }
+}
+
+fn category_icon(candidate: &Candidate) -> Icon {
+    match candidate.category {
+        Category::GitWorktree if candidate.agent.is_some() => Icon::Agent,
+        category => category_kind_icon(category),
     }
 }
 
@@ -3912,33 +4104,6 @@ fn place_row(
             style::regular(13.0)
         },
         if tint.is_some() { th.text } else { th.dim },
-    );
-    response
-}
-
-fn filter_chip(ui: &mut Ui, label: &str, count: Option<usize>, active: bool) -> egui::Response {
-    let th = t();
-    let text = match count {
-        Some(n) => format!("{label}  ·  {n}"),
-        None => label.to_string(),
-    };
-    let galley = ui
-        .painter()
-        .layout_no_wrap(text, style::semibold(12.0), Color32::PLACEHOLDER);
-    let (rect, response) =
-        ui.allocate_exact_size(vec2(galley.size().x + 22.0, 30.0), Sense::click());
-    let (fill, fg) = if active {
-        (th.text, th.bg)
-    } else if response.hovered() {
-        (th.hover, th.text)
-    } else {
-        (th.card, th.dim)
-    };
-    ui.painter().rect_filled(rect, 15, fill);
-    ui.painter().galley(
-        pos2(rect.left() + 11.0, rect.center().y - galley.size().y / 2.0),
-        galley,
-        fg,
     );
     response
 }

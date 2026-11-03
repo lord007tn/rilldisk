@@ -1064,6 +1064,17 @@ pub(crate) fn is_elevated() -> bool {
     Token::open(TOKEN_QUERY).is_ok_and(|token| token.is_elevated())
 }
 
+/// Installed physical memory in bytes.
+pub(crate) fn physical_memory() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: the struct is zeroed with its length set, as the API requires.
+    unsafe {
+        let mut status: MEMORYSTATUSEX = std::mem::zeroed();
+        status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        (GlobalMemoryStatusEx(&mut status) != 0).then_some(status.ullTotalPhys)
+    }
+}
+
 /// Windows offers elevation through UAC; this only serves the shared API.
 pub(crate) fn executable_on_path(program: &str) -> bool {
     let pathext = std::env::var("PATHEXT").ok();

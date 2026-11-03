@@ -7,16 +7,7 @@ use crate::settings::SCAN_LIMITS;
 use crate::style::{self, t};
 use crate::widgets::{self as w, Kind};
 use eframe::egui::{Color32, Frame, Margin, RichText, Sense, Ui, vec2};
-use rilldisk_core::{Category, git::Verdict};
-
-/// Memory a scan may hold per entry, rounded up from the measured 160–220 bytes
-/// (docs/PERFORMANCE.md) to leave room for analysis.
-const BYTES_PER_ENTRY: u64 = 240;
-
-/// Roughly how much memory a scan with `limit` entries may need.
-pub fn memory_for(limit: usize) -> u64 {
-    limit as u64 * BYTES_PER_ENTRY
-}
+use rilldisk_core::{Category, git::Verdict, memory_for};
 
 /// Physical memory available now, where the platform says.
 pub fn available_memory() -> Option<u64> {
@@ -36,9 +27,9 @@ pub fn available_memory() -> Option<u64> {
     }
 }
 
-/// "30M".
+/// "60M", "142M".
 pub fn short_limit(limit: usize) -> String {
-    format!("{}M", limit / 1_000_000)
+    format!("{}M", limit.div_ceil(1_000_000))
 }
 
 impl RillApp {
@@ -49,7 +40,7 @@ impl RillApp {
             return actions;
         }
         let th = t();
-        let current = self.prefs.max_entries;
+        let current = self.prefs.scan_limit();
         let next = SCAN_LIMITS.iter().copied().find(|&l| l > current);
         Frame::new()
             .fill(style::alpha(th.warn, if th.dark { 30 } else { 26 }))
@@ -99,7 +90,7 @@ impl RillApp {
                         ))
                         .clicked()
                     {
-                        actions.push(Action::ScanLimit(next, true));
+                        actions.push(Action::ScanLimit(Some(next), true));
                     }
                 });
             });

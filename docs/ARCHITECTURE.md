@@ -60,7 +60,8 @@ Windows regression test independently confirms absence of extents with
 Cancellation is cooperative between directory batches and records. A blocking
 filesystem operation can delay it. Every worker atomically reserves a record from
 one shared budget before retaining it, bounding the combined arena and in-flight
-records. Reaching the bound (default 30 million entries) produces one issue and a
+records. Reaching the bound (by default as many entries as fit in half of the
+installed memory, at least 30 million; `auto_max_entries`) produces one issue and a
 partial result. Progress counters update during enumeration. Paths, frontier copies,
 the hard-link set and query sorting add memory. Five million entries can require substantial RAM. A
 compact name arena and indexed queries should follow profiling, not precede it.
@@ -198,7 +199,8 @@ progress counters and swaps in a finished `Arc<Snapshot>`.
   anti-aliased annular sectors (each a 4 × n vertex grid whose outer rows fade over
   one pixel) and hit-tested in polar coordinates.
 * **Views**: Overview, Explore (map or rings plus a virtualized folder list),
-  Clean up (virtualized, grouped by category; tick folders or "Select all safe",
+  Clean up (Safe to delete / Review first halves, an All kinds menu, virtualized
+  and grouped by category; tick folders, a category heading or "Select all safe",
   then copy a plan or move them to the Recycle Bin / Trash after a confirmation
   dialog, see `cleanup_ui.rs`), Largest files, File types, Issues and Search.
 * **Elevation** (`elevation.rs`): the Issues view grouped by kind, the

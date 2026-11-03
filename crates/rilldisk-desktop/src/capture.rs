@@ -912,7 +912,10 @@ pub fn advance(app: &mut RillApp, ctx: &egui::Context) {
                 });
             }
         }
-        Step::Filter(category) => app.category_filter = category,
+        Step::Filter(category) => {
+            app.category_filter = category;
+            app.cleanup_view = crate::app::CleanupView::for_category(category);
+        }
         Step::Caption(text) => {
             tour.captions.push((tour.frame, text));
             let lines: Vec<String> = tour

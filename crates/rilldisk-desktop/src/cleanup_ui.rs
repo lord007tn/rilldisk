@@ -94,94 +94,73 @@ impl CleanupUi {
     }
 }
 
-/// Explanation line with "Select all safe" and "Clear" above the list.
-pub fn toolbar(app: &mut RillApp, ui: &mut Ui, data: &Arc<Data>) {
-    let th = t();
-    let category = app.category_filter;
-    let report = &data.reclaim;
-    let safe: Vec<usize> = app
-        .cleanup
+/// Candidates (indices) "Select all safe" ticks in the Clean up list: outermost
+/// Rebuildable and Cache folders that pass the static safety checks and hold
+/// something. Never Review items.
+pub fn safe(app: &mut RillApp, data: &Arc<Data>) -> Vec<usize> {
+    app.cleanup
         .safe(data)
         .iter()
         .copied()
-        .filter(|&i| category.is_none_or(|c| report.candidates[i].category == c))
-        .collect();
-    // Only when worktrees are shown: never tick what a filter hides.
-    let idle: Vec<usize> = if category.is_none_or(|c| c == Category::GitWorktree)
-        && app.safety_filter.is_none_or(|s| s == Safety::Review)
-    {
-        app.clean_idle_worktrees(data)
+        .filter(|&i| crate::app::listed(&data.reclaim.candidates[i]))
+        .collect()
+}
+
+/// "Select all safe" for the safe folders shown (`shown`).
+pub fn select_button(app: &mut RillApp, ui: &mut Ui, shown: &[usize]) {
+    let all = !shown.is_empty() && shown.iter().all(|i| app.picked.contains(i));
+    let label = if all {
+        format!("All {} selected", style::count(shown.len() as u64))
     } else {
-        Vec::new()
+        format!("Select all safe · {}", style::count(shown.len() as u64))
     };
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 8.0;
-        let buttons = if idle.is_empty() { 300.0 } else { 560.0 };
-        let width = (ui.available_width() - buttons).max(200.0);
-        ui.allocate_ui_with_layout(
-            vec2(width, 32.0),
-            Layout::left_to_right(Align::Center),
-            |ui| {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(format!(
-                            "Tick folders to move them to the {}. Nothing is removed until you confirm, and Review-first items are never ticked for you.",
-                            CleanupMode::trash_name()
-                        ))
-                        .font(style::regular(12.0))
-                        .color(th.faint),
-                    )
-                    .wrap(),
-                );
-            },
-        );
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if !app.picked.is_empty() && w::button(ui, Kind::Ghost, None, "Clear").clicked() {
-                app.picked.clear();
-            }
-            let all = !safe.is_empty() && safe.iter().all(|i| app.picked.contains(i));
-            ui.add_enabled_ui(!safe.is_empty() && !all, |ui| {
-                if w::button(
-                    ui,
-                    Kind::Soft,
-                    Some(Icon::Check),
-                    &format!("Select all safe · {}", safe.len()),
-                )
-                .on_hover_text(
-                    "Ticks every Rebuildable and Cache folder shown. Review-first items, system folders and Trash folders are never included.",
-                )
-                .on_disabled_hover_text(if safe.is_empty() {
-                    "No Rebuildable or Cache folder here can be removed safely."
-                } else {
-                    "Every safe folder shown is already ticked."
-                })
-                .clicked()
-                {
-                    app.picked.extend(safe.iter().copied());
-                }
-            });
-            // Worktrees with no Git-reported changes and no recent activity.
-            if !idle.is_empty() {
-                let all = idle.iter().all(|i| app.picked.contains(i));
-                ui.add_enabled_ui(!all, |ui| {
-                    if w::button(
-                        ui,
-                        Kind::Soft,
-                        Some(Icon::Agent),
-                        &format!("Select clean idle worktrees · {}", idle.len()),
-                    )
-                    .on_hover_text(format!(
-                        "Ticks worktrees where Git reports no uncommitted or untracked changes, no commits that exist only there and no lock, and nothing changed for {} days or more (Settings). Git does not see ignored files such as .env, and RillDisk cannot tell whether an agent is still running there: they stay Review first. Branch commits stay in the repository.",
-                        app.stale_days()
-                    ))
-                    .on_disabled_hover_text("Every clean idle worktree is already ticked.")
-                    .clicked()
-                    {
-                        app.picked.extend(idle.iter().copied());
-                    }
-                });
-            }
-        });
+    ui.add_enabled_ui(!shown.is_empty() && !all, |ui| {
+        if w::button(ui, Kind::Soft, Some(Icon::Check), &label)
+            .on_hover_text(format!(
+                "Ticks every safe folder shown. System folders and the {} itself are never included.",
+                CleanupMode::trash_name()
+            ))
+            .on_disabled_hover_text(if shown.is_empty() {
+                "No folder here can be removed safely."
+            } else {
+                "Every safe folder shown is already ticked."
+            })
+            .clicked()
+        {
+            app.picked.extend(shown.iter().copied());
+        }
+    });
+}
+
+/// "Select clean idle worktrees", when Git reports any.
+pub fn idle_button(app: &mut RillApp, ui: &mut Ui, data: &Arc<Data>) {
+    if app
+        .category_filter
+        .is_some_and(|c| c != Category::GitWorktree)
+    {
+        return;
+    }
+    let idle = app.clean_idle_worktrees(data);
+    if idle.is_empty() {
+        return;
+    }
+    let all = idle.iter().all(|i| app.picked.contains(i));
+    ui.add_enabled_ui(!all, |ui| {
+        if w::button(
+            ui,
+            Kind::Soft,
+            Some(Icon::Agent),
+            &format!("Select clean idle worktrees · {}", idle.len()),
+        )
+        .on_hover_text(format!(
+            "Ticks worktrees where Git reports no uncommitted or untracked changes, no commits that exist only there and no lock, and nothing changed for {} days or more (Settings). Git does not see ignored files such as .env, and RillDisk cannot tell whether an agent is still running there: they stay Review first. Branch commits stay in the repository.",
+            app.stale_days()
+        ))
+        .on_disabled_hover_text("Every clean idle worktree is already ticked.")
+        .clicked()
+        {
+            app.picked.extend(idle.iter().copied());
+        }
     });
 }
 
@@ -989,7 +968,7 @@ pub mod tour {
 
     pub fn select_safe(app: &mut RillApp) {
         if let Some(data) = app.data.clone() {
-            let safe = app.cleanup.safe(&data).to_vec();
+            let safe = super::safe(app, &data);
             app.picked.extend(safe);
         }
     }
