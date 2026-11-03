@@ -712,6 +712,72 @@ pub(crate) fn is_elevated() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+/// Installed physical memory in bytes, lowered to the cgroup (container)
+/// memory limit on Linux.
+pub(crate) fn physical_memory() -> Option<u64> {
+    // SAFETY: sysconf has no preconditions; -1 or 0 means unknown.
+    let (pages, size) = unsafe {
+        (
+            libc::sysconf(libc::_SC_PHYS_PAGES),
+            libc::sysconf(libc::_SC_PAGESIZE),
+        )
+    };
+    let installed = (pages > 0 && size > 0).then(|| pages as u64 * size as u64)?;
+    Some(cgroup_limit().map_or(installed, |limit| limit.min(installed)))
+}
+
+/// Memory available now: Linux `MemAvailable`, within the cgroup's remaining
+/// room. Other Unix systems do not report it.
+pub(crate) fn available_memory() -> Option<u64> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
+    let available = parse_meminfo_available(&meminfo)?;
+    let room = cgroup_limit()
+        .zip(cgroup_usage())
+        .map(|(l, u)| l.saturating_sub(u));
+    Some(room.map_or(available, |room| room.min(available)))
+}
+
+/// Linux and macOS do not distinguish commit from RAM here: the same figure.
+pub(crate) fn free_physical_memory() -> Option<u64> {
+    available_memory()
+}
+
+/// `MemAvailable` in bytes from `/proc/meminfo` text.
+fn parse_meminfo_available(text: &str) -> Option<u64> {
+    let line = text.lines().find(|l| l.starts_with("MemAvailable:"))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib * 1024)
+}
+
+/// The memory limit of this process's cgroup (v2 `memory.max`, or v1
+/// `memory.limit_in_bytes`), when one is set. Linux only.
+fn cgroup_limit() -> Option<u64> {
+    cgroup_value(&["memory.max", "memory/memory.limit_in_bytes"])
+}
+
+fn cgroup_usage() -> Option<u64> {
+    cgroup_value(&["memory.current", "memory/memory.usage_in_bytes"])
+}
+
+fn cgroup_value(files: &[&str]) -> Option<u64> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    files.iter().find_map(|file| {
+        let text = fs::read_to_string(Path::new("/sys/fs/cgroup").join(file)).ok()?;
+        parse_cgroup_bytes(&text)
+    })
+}
+
+/// A cgroup byte count; "max" and the v1 "no limit" sentinel mean none.
+fn parse_cgroup_bytes(text: &str) -> Option<u64> {
+    let value: u64 = text.trim().parse().ok()?;
+    (value < 1 << 60).then_some(value)
+}
+
 /// `sudo` or `pkexec` on `PATH` is a way to get to root.
 pub(crate) fn elevation() -> crate::Elevation {
     let is_elevated = is_elevated();
@@ -1111,6 +1177,17 @@ pub fn volumes() -> Vec<crate::Volume> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_files_parse() {
+        let meminfo =
+            "MemTotal:       16000000 kB\nMemFree:  100 kB\nMemAvailable:    8000000 kB\n";
+        assert_eq!(parse_meminfo_available(meminfo), Some(8_000_000 * 1024));
+        assert_eq!(parse_meminfo_available("MemTotal: 1 kB\n"), None);
+        assert_eq!(parse_cgroup_bytes("max\n"), None);
+        assert_eq!(parse_cgroup_bytes("9223372036854771712\n"), None);
+        assert_eq!(parse_cgroup_bytes("8589934592\n"), Some(8 << 30));
+    }
 
     #[test]
     fn descriptor_pressure_selects_full_path_children() {

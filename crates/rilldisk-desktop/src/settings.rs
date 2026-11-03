@@ -17,12 +17,14 @@ pub struct Saved {
     pub git_checks: Option<bool>,
     /// Days without work after which a clean worktree counts as idle.
     pub stale_days: Option<u64>,
-    /// Entry limit of desktop scans (one of [`SCAN_LIMITS`]).
-    pub max_entries: Option<usize>,
+    /// Entry limit of desktop scans: `Some(None)` is Automatic, `Some(Some(n))`
+    /// one of [`SCAN_LIMITS`].
+    pub max_entries: Option<Option<usize>>,
 }
 
-/// Entry limits the desktop offers: the default and two larger memory bounds.
-pub const SCAN_LIMITS: [usize; 3] = [30_000_000, 60_000_000, 120_000_000];
+/// Fixed entry limits the desktop offers besides Automatic
+/// ([`rilldisk_core::auto_max_entries`]), for folders larger than that.
+pub const SCAN_LIMITS: [usize; 4] = [60_000_000, 120_000_000, 240_000_000, 480_000_000];
 
 /// Everything the Settings page can change.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -33,7 +35,16 @@ pub struct Prefs {
     pub allocated: bool,
     pub git_checks: bool,
     pub stale_days: u64,
-    pub max_entries: usize,
+    /// None: Automatic, sized from installed memory.
+    pub max_entries: Option<usize>,
+}
+
+impl Prefs {
+    /// The entry limit desktop scans use.
+    pub fn scan_limit(&self) -> usize {
+        self.max_entries
+            .unwrap_or_else(rilldisk_core::auto_max_entries)
+    }
 }
 
 fn path() -> Option<PathBuf> {
@@ -70,13 +81,7 @@ pub fn load() -> Saved {
                     _ => None,
                 }
             }
-            Some(("scan-limit", value)) => {
-                saved.max_entries = value
-                    .trim()
-                    .parse()
-                    .ok()
-                    .filter(|n| SCAN_LIMITS.contains(n))
-            }
+            Some(("scan-limit", value)) => saved.max_entries = parse_limit(value.trim()),
             Some(("stale-days", value)) => {
                 saved.stale_days = value.trim().parse().ok().filter(|d| (1..=3650).contains(d))
             }
@@ -84,6 +89,19 @@ pub fn load() -> Saved {
         }
     }
     saved
+}
+
+/// A saved `scan-limit`. Versions before 0.1.4 always wrote their fixed
+/// default, 30,000,000, so it reads as Automatic, which is never smaller.
+fn parse_limit(value: &str) -> Option<Option<usize>> {
+    match value {
+        "auto" => Some(None),
+        _ => match value.parse().ok()? {
+            rilldisk_core::DEFAULT_MAX_ENTRIES => Some(None),
+            n if SCAN_LIMITS.contains(&n) => Some(Some(n)),
+            _ => None,
+        },
+    }
 }
 
 /// Best effort: a read-only profile simply keeps the defaults next time.
@@ -105,7 +123,23 @@ pub fn save(prefs: &Prefs) {
             if prefs.allocated { "on-disk" } else { "size" },
             if prefs.git_checks { "on" } else { "off" },
             prefs.stale_days,
-            prefs.max_entries
+            prefs
+                .max_entries
+                .map_or_else(|| "auto".to_string(), |n| n.to_string())
         ),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_default_limit_reads_as_automatic() {
+        assert_eq!(parse_limit("auto"), Some(None));
+        assert_eq!(parse_limit("30000000"), Some(None));
+        assert_eq!(parse_limit("120000000"), Some(Some(120_000_000)));
+        assert_eq!(parse_limit("12345"), None);
+        assert_eq!(parse_limit("junk"), None);
+    }
 }

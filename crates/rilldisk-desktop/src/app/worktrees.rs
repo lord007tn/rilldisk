@@ -144,7 +144,7 @@ impl RillApp {
             .candidates
             .iter()
             .enumerate()
-            .filter(|(_, c)| c.nested_in.is_none())
+            .filter(|(_, c)| c.nested_in.is_none() && super::listed(c))
             .filter(|(_, c)| {
                 matches!(self.git_view(c), Some(GitView::Ready(r)) if r.verdict == Verdict::CleanIdle)
             })

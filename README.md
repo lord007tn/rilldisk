@@ -169,8 +169,12 @@ The desktop's Size / On disk switch changes the size figures; what removal frees
 is always on disk. It reads "at least" only when every allocation is known, and
 "about" when some sizes fell back to file length.
 
-In **Clean up**, tick folders or press **Select all safe** (Regenerable and Cache
-only; Review-first items are never ticked for you). **Move to Recycle Bin** opens a
+**Clean up** has two halves: **Safe to delete** (Regenerable and Cache folders that
+tools rebuild or re-download) and **Review first** (folders that may hold unique
+work, such as worktrees). One **All kinds** menu narrows either half to one kind.
+Tick folders, or in Safe to delete tick a kind's heading or press **Select all
+safe**; Review-first items are never ticked for you, and empty folders are not
+listed. **Move to Recycle Bin** opens a
 confirmation listing every path and the total. Right before each folder is moved,
 RillDisk checks again that it:
 
@@ -231,11 +235,15 @@ must be new; existing files are never overwritten.
 
 ## Known limits
 
-* **Entry limit.** A scan holds at most 30 million entries by default (about 240
-  bytes of memory each). A scan that reaches it is marked incomplete everywhere,
-  and the desktop offers a rescan with 60M or 120M (memory permitting); the CLI
-  takes `--max-entries`. Counts from an incomplete scan, including worktree counts,
-  are lower bounds.
+* **Entry limit.** A scan holds as many entries as fit in half of the installed
+  memory, or in the memory it can still allocate when it starts if that is less
+  (Windows: RAM plus page file not yet committed; Linux: available RAM within any
+  container limit). Each entry needs about 240 bytes; the limit is never under
+  30 million: up to about 35 million on a 16 GB computer, 140 million on 64 GB.
+  A scan that reaches it is marked incomplete everywhere. The desktop offers a
+  rescan with the next larger fixed limit (60M to 480M) when one exists and
+  memory permits; the CLI and MCP server take `--max-entries`. Counts from an
+  incomplete scan, including worktree counts, are lower bounds.
 * **Partial scans** (unreadable folders, cancellation, unresponsive folders) are
   marked partial in the app, the CLI exit code, JSON and MCP. Protected system
   folders need administrator rights (desktop: **Restart as administrator**).

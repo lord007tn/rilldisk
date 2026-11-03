@@ -56,6 +56,10 @@ pub enum Step {
     CloseMenu,
     /// Clean up: show one category (or everything).
     Filter(Option<Category>),
+    /// Clean up: show the safe half or the Review-first half.
+    Half(crate::app::CleanupView),
+    /// Clean up: untick everything.
+    ClearPicks,
     /// Until Git has answered for every worktree (the fixture's real repositories).
     WaitGit,
     /// Start a caption at the next recorded frame (written to captions.json).
@@ -373,6 +377,54 @@ impl Tour {
                 ChartKind(Chart::Map),
                 Wait(10),
                 Shot("navigation-dark"),
+                Quit,
+            ],
+        )
+    }
+
+    /// The Clean up view's two halves, kind filter and bulk ticks, recorded on
+    /// the synthetic demo disk (`--tour cleanup-view`). Nothing is removed.
+    pub fn cleanup_view(dir: PathBuf) -> Self {
+        use crate::app::CleanupView::{Review, Safe};
+        use Step::*;
+        Self::with_steps(
+            dir,
+            vec![
+                Theme(true),
+                WaitData,
+                Tab(View::Cleanup),
+                WaitGit,
+                PointerAway,
+                Wait(10),
+                Shot("cleanup-view-safe"),
+                Record(true),
+                Caption("Safe to delete: folders that tools rebuild or re-download"),
+                Wait(120),
+                Caption("Select all safe ticks every one of them"),
+                SelectSafe,
+                Wait(120),
+                Shot("cleanup-view-selected"),
+                Caption("Narrow to one kind with the All kinds menu"),
+                ClearPicks,
+                Filter(Some(Category::BuildOutput)),
+                Wait(120),
+                Shot("cleanup-view-kind"),
+                Caption("Review first: folders that may hold unique work"),
+                Filter(None),
+                Half(Review),
+                Wait(120),
+                Shot("cleanup-view-review"),
+                Caption("Git says which worktrees are clean and idle"),
+                SelectCleanIdle,
+                Wait(120),
+                Shot("cleanup-view-review-selected"),
+                ClearPicks,
+                Half(Safe),
+                Wait(20),
+                Record(false),
+                Settings(true),
+                Wait(10),
+                Shot("cleanup-view-scan-limit"),
                 Quit,
             ],
         )
@@ -912,7 +964,12 @@ pub fn advance(app: &mut RillApp, ctx: &egui::Context) {
                 });
             }
         }
-        Step::Filter(category) => app.category_filter = category,
+        Step::Filter(category) => {
+            app.category_filter = category;
+            app.cleanup_view = crate::app::CleanupView::for_category(category);
+        }
+        Step::Half(view) => app.cleanup_view = view,
+        Step::ClearPicks => app.picked.clear(),
         Step::Caption(text) => {
             tour.captions.push((tour.frame, text));
             let lines: Vec<String> = tour

@@ -78,29 +78,51 @@ impl RillApp {
                     },
                 );
                 ui.add_space(10.0);
-                let limits = crate::settings::SCAN_LIMITS;
+                // Automatic, then the larger fixed limits (and a saved smaller one).
+                let auto = rilldisk_core::auto_max_entries();
+                let mut limits: Vec<Option<usize>> = vec![None];
+                limits.extend(
+                    crate::settings::SCAN_LIMITS
+                        .iter()
+                        .copied()
+                        .filter(|&l| l > auto || self.prefs.max_entries == Some(l))
+                        .map(Some),
+                );
                 let estimates = limits
                     .iter()
+                    .flatten()
                     .map(|&l| {
                         format!(
                             "{} needs up to about {}",
                             super::scope::short_limit(l),
-                            style::bytes(super::scope::memory_for(l))
+                            style::bytes(rilldisk_core::memory_for(l))
                         )
                     })
                     .collect::<Vec<_>>()
                     .join(", ");
+                let installed = rilldisk_core::physical_memory()
+                    .map(|m| {
+                        format!(
+                            " (half of this computer's {}, or less when memory runs short as a scan starts)",
+                            style::bytes(m)
+                        )
+                    })
+                    .unwrap_or_default();
                 row(
                     ui,
                     "Scan limit",
                     &format!(
-                        "Entries one scan may hold. A scan that reaches it stops and says so; raise it for very large folders such as a whole home folder full of worktrees. {estimates} of memory."
+                        "Entries one scan may hold. Automatic allows {} entries now, up to about {} of memory{installed}, enough for whole drives. A scan that reaches its limit stops and says so. {estimates}.",
+                        style::count(auto as u64),
+                        style::bytes(rilldisk_core::memory_for(auto)),
                     ),
                     |ui| {
                         let mut limit = self.prefs.max_entries;
-                        let labels: Vec<String> =
-                            limits.iter().map(|&l| super::scope::short_limit(l)).collect();
-                        let options: Vec<(usize, Option<Icon>, &str)> = limits
+                        let labels: Vec<String> = limits
+                            .iter()
+                            .map(|l| l.map_or_else(|| "Automatic".to_string(), super::scope::short_limit))
+                            .collect();
+                        let options: Vec<(Option<usize>, Option<Icon>, &str)> = limits
                             .iter()
                             .zip(&labels)
                             .map(|(&l, label)| (l, None, label.as_str()))

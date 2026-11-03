@@ -42,8 +42,10 @@ struct ScanArgs {
     output: Option<PathBuf>,
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=64))]
     threads: Option<u8>,
-    #[arg(long, default_value_t = rilldisk_core::DEFAULT_MAX_ENTRIES)]
-    max_entries: usize,
+    /// Entries one scan may hold [default: as many as fit in half of the
+    /// installed memory, at least 30,000,000]
+    #[arg(long)]
+    max_entries: Option<usize>,
     /// Linux/macOS: also enter other mounted filesystems below the path. Virtual
     /// filesystems such as /proc, /sys, /dev and /run are skipped either way.
     #[arg(long)]
@@ -148,8 +150,10 @@ enum Command {
         root: Vec<PathBuf>,
         #[arg(long, value_parser = clap::value_parser!(u8).range(1..=64))]
         threads: Option<u8>,
-        #[arg(long, default_value_t = rilldisk_core::DEFAULT_MAX_ENTRIES)]
-        max_entries: usize,
+        /// Entries one scan may hold [default: as many as fit in half of the
+        /// installed memory, at least 30,000,000]
+        #[arg(long)]
+        max_entries: Option<usize>,
         /// Linux/macOS: let scans enter other mounted filesystems below a root.
         #[arg(long)]
         cross_filesystems: bool,
@@ -839,13 +843,13 @@ fn now_ms() -> u64 {
 
 fn options(
     threads: Option<u8>,
-    max_entries: usize,
+    max_entries: Option<usize>,
     cross_filesystems: bool,
     backend: BackendArg,
 ) -> ScanOptions {
     ScanOptions {
         threads: threads.map_or_else(|| ScanOptions::default().threads, usize::from),
-        max_entries,
+        max_entries: max_entries.unwrap_or_else(rilldisk_core::auto_max_entries),
         cross_filesystems,
         backend: backend.into(),
     }
