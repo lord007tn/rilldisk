@@ -753,7 +753,8 @@ fn write_scan(
             if report.candidate_count > 0 {
                 writeln!(
                     writer,
-                    "\nReclaimable: frees at least {} ({} total size) in {} candidates. Run `rilldisk reclaim` on this path for details.",
+                    "\nReclaimable: frees {} {} on disk ({} total size) in {} candidates. Run `rilldisk reclaim` on this path for details.",
+                    floor_word(&report),
                     human(report.total_exclusive_bytes),
                     human(report.total_logical_bytes),
                     report.candidate_count
@@ -776,7 +777,8 @@ fn write_reclaim(
     let frees: u64 = outer.map(|c| c.exclusive_bytes).sum();
     writeln!(
         writer,
-        "\nReclaimable: frees at least {} on disk ({} total size) in {} candidates (>= {}).",
+        "\nReclaimable: frees {} {} on disk ({} total size) in {} candidates (>= {}).",
+        floor_word(report),
         human(frees),
         human(size),
         report.candidates.len(),
@@ -878,6 +880,16 @@ pub(crate) fn human(bytes: u64) -> String {
         unit += 1;
     }
     format!("{size:.1} {}", UNITS[unit])
+}
+
+/// "at least" when every candidate's allocated size is known (FREES is then a
+/// floor); "about" when some fell back to file length.
+pub(crate) fn floor_word(report: &ReclaimReport) -> &'static str {
+    if report.total_allocated_bytes.is_some() {
+        "at least"
+    } else {
+        "about"
+    }
 }
 
 /// `reclaim --git --delete`: a linked worktree stays only with a Git report that

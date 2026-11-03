@@ -162,6 +162,7 @@ pub fn paint(
     places: &[nav::Place],
     anim: &mut Anim,
     allocated: bool,
+    waiting: &str,
 ) -> Option<usize> {
     let mut clicked = None;
     let th = t();
@@ -189,7 +190,7 @@ pub fn paint(
         p.text(
             map_rect.center(),
             Align2::CENTER_CENTER,
-            "Reading the first folders…",
+            waiting,
             style::regular(13.0),
             th.faint,
         );
@@ -553,6 +554,7 @@ mod tests {
                     &places,
                     &mut anim,
                     false,
+                    "",
                 )
                 .or(opened);
             })
@@ -604,6 +606,7 @@ mod tests {
                     &places,
                     &mut anim,
                     false,
+                    "",
                 )
                 .or(selected);
             })

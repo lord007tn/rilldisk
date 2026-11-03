@@ -123,7 +123,8 @@ impl RillApp {
         let orphaned = worktrees.len() as u64 - linked;
         let outer = worktrees.iter().filter(|c| c.nested_in.is_none());
         let size: u64 = outer.clone().map(|c| size_metric(c, self.allocated)).sum();
-        let freed: u64 = outer.map(|c| frees(c, self.allocated)).sum();
+        let known = super::allocation_known(outer.clone().copied());
+        let freed: u64 = outer.map(|c| frees(c)).sum();
         let mut agents: Vec<(&str, u64)> = Vec::new();
         for c in &worktrees {
             let name = c.agent.unwrap_or("Not attributed");
@@ -151,9 +152,10 @@ impl RillApp {
                 ui.label(RichText::new(title).font(style::semibold(16.0)));
                 ui.label(
                     RichText::new(format!(
-                        "Under {} · {} in size · removing every one would free at least {} (hard links counted). Neither figure means they are safe to remove.",
+                        "Under {} · {} in size · removing every one would free {} {} on disk (hard links counted). Neither figure means they are safe to remove.",
                         summary.root.display(),
                         style::bytes(size),
+                        super::floor_word(known),
                         style::bytes(freed)
                     ))
                     .font(style::regular(12.0))

@@ -506,7 +506,6 @@ fn danger_button(ui: &mut Ui, text: &str) -> egui::Response {
 
 fn confirm_dialog(app: &mut RillApp, ctx: &egui::Context) {
     let th = t();
-    let allocated = app.allocated;
     let Some(confirm) = &mut app.cleanup.confirm else {
         return;
     };
@@ -516,8 +515,15 @@ fn confirm_dialog(app: &mut RillApp, ctx: &egui::Context) {
     let frees_of = |entry_id: usize| {
         data.candidate_of
             .get(&entry_id)
-            .map_or(0, |&i| frees(&data.reclaim.candidates[i], allocated))
+            .map_or(0, |&i| frees(&data.reclaim.candidates[i]))
     };
+    let known = crate::app::allocation_known(
+        plan.items
+            .iter()
+            .filter_map(|i| data.candidate_of.get(&i.entry_id))
+            .map(|&i| &data.reclaim.candidates[i]),
+    );
+    let floor = crate::app::floor_word(known);
     let total: u64 = plan.items.iter().map(|i| frees_of(i.entry_id)).sum();
     let reviews = plan
         .items
@@ -546,13 +552,13 @@ fn confirm_dialog(app: &mut RillApp, ctx: &egui::Context) {
             "None of the ticked folders can be removed.".to_string()
         } else if permanent {
             format!(
-                "Frees at least {} · {}. This cannot be undone.",
+                "Frees {floor} {} on disk · {}. This cannot be undone.",
                 style::bytes(total),
                 style::plural(plan.total_files, "file")
             )
         } else {
             format!(
-                "Frees at least {} once the {} is emptied · {}. You can restore them from there.",
+                "Frees {floor} {} on disk once the {} is emptied · {}. You can restore them from there.",
                 style::bytes(total),
                 CleanupMode::trash_name(),
                 style::plural(plan.total_files, "file")
@@ -822,8 +828,16 @@ fn result_dialog(app: &mut RillApp, ctx: &egui::Context) {
         .iter()
         .filter(|r| matches!(r.outcome, Outcome::Removed { .. }))
         .filter_map(|r| finished.data.candidate_of.get(&r.item.entry_id))
-        .map(|&i| frees(&finished.data.reclaim.candidates[i], allocated))
+        .map(|&i| frees(&finished.data.reclaim.candidates[i]))
         .sum();
+    let known = crate::app::allocation_known(
+        report
+            .items
+            .iter()
+            .filter(|r| matches!(r.outcome, Outcome::Removed { .. }))
+            .filter_map(|r| finished.data.candidate_of.get(&r.item.entry_id))
+            .map(|&i| &finished.data.reclaim.candidates[i]),
+    );
     let skipped = report.refused.len()
         + report
             .items
@@ -863,7 +877,11 @@ fn result_dialog(app: &mut RillApp, ctx: &egui::Context) {
             ui,
             if clean { Icon::Check } else { Icon::Warning },
             if clean { th.good } else { th.warn },
-            &format!("Freed at least {}", style::bytes(freed)),
+            &format!(
+                "Freed {} {} on disk",
+                crate::app::floor_word(known),
+                style::bytes(freed)
+            ),
             &parts.join(" · "),
         );
         ui.add_space(12.0);

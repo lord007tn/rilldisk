@@ -1160,7 +1160,9 @@ impl RillApp {
                     .font(style::regular(11.5))
                     .color(th.dim),
             )
-            .on_hover_text("Reads names, sizes and dates only. Nothing leaves this PC.");
+            .on_hover_text(
+                "Reads names, sizes and dates; the optional Git check runs your git, read-only. Nothing leaves this PC.",
+            );
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 actions.extend(self.version_button(ui));
             });
@@ -1316,12 +1318,8 @@ impl RillApp {
             (
                 Tab::Cleanup,
                 "Clean up".to_string(),
-                (!data.reclaim.candidates.is_empty()).then(|| {
-                    (
-                        style::bytes(frees_total(&data.reclaim, self.allocated)),
-                        th.accent,
-                    )
-                }),
+                (!data.reclaim.candidates.is_empty())
+                    .then(|| (style::bytes(frees_total(&data.reclaim)), th.accent)),
             ),
             (Tab::Largest, "Largest files".to_string(), None),
             (Tab::Types, "File types".to_string(), None),
@@ -1514,11 +1512,32 @@ impl RillApp {
                 .color(th.dim),
         );
         ui.add_space(10.0);
+        // An NTFS table scan reads the whole table before any folder exists: show
+        // how far through the table it is, then that folders are being built.
+        let mft = control.mft_progress();
         let (bar, _) = ui.allocate_exact_size(vec2(ui.available_width(), 4.0), Sense::hover());
-        live::sweep(ui.painter(), bar, ui.input(|i| i.time), th.accent);
+        match mft {
+            Some(m) if !m.building => w::progress(
+                ui.painter(),
+                bar,
+                m.records_read as f32 / m.records_total.max(1) as f32,
+                th.accent,
+            ),
+            _ => live::sweep(ui.painter(), bar, ui.input(|i| i.time), th.accent),
+        }
         ui.add_space(16.0);
         let full = ui.available_rect_before_wrap();
         let area = Rect::from_min_max(full.min, egui::pos2(full.right(), full.bottom() - 26.0));
+        let waiting = match mft {
+            Some(m) if !m.building => format!(
+                "Reading the NTFS file table · {:.0}% · {} of {} records",
+                m.records_read as f64 * 100.0 / m.records_total.max(1) as f64,
+                style::short_count(m.records_read),
+                style::short_count(m.records_total)
+            ),
+            Some(_) => "File table read · building folders from it…".to_string(),
+            None => "Reading the first folders…".to_string(),
+        };
         if let Some(id) = live::paint(
             ui,
             area,
@@ -1526,13 +1545,14 @@ impl RillApp {
             &places,
             &mut self.live_anim,
             self.allocated,
+            &waiting,
         ) {
             self.live_anim.open(&control, id, view.as_deref());
         }
         ui.painter().text(
             egui::pos2(full.left() + 4.0, full.bottom() - 4.0),
             Align2::LEFT_BOTTOM,
-            if view.is_some() { "Partial sizes grow as folders are read. Click folders to browse; Parent, Backspace or Left goes up. On disk is file allocation, not volume used space." } else { "Reading metadata. MFT scans publish folders after table processing; directory scans publish as batches arrive." },
+            if view.is_some() { "Partial sizes grow as folders are read. Click folders to browse; Parent, Backspace or Left goes up. On disk is file allocation, not volume used space." } else { if mft.is_some() { "An NTFS table scan reads the whole file table in one pass, then builds every folder at once; the map appears when that is done. File counts restart while folders are built." } else { "Reading metadata. Folders appear as they are read." } },
             style::regular(11.5),
             th.faint,
         );
@@ -1636,7 +1656,7 @@ impl RillApp {
         // 2. Clean up
         {
             let rect = card(1);
-            let frees = frees_total(&data.reclaim, self.allocated);
+            let frees = frees_total(&data.reclaim);
             let has = !data.reclaim.candidates.is_empty();
             let (fill, fg) = if has {
                 (th.accent, th.on_accent)
@@ -1756,7 +1776,7 @@ impl RillApp {
                 let freed: u64 = worktrees
                     .iter()
                     .filter(|c| c.nested_in.is_none())
-                    .map(|c| frees(c, self.allocated))
+                    .map(|c| frees(c))
                     .sum();
                 let (count, unit) = match (agent_count, worktrees.len()) {
                     (1, _) => (1, "agent worktree"),
@@ -1776,7 +1796,11 @@ impl RillApp {
                 p.text(
                     inner.left_top() + vec2(0.0, 60.0),
                     Align2::LEFT_TOP,
-                    format!("frees ≥ {} if removed", style::bytes(freed)),
+                    format!(
+                        "frees {} {} on disk if removed",
+                        floor_word(allocation_known(data.reclaim.candidates.iter())),
+                        style::bytes(freed)
+                    ),
                     style::regular(12.0),
                     th.dim,
                 );
@@ -1786,7 +1810,7 @@ impl RillApp {
                         .iter()
                         .map(|&i| &data.reclaim.candidates[i])
                         .filter(|c| c.nested_in.is_none())
-                        .map(|c| frees(c, self.allocated))
+                        .map(frees)
                         .sum();
                     p.circle_filled(pos2(inner.left() + 4.0, y + 8.0), 3.5, agent_color(agent));
                     p.text(
@@ -2567,19 +2591,24 @@ impl RillApp {
         let p = ui.painter().clone();
         p.rect_filled(head, 16, th.card);
         let inner = head.shrink2(vec2(20.0, 16.0));
-        let total = frees_total(report, self.allocated);
+        let total = frees_total(report);
+        let known = allocation_known(report.candidates.iter());
         let big = w::big_bytes(&p, inner.left_top(), Align2::LEFT_TOP, total, 32.0, th.text);
         p.text(
             pos2(big.right() + 12.0, big.bottom() - 8.0),
             Align2::LEFT_BOTTOM,
-            "can be freed, at least",
+            if known {
+                "freed on disk, at least"
+            } else {
+                "freed on disk, about (some sizes unknown)"
+            },
             style::regular(13.0),
             th.dim,
         );
         let outer = report.candidates.iter().filter(|c| c.nested_in.is_none());
         let shared: u64 = outer.clone().map(|c| c.shared_bytes).sum();
         let mut caption = format!(
-            "{} across {} folders.",
+            "{} in size across {} folders.",
             style::bytes(outer.clone().map(|c| size_metric(c, self.allocated)).sum()),
             style::count(outer.count() as u64)
         );
@@ -2649,10 +2678,7 @@ impl RillApp {
                 (
                     cat,
                     items.clone().count(),
-                    items
-                        .filter(|c| c.nested_in.is_none())
-                        .map(|c| frees(c, self.allocated))
-                        .sum(),
+                    items.filter(|c| c.nested_in.is_none()).map(frees).sum(),
                 )
             })
             .filter(|c| c.1 > 0)
@@ -2745,7 +2771,11 @@ impl RillApp {
                             p.text(
                                 pos2(rect.right() - 8.0, y),
                                 Align2::RIGHT_CENTER,
-                                format!("frees ≥ {}", style::bytes(*bytes)),
+                                format!(
+                                    "frees {} {}",
+                                    floor_sign(allocation_known(report.candidates.iter())),
+                                    style::bytes(*bytes)
+                                ),
                                 style::regular(12.5),
                                 th.dim,
                             );
@@ -2777,6 +2807,14 @@ impl RillApp {
         let p = &p;
         let c = &report.candidates[i];
         let card = rect.shrink2(vec2(0.0, 3.0));
+        if self.tour.is_some() {
+            ui.ctx().data_mut(|d| {
+                d.insert_temp(
+                    egui::Id::unique((crate::capture::CARD_HITS, c.entry_id)),
+                    card,
+                )
+            });
+        }
         let picked = self.picked.contains(&i);
         p.rect_filled(
             card,
@@ -2837,11 +2875,15 @@ impl RillApp {
             text_w - (path_x - text_x),
         );
         p.galley(pos2(path_x, card.top() + 34.0), path, th.faint);
-        let size = frees(c, self.allocated);
+        let size = frees(c);
         p.text(
             pos2(card.right() - 16.0, card.top() + 12.0),
             Align2::RIGHT_TOP,
-            style::bytes(size),
+            if c.allocated_bytes.is_some() {
+                style::bytes(size)
+            } else {
+                format!("≈ {}", style::bytes(size))
+            },
             style::semibold(15.0),
             th.text,
         );
@@ -2853,12 +2895,10 @@ impl RillApp {
             Some(d) => format!("idle {d} days"),
             None => String::new(),
         };
-        let detail = if c.shared_bytes > 0 {
-            format!(
-                "of {} · {}",
-                style::bytes(size_metric(c, self.allocated)),
-                idle
-            )
+        // What it frees on disk is the big number; its size, when that differs.
+        let held = size_metric(c, self.allocated);
+        let detail = if style::bytes(held) != style::bytes(size) {
+            format!("of {} · {}", style::bytes(held), idle)
         } else {
             idle
         };
@@ -2945,7 +2985,7 @@ impl RillApp {
             .filter(|c| c.nested_in.is_none_or(|p| !picked_ids.contains(&p)))
             .collect();
         chosen.sort_by_key(|c| std::cmp::Reverse(c.logical_bytes));
-        let total: u64 = chosen.iter().map(|c| frees(c, self.allocated)).sum();
+        let total: u64 = chosen.iter().map(|c| frees(c)).sum();
         let width = area.width().min(760.0);
         let rect = Rect::from_center_size(
             pos2(area.center().x, area.bottom() - 36.0),
@@ -2969,7 +3009,11 @@ impl RillApp {
         p.text(
             pos2(inner.left(), inner.center().y + 10.0),
             Align2::LEFT_CENTER,
-            format!("frees ≥ {}", style::bytes(total)),
+            format!(
+                "frees {} {} on disk",
+                floor_sign(allocation_known(chosen.iter().copied())),
+                style::bytes(total)
+            ),
             style::regular(12.5),
             th.accent,
         );
@@ -2985,15 +3029,16 @@ impl RillApp {
             .clicked()
         {
             let mut plan = format!(
-                "# RillDisk cleanup plan: {} folders, frees at least {}\n# Review every line before running it.\n",
+                "# RillDisk cleanup plan: {} folders, frees {} {} on disk\n# Review every line before running it.\n",
                 chosen.len(),
+                floor_word(allocation_known(chosen.iter().copied())),
                 style::bytes(total)
             );
             for c in &chosen {
                 plan.push_str(&format!(
                     "\n# {} · {} · {}\n",
                     c.label,
-                    style::bytes(frees(c, self.allocated)),
+                    style::bytes(frees(c)),
                     c.path.display()
                 ));
                 if is_command(&c.suggested_action) {
@@ -3384,7 +3429,7 @@ impl RillApp {
                         let (dot, _) = ui.allocate_exact_size(vec2(6.0, 24.0), Sense::hover());
                         ui.painter().circle_filled(dot.center(), 3.0, th.good);
                         ui.label(
-                            RichText::new("Metadata only · nothing leaves this PC · AGPL-3.0")
+                            RichText::new("Local only · nothing leaves this PC · AGPL-3.0")
                                 .font(style::regular(11.5))
                                 .color(th.faint),
                         );
@@ -3658,15 +3703,26 @@ fn find_path(snapshot: &Snapshot, path: &str) -> Option<usize> {
     Some(id)
 }
 
-/// Space removing a candidate frees at least: hard-linked files are excluded.
-pub(crate) fn frees(candidate: &Candidate, allocated: bool) -> u64 {
-    if allocated {
-        candidate.exclusive_bytes
-    } else {
-        candidate
-            .logical_bytes
-            .saturating_sub(candidate.shared_bytes)
-    }
+/// On-disk space removing a candidate frees: its files' allocated size, without
+/// files hard-linked elsewhere. Always physical, whichever size metric is shown;
+/// a floor only when every allocation is known ([`floor_word`]).
+pub(crate) fn frees(candidate: &Candidate) -> u64 {
+    candidate.exclusive_bytes
+}
+
+/// Every candidate's allocated size is known, so [`frees`] sums are a floor.
+pub(crate) fn allocation_known<'a>(mut candidates: impl Iterator<Item = &'a Candidate>) -> bool {
+    candidates.all(|c| c.allocated_bytes.is_some())
+}
+
+/// "at least" for a known floor, "about" when some sizes fell back to file length.
+pub(crate) fn floor_word(known: bool) -> &'static str {
+    if known { "at least" } else { "about" }
+}
+
+/// `≥` or `≈`, as [`floor_word`].
+pub(crate) fn floor_sign(known: bool) -> &'static str {
+    if known { "≥" } else { "≈" }
 }
 
 fn size_metric(candidate: &Candidate, allocated: bool) -> u64 {
@@ -3677,12 +3733,12 @@ fn size_metric(candidate: &Candidate, allocated: bool) -> u64 {
     }
 }
 
-fn frees_total(report: &ReclaimReport, allocated: bool) -> u64 {
+fn frees_total(report: &ReclaimReport) -> u64 {
     report
         .candidates
         .iter()
         .filter(|c| c.nested_in.is_none())
-        .map(|c| frees(c, allocated))
+        .map(frees)
         .sum()
 }
 

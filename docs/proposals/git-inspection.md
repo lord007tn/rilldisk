@@ -53,21 +53,33 @@ A lock (`git worktree lock`) also matters: someone said "keep this".
 4. **Limits.** Each command stops after 15 seconds. The desktop runs at most four
    worktrees at once, in the background after a scan; the CLI also uses four.
    Missing Git, a timeout or an error gives the verdict "unknown" with the reason.
+   A check that produces no report at all (a failed worker) is also "unknown".
    Unknown is never treated as safe.
 5. **Verdicts**, most important first: uncommitted changes; commits only here;
    locked; active (clean, but commits or file changes within the idle threshold,
    14 days by default); clean and idle; unknown. Each verdict comes with a
    suggested command (commit or stash first, create a branch first, unlock first,
    or `git worktree remove`). Verdicts never change a candidate's safety class:
-   worktrees stay "Review first".
+   worktrees stay "Review first". The wording says what Git reports, never that a
+   worktree is safe: `git status` does not list ignored files (`.env`, local
+   settings), and nothing here detects a program still working in the folder.
+7. **At removal.** A worktree that carries a Git verdict into cleanup (the desktop
+   with checks on, including worktrees whose check had not finished; the CLI with
+   `--git`) is asked about again with the same commands right before it is moved.
+   It is refused unless Git answers and reports nothing that would be lost, and a
+   worktree picked as clean and idle is refused if it shows activity since
+   (`git::recheck`, called from `cleanup::execute_with`). Without a Git verdict a
+   worktree takes the explicit Review-first path, labelled as not checked.
 6. **Where.**
    - **CLI:** only with `rilldisk reclaim --git`. Table and JSON output gain the
      verdict (`candidates[].git`). With `--delete`, worktrees whose verdict is not
      clean (including unknown) are left out, and the CLI says how many.
    - **Desktop:** on by default, with an off switch and the idle threshold in
      Settings. Cards show the verdict, "Select clean idle worktrees" ticks only
-     clean and idle ones, and the removal dialog names ticked worktrees that would
-     lose work. Scripted captures show fixed preview states and never start Git.
+     clean and idle ones, and the removal dialog names ticked worktrees Git
+     reports changes for, ones not checked yet, and the ignored-file and
+     running-agent caveat. Scripted captures run Git on the synthetic fixture's
+     own repositories.
    - **MCP:** unchanged. The server promises no program execution, so it does not
      run Git; `find_reclaimable` output keeps its shape.
 
@@ -83,4 +95,9 @@ A lock (`git worktree lock`) also matters: someone said "keep this".
 `git::tests` covers porcelain parsing (renames carry two paths) and the verdict
 order. `tests/git.rs` builds real repositories with clean, dirty, detached and
 locked worktrees, checks every verdict through a scan, and checks that no index
-file changed.
+file changed. It also changes worktrees after they were judged (an untracked file,
+a lock, a detached-only commit, new activity, a moved main repository) and checks
+that removal refuses each one, while a clean worktree with unpushed branch commits
+and an explicitly unchecked one still reach the remover (nothing is deleted: the
+test records instead). `reclaim::tests` and the CLI tests check that a missing
+report becomes unknown and keeps a worktree out of `--git --delete`.

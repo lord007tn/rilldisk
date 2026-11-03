@@ -15,6 +15,9 @@ use std::{
     },
 };
 
+/// Key of a Clean up card's screen rect (with its entry id), for scripted tours.
+pub const CARD_HITS: &str = "cleanup-card";
+
 #[derive(Clone, Copy)]
 pub enum Target {
     /// Entry whose path ends with these components.
@@ -23,6 +26,8 @@ pub enum Target {
     Candidate(Category),
     /// Row of the folder panel, by path suffix.
     Row(&'static str),
+    /// A card in Clean up, by path suffix.
+    Card(&'static str),
     /// Breadcrumb, by path suffix.
     Crumb(&'static str),
     /// Row of the folder panel during a scan, by name.
@@ -53,6 +58,12 @@ pub enum Step {
     Filter(Option<Category>),
     /// Until Git has answered for every worktree (the fixture's real repositories).
     WaitGit,
+    /// Start a caption at the next recorded frame (written to captions.json).
+    Caption(&'static str),
+    /// Clean up: "Select clean idle worktrees".
+    SelectCleanIdle,
+    /// The pointer leaves the window (hides hover tooltips).
+    PointerAway,
     Tab(View),
     Highlight(bool),
     Search(&'static str),
@@ -112,12 +123,79 @@ pub struct Tour {
     pointer: Pos2,
     motion: Option<(Pos2, Pos2, u32, u32)>,
     pending: Arc<AtomicUsize>,
+    /// First recorded frame of each caption, for the video encoder.
+    captions: Vec<(u32, &'static str)>,
     /// Keeps a scripted scan running.
     preview_scan: Option<std::sync::mpsc::Sender<Result<crate::app::Data, String>>>,
     pub(crate) update_sender: Option<std::sync::mpsc::Sender<Result<(), String>>>,
 }
 
 impl Tour {
+    /// A captioned walk through worktree analysis on the synthetic demo disk
+    /// (`scripts/make_demo_fixture.py` with Git), for `scripts/make_demo_video.py`.
+    /// Recorded at one frame per three ticks; the encoder plays 20 frames a second.
+    /// Nothing is removed: the removal dialog is opened and closed.
+    pub fn video(dir: PathBuf) -> Self {
+        use Step::*;
+        use Target::*;
+        let agent = "atlas-web/.claude/worktrees/agent-3f9c2a";
+        let perf = "Projects/ferrite-engine-perf";
+        // Not `worktrees/…` alone: Git keeps an admin folder of the same name.
+        let spike = ".t3/worktrees/atlas-web-spike";
+        Self::with_steps(
+            dir,
+            vec![
+                WaitData,
+                WaitGit,
+                Wait(20),
+                Record(true),
+                Caption("A synthetic demo disk with fictional paths, scanned by RillDisk 0.1.3"),
+                Wait(240),
+                Caption("Size counts every byte; Clean up counts what removal would actually free"),
+                Tab(View::Cleanup),
+                Wait(250),
+                Caption("Git worktrees: four found, with their size and what removing them frees"),
+                Filter(Some(Category::GitWorktree)),
+                Wait(260),
+                Caption("Each worktree is checked with your own Git, read-only"),
+                Move(Card(agent), 30),
+                Wait(240),
+                Caption(
+                    "118 days idle, yet Git reports an uncommitted edit: it stays Review first",
+                ),
+                Move(Card(perf), 30),
+                Wait(240),
+                Caption("A commit that exists only on a detached HEAD would be lost: kept"),
+                Move(Card(spike), 30),
+                Wait(220),
+                PointerAway,
+                Caption(
+                    "Bulk select ticks only worktrees with no Git-reported changes and no recent work",
+                ),
+                SelectCleanIdle,
+                Wait(200),
+                Caption(
+                    "Removal asks first, uses the Recycle Bin, and checks Git again right before each worktree",
+                ),
+                Confirm(CleanupMode::Trash),
+                Wait(300),
+                Dismiss,
+                Caption(
+                    "Right-click any folder: Show in Explorer, copy its path, or scan just that folder",
+                ),
+                Filter(None),
+                Tab(View::Explore),
+                Wait(30),
+                Menu(Row("Projects")),
+                Wait(200),
+                CloseMenu,
+                Wait(10),
+                Record(false),
+                Quit,
+            ],
+        )
+    }
+
     pub fn updates(dir: PathBuf) -> Self {
         use crate::update::Preview;
         use Step::*;
@@ -458,7 +536,8 @@ impl Tour {
                 Wait(8),
                 Tab(View::Cleanup),
                 Wait(14),
-                Pick(Category::GitWorktree, 2),
+                WaitGit,
+                SelectCleanIdle,
                 Pick(Category::BuildOutput, 1),
                 Wait(18),
                 Shot("cleanup"),
@@ -525,6 +604,7 @@ impl Tour {
             pointer: pos2(700.0, 500.0),
             motion: None,
             pending: Arc::default(),
+            captions: Vec::new(),
             preview_scan: None,
             update_sender: None,
         }
@@ -601,6 +681,11 @@ fn position(app: &RillApp, ctx: &egui::Context, target: Target) -> Option<Pos2> 
             resolve(app, target).and_then(|id| pointer_for(app, id))
         }
         Target::Row(suffix) => hit(ctx, nav::PANEL_HITS, resolve(app, Target::Entry(suffix))?),
+        Target::Card(suffix) => {
+            let id = resolve(app, Target::Entry(suffix))?;
+            ctx.data(|d| d.get_temp::<egui::Rect>(egui::Id::unique((CARD_HITS, id))))
+                .map(|rect| rect.center() + egui::vec2(-rect.width() * 0.25, 0.0))
+        }
         Target::Crumb(suffix) => hit(ctx, nav::CRUMB_HITS, resolve(app, Target::Entry(suffix))?),
         Target::LiveRow(name) => {
             let view = app.live_view()?;
@@ -828,6 +913,25 @@ pub fn advance(app: &mut RillApp, ctx: &egui::Context) {
             }
         }
         Step::Filter(category) => app.category_filter = category,
+        Step::Caption(text) => {
+            tour.captions.push((tour.frame, text));
+            let lines: Vec<String> = tour
+                .captions
+                .iter()
+                .map(|(frame, text)| format!("{{\"frame\": {frame}, \"text\": {text:?}}}"))
+                .collect();
+            let json = format!("[\n  {}\n]\n", lines.join(",\n  "));
+            if let Err(error) = std::fs::write(tour.dir.join("captions.json"), json) {
+                eprintln!("captions: {error}");
+            }
+        }
+        Step::PointerAway => app.injected.push(egui::Event::PointerGone),
+        Step::SelectCleanIdle => {
+            if let Some(data) = app.data.clone() {
+                let idle = app.clean_idle_worktrees(&data);
+                app.picked.extend(idle);
+            }
+        }
         Step::WaitGit => {
             if !app.git_settled() {
                 app.tour = Some(tour);
