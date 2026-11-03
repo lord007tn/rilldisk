@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 pub(crate) mod nav;
+mod scope;
 mod settings_page;
+mod updates;
+mod worktrees;
+pub(crate) use worktrees::PickNotes;
 
 use crate::capture::Tour;
 use crate::icons::{self, Icon};
@@ -13,7 +17,7 @@ use crate::update;
 use crate::widgets::{self as w, Kind};
 use eframe::egui::{
     self, Align, Align2, Color32, Frame, Key, Layout, Margin, Mesh, Pos2, Rect, RichText, Sense,
-    Shape, Stroke, Ui, UiBuilder, pos2, vec2,
+    Shape, Ui, UiBuilder, pos2, vec2,
 };
 use rilldisk_core::{
     Candidate, Category, EntryKind, LiveView, ReclaimReport, Safety, ScanControl, ScanOptions,
@@ -153,6 +157,15 @@ enum Action {
     /// The user agreed to install this update.
     Install(Box<update::Release>),
     CheckUpdates,
+    /// Show a folder or file in the platform file manager (reveal.rs).
+    Reveal(String),
+    DismissUpdateNotice,
+    /// Settings: ask Git about worktree candidates.
+    GitChecks(bool),
+    /// Settings: days without work before a clean worktree counts as idle.
+    StaleDays(u64),
+    /// Use this entry limit from now on; rescan the shown root when `true`.
+    ScanLimit(usize, bool),
 }
 
 /// Scan generation, folder and metric of a sorted child list.
@@ -180,6 +193,9 @@ pub struct RillApp {
     pub rings: Rings,
     generation: usize,
     hovered: Option<usize>,
+    /// Entry whose context menu is open on a chart. The menu covers the pointer,
+    /// so the tile is no longer hovered while it is open.
+    menu_target: Option<usize>,
     list_hover: Option<usize>,
     pub search: String,
     search_edited: Option<f64>,
@@ -190,7 +206,8 @@ pub struct RillApp {
     pub category_filter: Option<Category>,
     pub picked: HashSet<usize>,
     pub highlight: bool,
-    toast: Option<(String, f64)>,
+    /// Message, time shown, and whether it confirms something that worked.
+    toast: Option<(String, f64, bool)>,
     pub dark: bool,
     pub identity: Identity,
     prefs: Prefs,
@@ -215,6 +232,8 @@ pub struct RillApp {
     pub cleanup: crate::cleanup_ui::CleanupUi,
     assistants: crate::assistants::State,
     pub elevate: crate::elevation::Elevate,
+    /// Git checks of worktree candidates (app/worktrees.rs).
+    git: worktrees::GitChecks,
 }
 
 pub fn now_ms() -> u64 {
@@ -327,6 +346,7 @@ impl RillApp {
             rings: Default::default(),
             generation: 0,
             hovered: None,
+            menu_target: None,
             list_hover: None,
             search: String::new(),
             search_edited: None,
@@ -344,6 +364,11 @@ impl RillApp {
                 identity,
                 theme,
                 allocated,
+                git_checks: saved.git_checks.unwrap_or(true),
+                stale_days: saved
+                    .stale_days
+                    .unwrap_or(rilldisk_core::git::DEFAULT_STALE_DAYS),
+                max_entries: saved.max_entries.unwrap_or(settings::SCAN_LIMITS[0]),
             },
             settings_open: false,
             applied: Some((identity, dark)),
@@ -363,6 +388,7 @@ impl RillApp {
             cleanup: Default::default(),
             assistants: Default::default(),
             elevate: crate::elevation::Elevate::new(),
+            git: Default::default(),
         };
         if path.is_some() {
             app.start_scan(&cc.egui_ctx);
@@ -391,10 +417,14 @@ impl RillApp {
         let (tx, rx) = mpsc::channel();
         let (thread_control, thread_root, repaint) =
             (control.clone(), PathBuf::from(&root), ctx.clone());
+        let options = ScanOptions {
+            max_entries: self.prefs.max_entries,
+            ..ScanOptions::default()
+        };
         std::thread::Builder::new()
             .name("rilldisk-scan".into())
             .spawn(move || {
-                let result = scan(&thread_root, ScanOptions::default(), thread_control)
+                let result = scan(&thread_root, options, thread_control)
                     .map(Data::analyze)
                     .map_err(|e| format!("{e:#}"));
                 let _ = tx.send(result);
@@ -451,6 +481,7 @@ impl RillApp {
                                 self.toast = Some((
                                     "That folder is not in the new results. Showing the top of the scan".into(),
                                     ctx.input(|i| i.time),
+                                    false,
                                 ));
                             }
                         }
@@ -491,7 +522,8 @@ impl RillApp {
             match result {
                 Ok(Some(release)) => self.available = Some(release),
                 Ok(None) if self.update_manual => {
-                    self.toast = Some(("RillDisk is up to date".into(), ctx.input(|i| i.time)));
+                    self.toast =
+                        Some(("RillDisk is up to date".into(), ctx.input(|i| i.time), true));
                 }
                 Ok(None) => {}
                 Err(error) if self.update_manual => self.update_error = Some(error),
@@ -722,7 +754,7 @@ impl RillApp {
                 }
                 Action::Copy(text, what) => {
                     ctx.copy_text(text);
-                    self.toast = Some((format!("Copied {what}"), ctx.input(|i| i.time)));
+                    self.toast = Some((format!("Copied {what}"), ctx.input(|i| i.time), true));
                 }
                 Action::Tab(tab) => self.tab = tab,
                 Action::Scan(_) | Action::ScanThen(..) | Action::Open(_)
@@ -761,6 +793,38 @@ impl RillApp {
                     self.save_prefs();
                 }
                 Action::Settings(open) => self.settings_open = open,
+                Action::DismissUpdateNotice => self.update_notice = None,
+                Action::GitChecks(on) => {
+                    self.prefs.git_checks = on;
+                    self.save_prefs();
+                }
+                Action::StaleDays(days) => {
+                    self.prefs.stale_days = days;
+                    self.save_prefs();
+                }
+                Action::ScanLimit(limit, rescan) => {
+                    self.prefs.max_entries = limit;
+                    self.save_prefs();
+                    if rescan
+                        && self.running.is_none()
+                        && let Some(data) = &self.data
+                    {
+                        self.path = data.snapshot.summary.root.display().to_string();
+                        self.start_scan(ctx);
+                    }
+                }
+                Action::Reveal(path) => {
+                    let now = ctx.input(|i| i.time);
+                    // Scripted captures never start other programs.
+                    let result = if self.tour.is_some() {
+                        Ok(())
+                    } else {
+                        crate::reveal::show(std::path::Path::new(&path))
+                    };
+                    if let Err(error) = result {
+                        self.toast = Some((error, now, false));
+                    }
+                }
                 Action::Open(path) => {
                     self.settings_open = false;
                     if self.open_in_results(&path) {
@@ -770,11 +834,12 @@ impl RillApp {
                     match &self.running {
                         Some(running) if covers(&running.root, &path) => {
                             self.pending_open = Some(path);
-                            self.toast = Some(("Opens here when the scan finishes".into(), now));
+                            self.toast =
+                                Some(("Opens here when the scan finishes".into(), now, false));
                         }
                         Some(_) => {
                             self.toast =
-                                Some(("A scan is running. Stop it first (Esc)".into(), now));
+                                Some(("A scan is running. Stop it first (Esc)".into(), now, false));
                         }
                         None => {
                             self.path = path;
@@ -790,6 +855,7 @@ impl RillApp {
                     self.toast = Some((
                         "Finish the current scan or cleanup before updating".into(),
                         ctx.input(|i| i.time),
+                        false,
                     ));
                 }
                 Action::Install(_) if self.tour.is_some() => {
@@ -954,73 +1020,96 @@ impl RillApp {
                 }
             });
         });
-        ui.add_space(20.0);
-        // Settings and the status lines below stay put however many drives there are.
-        let footer_height = 96.0;
+        ui.add_space(18.0);
+        // The footer is laid out first so the lists above scroll in whatever room
+        // it leaves, however many drives there are and whether an update shows.
+        let full = ui.available_rect_before_wrap();
+        // Its height is known after drawing, so last frame's is used and fixed up.
+        let height_id = egui::Id::unique("sidebar-footer-height");
+        let height = ui.data(|d| d.get_temp::<f32>(height_id)).unwrap_or(66.0);
+        let mut footer = ui.new_child(UiBuilder::new().max_rect(Rect::from_min_max(
+            pos2(full.left(), full.bottom() - height),
+            full.max,
+        )));
+        actions.extend(self.sidebar_footer(&mut footer));
+        let used = footer.min_rect().height();
+        if (used - height).abs() > 0.5 {
+            ui.data_mut(|d| d.insert_temp(height_id, used));
+            ui.ctx().request_repaint();
+        }
+        let list = Rect::from_min_max(full.min, pos2(full.right(), full.bottom() - used - 12.0));
+        let mut lists = ui.new_child(UiBuilder::new().max_rect(list));
         egui::ScrollArea::vertical()
             .id_salt("sidebar-places")
-            .max_height((ui.available_height() - footer_height).max(0.0))
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
+            .auto_shrink([false, false])
+            .show(&mut lists, |ui| {
                 w::section_label(ui, "Drives");
-                ui.add_space(2.0);
+                ui.add_space(4.0);
                 for volume in &self.volumes {
                     let letter = volume.root.display().to_string();
                     let active = located.as_deref() == Some(letter.as_str());
                     let (rect, response) =
-                        ui.allocate_exact_size(vec2(ui.available_width(), 50.0), Sense::click());
+                        ui.allocate_exact_size(vec2(ui.available_width(), 52.0), Sense::click());
                     let p = ui.painter();
                     w::row_fill(p, rect, response.hovered(), active);
                     let tile =
-                        Rect::from_min_size(rect.left_top() + vec2(8.0, 10.0), vec2(30.0, 30.0));
+                        Rect::from_min_size(rect.left_top() + vec2(8.0, 11.0), vec2(30.0, 30.0));
                     p.rect_filled(
                         tile,
                         9,
-                        style::alpha(th.accent, if th.dark { 50 } else { 34 }),
+                        style::alpha(th.accent, if th.dark { 44 } else { 30 }),
                     );
-                    icons::paint(p, tile.shrink(7.0), Icon::Drive, th.accent);
+                    icons::paint(p, tile.shrink(7.5), Icon::Drive, th.accent);
                     let label = if volume.label.is_empty() {
                         "Local Disk"
                     } else {
                         &volume.label
                     };
                     let text_left = tile.right() + 10.0;
-                    let width = rect.right() - text_left - 8.0;
-                    let name = w::fit(
-                        p,
-                        format!("{label} ({})", letter.trim_end_matches('\\')),
-                        style::semibold(13.0),
-                        th.text,
-                        width,
-                    );
-                    p.galley(pos2(text_left, rect.top() + 8.0), name, th.text);
+                    let width = rect.right() - text_left - 10.0;
                     let used = volume.total_bytes.saturating_sub(volume.free_bytes);
                     let share = used as f32 / volume.total_bytes.max(1) as f32;
-                    p.text(
-                        pos2(text_left, rect.top() + 26.0),
-                        Align2::LEFT_TOP,
+                    let free = p.layout_no_wrap(
                         format!("{} free", style::bytes(volume.free_bytes)),
                         style::regular(11.0),
                         th.faint,
                     );
+                    let name = w::fit(
+                        p,
+                        format!("{label} ({})", letter.trim_end_matches('\\')),
+                        if active {
+                            style::semibold(13.0)
+                        } else {
+                            style::regular(13.0)
+                        },
+                        th.text,
+                        width - free.size().x - 6.0,
+                    );
+                    p.galley(pos2(text_left, rect.top() + 10.0), name, th.text);
+                    p.galley(
+                        pos2(rect.right() - 10.0 - free.size().x, rect.top() + 12.0),
+                        free,
+                        th.faint,
+                    );
                     let bar =
-                        Rect::from_min_size(pos2(text_left, rect.bottom() - 7.0), vec2(width, 3.0));
+                        Rect::from_min_size(pos2(text_left, rect.top() + 32.0), vec2(width, 4.0));
                     w::progress(p, bar, share, usage_color(share));
-                    if response
-                        .on_hover_text(format!(
-                            "{} used of {} · {}\nClick to open",
-                            style::bytes(used),
-                            style::bytes(volume.total_bytes),
-                            volume.filesystem
-                        ))
-                        .clicked()
-                    {
-                        actions.push(Action::Open(letter));
+                    let response = response.on_hover_text(format!(
+                        "{} used of {} · {} free · {}\nClick to open · right-click for more",
+                        style::bytes(used),
+                        style::bytes(volume.total_bytes),
+                        style::bytes(volume.free_bytes),
+                        volume.filesystem
+                    ));
+                    if response.clicked() {
+                        actions.push(Action::Open(letter.clone()));
                     }
+                    response.context_menu(|ui| place_menu(ui, &letter, &mut actions));
+                    ui.add_space(2.0);
                 }
-                ui.add_space(16.0);
+                ui.add_space(18.0);
                 w::section_label(ui, "Places");
-                ui.add_space(2.0);
+                ui.add_space(4.0);
                 for (i, (name, icon, path)) in self.places.iter().enumerate() {
                     let active = located.as_deref() == Some(path.as_str());
                     let row = place_row(
@@ -1030,16 +1119,11 @@ impl RillApp {
                         active,
                         Some(style::chart(i as f32 / 5.0, 0)),
                     )
-                    .on_hover_text(format!("{path}\nRight-click to scan only this folder"));
+                    .on_hover_text(format!("{path}\nClick to open · right-click for more"));
                     if row.clicked() {
                         actions.push(Action::Open(path.clone()));
                     }
-                    row.context_menu(|ui| {
-                        if ui.button("Scan only this folder").clicked() {
-                            actions.push(Action::Scan(path.clone()));
-                            ui.close();
-                        }
-                    });
+                    row.context_menu(|ui| place_menu(ui, path, &mut actions));
                 }
                 if place_row(ui, Icon::Folder, "Choose folder…", false, None)
                     .on_hover_text("Ctrl+O")
@@ -1049,29 +1133,37 @@ impl RillApp {
                     actions.push(Action::Scan(folder.display().to_string()));
                 }
             });
-        ui.with_layout(Layout::bottom_up(Align::Min), |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                ui.label(
-                    RichText::new(concat!("v", env!("CARGO_PKG_VERSION"), " · AGPL-3.0 ·"))
-                        .font(style::regular(11.0))
-                        .color(th.faint),
-                );
+        actions
+    }
+
+    /// Bottom of the sidebar: the update card when there is one, Settings, and a
+    /// status line with the version.
+    fn sidebar_footer(&mut self, ui: &mut Ui) -> Vec<Action> {
+        let mut actions = Vec::new();
+        let th = t();
+        if self.update_pending() {
+            actions.extend(self.update_card(ui, false));
+            ui.add_space(10.0);
+        }
+        if place_row(ui, Icon::Gear, "Settings", self.settings_open, None).clicked() {
+            actions.push(Action::Settings(!self.settings_open));
+        }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.add_space(10.0);
+            let (dot, _) = ui.allocate_exact_size(vec2(6.0, 24.0), Sense::hover());
+            ui.painter().circle_filled(dot.center(), 3.0, th.good);
+            ui.label(
+                RichText::new("Local only")
+                    .font(style::regular(11.5))
+                    .color(th.dim),
+            )
+            .on_hover_text("Reads names, sizes and dates only. Nothing leaves this PC.");
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                actions.extend(self.version_button(ui));
             });
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                let (dot, _) = ui.allocate_exact_size(vec2(8.0, 14.0), Sense::hover());
-                ui.painter().circle_filled(dot.center(), 3.5, th.good);
-                ui.label(
-                    RichText::new("Local only · nothing leaves this PC")
-                        .font(style::regular(11.5))
-                        .color(th.dim),
-                );
-            });
-            ui.add_space(8.0);
-            if place_row(ui, Icon::Gear, "Settings", self.settings_open, None).clicked() {
-                actions.push(Action::Settings(!self.settings_open));
-            }
         });
         actions
     }
@@ -1161,24 +1253,58 @@ impl RillApp {
                     let root = s.root.display().to_string();
                     let font = style::semibold(15.0);
                     let text = nav::fit_path(ui, &root, font.clone(), ui.available_width() - 12.0);
-                    ui.label(RichText::new(text).font(font).color(th.text))
-                        .on_hover_text(root);
+                    let title = ui
+                        .add(egui::Label::new(RichText::new(text).font(font).color(th.text)).sense(Sense::click()))
+                        .on_hover_text(format!("{root}\nRight-click for more"));
+                    title.context_menu(|ui| place_menu(ui, &root, &mut actions));
                 });
             });
         });
+        // What was measured, in words: logical, unique and on-disk sizes stay
+        // distinct, and the drive's own numbers are labelled as the drive's.
         let s = &snapshot.summary;
-        ui.label(RichText::new(format!("Scan logical: {} · unique: {} · allocated: {} · backend: {}",
-            style::bytes(s.logical_bytes), style::bytes(s.unique_logical_bytes),
-            s.allocated_bytes.map(style::bytes).unwrap_or_else(|| "unknown".into()), s.backend)).small().color(th.dim))
-            .on_hover_text(format!("Exact bytes: logical {} · unique {} · allocated {:?}. Logical includes every hard-link name; allocated counts identities once. Sparse/compressed files differ. Partial scans omit unreadable paths. Volume used space also includes filesystem metadata, snapshots and unscanned files.", s.logical_bytes, s.unique_logical_bytes, s.allocated_bytes));
-        if let Some(v) = self
+        let mut parts = vec![
+            (style::bytes(s.logical_bytes), "size"),
+            (style::bytes(s.unique_logical_bytes), "unique"),
+            (
+                s.allocated_bytes
+                    .map(style::bytes)
+                    .unwrap_or_else(|| "unknown".into()),
+                "on disk",
+            ),
+            (style::count(s.files), "files"),
+        ];
+        let root = s.root.display().to_string();
+        let volume = self
             .volumes
             .iter()
-            .find(|v| same_path(&v.root.display().to_string(), &s.root.display().to_string()))
-        {
-            ui.label(RichText::new(format!("Volume used: {} · free: {} · capacity: {} (volume information at app startup)", style::bytes(v.total_bytes.saturating_sub(v.free_bytes)), style::bytes(v.free_bytes), style::bytes(v.total_bytes))).small().color(th.dim))
-                .on_hover_text(format!("Volume used: {} bytes. Compare this field with Explorer drive properties. File totals above measure different things.", v.total_bytes.saturating_sub(v.free_bytes)));
+            .find(|v| same_path(&v.root.display().to_string(), &root));
+        let drive_text;
+        if let Some(v) = volume {
+            drive_text = format!(
+                "{} used of {}",
+                style::bytes(v.total_bytes.saturating_sub(v.free_bytes)),
+                style::bytes(v.total_bytes)
+            );
+            parts.push((drive_text, "on the drive"));
         }
+        let line = meta_line(ui, &parts);
+        let mut tip = format!(
+            "Size counts every name, hard links included: {} bytes.\nUnique counts hard-linked files once: {} bytes.\nOn disk is allocated space: {}.\nSparse and compressed files make these differ. Partial scans leave unreadable folders out.\nScanned with the {} reader.",
+            style::count(s.logical_bytes),
+            style::count(s.unique_logical_bytes),
+            s.allocated_bytes
+                .map(|b| format!("{} bytes", style::count(b)))
+                .unwrap_or_else(|| "unknown".into()),
+            s.backend
+        );
+        if let Some(v) = volume {
+            tip.push_str(&format!(
+                "\n\nDrive used space ({} bytes, read when RillDisk started) also includes filesystem metadata, snapshots and files outside this scan. Compare it with the drive's properties in Explorer.",
+                style::count(v.total_bytes.saturating_sub(v.free_bytes))
+            ));
+        }
+        line.on_hover_text(tip);
         actions
     }
 
@@ -1237,6 +1363,7 @@ impl RillApp {
         };
         actions.extend(self.header(ui, &data));
         ui.add_space(12.0);
+        actions.extend(self.limit_banner(ui, &data));
         if let Some(error) = &self.error {
             error_banner(ui, error, Some(&data));
             ui.add_space(10.0);
@@ -1918,14 +2045,17 @@ impl RillApp {
                 );
                 treemap::outline(&painter, &tile, style::alpha(th.ink, 160), 1.5);
                 let id = tile.id as usize;
-                let response = response.on_hover_ui_at_pointer(|ui| {
+                let response = response.clone().on_hover_ui_at_pointer(|ui| {
                     entry_tooltip(ui, data, id, self.allocated, total)
                 });
                 if response.clicked() {
                     actions.push(Action::Explore(id));
                 }
-                response.context_menu(|ui| entry_menu(ui, snapshot, id, &mut actions));
+                if response.secondary_clicked() {
+                    self.menu_target = Some(id);
+                }
             }
+            self.chart_menu(&response, snapshot, &mut actions);
         }
         actions
     }
@@ -2228,7 +2358,7 @@ impl RillApp {
             }
         }
         if let Some(id) = self.hovered {
-            let response = response.on_hover_ui_at_pointer(|ui| {
+            let response = response.clone().on_hover_ui_at_pointer(|ui| {
                 entry_tooltip(ui, data, id, self.allocated, view_total)
             });
             if response.clicked() {
@@ -2238,11 +2368,33 @@ impl RillApp {
                     actions.push(Action::Select(id));
                 }
             }
-            response.context_menu(|ui| entry_menu(ui, snapshot, id, &mut actions));
+            if response.secondary_clicked() {
+                self.menu_target = Some(id);
+            }
         } else if response.clicked() && self.chart == Chart::Rings {
             actions.push(Action::Up);
         }
+        self.chart_menu(&response, snapshot, &mut actions);
         actions
+    }
+
+    /// The context menu of the chart tile that was right-clicked, kept open while
+    /// the pointer is over the menu instead of the tile.
+    fn chart_menu(
+        &mut self,
+        response: &egui::Response,
+        snapshot: &Snapshot,
+        actions: &mut Vec<Action>,
+    ) {
+        let Some(id) = self.menu_target.filter(|&id| id < snapshot.entries.len()) else {
+            return;
+        };
+        if response
+            .context_menu(|ui| entry_menu(ui, snapshot, id, actions))
+            .is_none()
+        {
+            self.menu_target = None;
+        }
     }
 
     /// The folder tree around the shown folder. It always lists the shown folder, so
@@ -2314,12 +2466,14 @@ impl RillApp {
                 .take()
                 .and_then(|id| rows.iter().position(|&r| r as usize == id)),
         };
+        let view_total = self.size(snapshot, self.zoom).max(1);
         let row = |index: usize| {
             let id = rows[index] as usize;
             let child = &snapshot.entries[id];
             let path = snapshot.path(id).display().to_string();
             let folder = child.kind == EntryKind::Directory;
             nav::Row {
+                share: self.size(snapshot, id) as f32 / view_total as f32,
                 id,
                 name: snapshot.name(id).into_owned(),
                 size: self.size_text(snapshot, id),
@@ -2354,37 +2508,35 @@ impl RillApp {
         if result.notice_clicked {
             actions.push(Action::Tab(Tab::Issues));
         }
-        // Footer: path and a copy button.
+        // Footer: the path of the selection (or the open folder), to copy or show.
         let footer = Rect::from_min_max(
-            pos2(inner.left(), rect.bottom() - footer_h + 8.0),
-            pos2(inner.right(), rect.bottom() - 14.0),
+            pos2(inner.left() - 6.0, rect.bottom() - footer_h + 10.0),
+            pos2(inner.right() + 6.0, rect.bottom() - 12.0),
         );
-        p.line_segment(
-            [
-                footer.left_top() - vec2(0.0, 6.0),
-                footer.right_top() - vec2(0.0, 6.0),
-            ],
-            Stroke::new(1.0, style::alpha(th.faint, 50)),
-        );
+        p.rect_filled(footer, 10, th.field);
         let path = snapshot
             .path(self.selected.unwrap_or(self.zoom))
             .display()
             .to_string();
         let mut row = ui.new_child(
             UiBuilder::new()
-                .max_rect(footer)
+                .max_rect(footer.shrink2(vec2(4.0, 0.0)))
                 .layout(Layout::right_to_left(Align::Center)),
         );
+        row.spacing_mut().item_spacing.x = 0.0;
         if w::icon_button(&mut row, Icon::Copy, "Copy path (Ctrl+C)").clicked() {
             actions.push(Action::Copy(path.clone(), "path"));
         }
-        let shown = nav::fit_path(&row, &path, style::mono(11.5), footer.width() - 40.0);
+        if w::icon_button(&mut row, Icon::Folder, crate::reveal::label()).clicked() {
+            actions.push(Action::Reveal(path.clone()));
+        }
+        let shown = nav::fit_path(&row, &path, style::mono(11.5), footer.width() - 90.0);
         p.text(
-            pos2(footer.left(), footer.center().y),
+            pos2(footer.left() + 12.0, footer.center().y),
             Align2::LEFT_CENTER,
             shown,
             style::mono(11.5),
-            th.faint,
+            th.dim,
         );
         actions
     }
@@ -2528,6 +2680,9 @@ impl RillApp {
         ui.add_space(6.0);
         crate::cleanup_ui::toolbar(self, ui, data);
         ui.add_space(8.0);
+        if self.category_filter == Some(Category::GitWorktree) {
+            self.worktree_inventory(ui, data);
+        }
         // Rows grouped by category, biggest group first.
         enum Row {
             Group(Category, usize, u64),
@@ -2661,14 +2816,27 @@ impl RillApp {
         if c.nested_in.is_some() && chip_x + 60.0 < text_x + text_w {
             w::chip_at(p, pos2(chip_x, card.top() + 20.0), "nested", th.faint);
         }
+        // Worktrees: Git's verdict leads the second line, before the path.
+        let git = self.git_view(c);
+        let mut path_x = text_x;
+        if let Some(view) = &git {
+            let (text, tint) = worktrees::chip(view);
+            let chip = w::chip_at(p, pos2(text_x, card.top() + 41.0), &text, tint);
+            path_x = chip.right() + 8.0;
+        }
+        let report = match &git {
+            Some(worktrees::GitView::Ready(report)) => Some(report.as_ref()),
+            _ => None,
+        };
+        let suggested = report.map_or(c.suggested_action.as_str(), |r| r.suggested_action.as_str());
         let path = w::fit(
             p,
             c.path.display().to_string(),
             style::mono(11.5),
             th.faint,
-            text_w,
+            text_w - (path_x - text_x),
         );
-        p.galley(pos2(text_x, card.top() + 34.0), path, th.faint);
+        p.galley(pos2(path_x, card.top() + 34.0), path, th.faint);
         let size = frees(c, self.allocated);
         p.text(
             pos2(card.right() - 16.0, card.top() + 12.0),
@@ -2677,7 +2845,9 @@ impl RillApp {
             style::semibold(15.0),
             th.text,
         );
-        let idle = match c.idle_days {
+        // Git's last work includes the last commit, not only file times.
+        let idle_days = report.and_then(|r| r.idle_days).or(c.idle_days);
+        let idle = match idle_days {
             Some(0) => "active today".to_string(),
             Some(1) => "idle 1 day".to_string(),
             Some(d) => format!("idle {d} days"),
@@ -2703,8 +2873,8 @@ impl RillApp {
         let mut action_rect = None;
         if response.hovered() || response.contains_pointer() {
             let r = Rect::from_min_size(
-                pos2(card.right() - right_w - 108.0, card.center().y - 16.0),
-                vec2(104.0, 32.0),
+                pos2(card.right() - right_w - 144.0, card.center().y - 16.0),
+                vec2(140.0, 32.0),
             );
             p.rect_filled(r.expand(4.0), 10, th.hover);
             action_rect = Some(r);
@@ -2720,25 +2890,34 @@ impl RillApp {
             if w::icon_button(
                 &mut bar,
                 Icon::Terminal,
-                &format!("Copy command:\n{}", c.suggested_action),
+                &format!("Copy command:\n{suggested}"),
             )
             .clicked()
             {
-                actions.push(Action::Copy(c.suggested_action.clone(), "command"));
+                actions.push(Action::Copy(suggested.to_string(), "command"));
                 clicked_action = true;
             }
             if w::icon_button(&mut bar, Icon::Copy, "Copy path").clicked() {
                 actions.push(Action::Copy(c.path.display().to_string(), "path"));
                 clicked_action = true;
             }
-            if w::icon_button(&mut bar, Icon::Eye, "Show in Explore").clicked() {
+            if w::icon_button(&mut bar, Icon::Folder, crate::reveal::label()).clicked() {
+                actions.push(Action::Reveal(c.path.display().to_string()));
+                clicked_action = true;
+            }
+            if w::icon_button(&mut bar, Icon::Eye, "Find in Explore").clicked() {
                 actions.push(Action::Explore(c.entry_id));
                 self.highlight = true;
                 clicked_action = true;
             }
         }
+        let git_line = match &git {
+            Some(worktrees::GitView::Ready(report)) => format!("\n\nGit: {}", report.summary),
+            Some(worktrees::GitView::Pending) => "\n\nGit: checking…".to_string(),
+            None => String::new(),
+        };
         let response =
-            response.on_hover_text(format!("{}\n\nSuggested: {}", c.reason, c.suggested_action));
+            response.on_hover_text(format!("{}{git_line}\n\nSuggested: {suggested}", c.reason));
         if response.clicked() && !clicked_action {
             actions.push(Action::Pick(i));
         }
@@ -3142,13 +3321,18 @@ impl RillApp {
                             }
                         });
                     });
+                    if self.update_pending() {
+                        ui.add_space(22.0);
+                        actions.extend(self.update_card(ui, true));
+                    }
+                    if self.installing.is_some() {
+                        ui.disable();
+                    }
                     ui.add_space(28.0);
                     w::section_label(ui, "Drives");
                     ui.add_space(4.0);
                     for volume in &self.volumes {
-                        if let Some(action) = drive_row(ui, volume) {
-                            actions.push(action);
-                        }
+                        drive_row(ui, volume, &mut actions);
                         ui.add_space(8.0);
                     }
                     if self.volumes.is_empty() {
@@ -3192,17 +3376,21 @@ impl RillApp {
                     });
                     ui.add_space(18.0);
                     crate::assistants::panel(ui, &mut self.assistants, width);
-                    ui.add_space(24.0);
-                    ui.vertical_centered(|ui| {
+                    ui.add_space(22.0);
+                    ui.horizontal(|ui| {
+                        ui.set_width(width);
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.add_space(2.0);
+                        let (dot, _) = ui.allocate_exact_size(vec2(6.0, 24.0), Sense::hover());
+                        ui.painter().circle_filled(dot.center(), 3.0, th.good);
                         ui.label(
-                            RichText::new(concat!(
-                                "Metadata only · nothing leaves this PC   ·   v",
-                                env!("CARGO_PKG_VERSION"),
-                                " · AGPL-3.0"
-                            ))
-                            .font(style::regular(11.5))
-                            .color(th.faint),
+                            RichText::new("Metadata only · nothing leaves this PC · AGPL-3.0")
+                                .font(style::regular(11.5))
+                                .color(th.faint),
                         );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            actions.extend(self.version_button(ui));
+                        });
                     });
                     ui.add_space(20.0);
                 });
@@ -3279,68 +3467,8 @@ impl RillApp {
         self.installing.is_some()
     }
 
-    /// Persistent update access, including the welcome screen.
-    fn update_bar(&self, ui: &mut Ui) -> Vec<Action> {
-        let mut actions = Vec::new();
-        let th = t();
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(concat!("RillDisk ", env!("CARGO_PKG_VERSION"))).small().color(th.dim));
-            ui.separator();
-            if let Some(install) = &self.installing {
-                ui.label(RichText::new(install.phase().label()).color(th.accent));
-                let (received, total) = install.bytes();
-                let (bar, _) = ui.allocate_exact_size(vec2(220.0, 6.0), Sense::hover());
-                if let Some(progress) = install.progress() {
-                    w::progress(ui.painter(), bar, progress, th.accent);
-                    ui.label(format!("{:.0}% | {} / {}", progress.clamp(0.0, 1.0) * 100.0, style::bytes(received), style::bytes(total)));
-                } else {
-                    live::sweep(ui.painter(), bar, ui.input(|i| i.time), th.accent);
-                    if received > 0 { ui.label(format!("{} received", style::bytes(received))); }
-                }
-                ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
-                return;
-            }
-            if let Some(error) = &self.update_error {
-                ui.label(RichText::new("Update needs attention").color(th.danger)).on_hover_text(error);
-                ui.menu_button("Details", |ui| {
-                    ui.set_max_width(500.0);
-                    ui.label(error);
-                    if ui.button("Copy details").clicked() { ui.ctx().copy_text(error.clone()); }
-                });
-                if w::button(ui, Kind::Soft, None, "Retry").on_hover_text(error).clicked() {
-                    actions.push(match &self.available {
-                        Some(release) if release.blocked.is_none() && (release.update_command.is_none() || release.msi) => Action::Install(Box::new(release.clone())),
-                        _ => Action::CheckUpdates,
-                    });
-                }
-            } else if let Some(release) = &self.available {
-                ui.label(RichText::new(format!("Update {} available", release.version)).color(th.accent));
-                if release.blocked.is_none() && (release.update_command.is_none() || release.msi) {
-                    let allowed = self.running.is_none() && !self.cleanup.modal_open();
-                    let button = ui.add_enabled_ui(allowed, |ui| w::button(ui, Kind::Primary, None, "Update and restart")).inner;
-                    if self.tour.is_some() { ui.ctx().data_mut(|d| d.insert_temp(egui::Id::unique("update-install-button"), button.rect)); }
-                    if button.on_disabled_hover_text("Finish the scan or cleanup before restarting")
-                        .on_hover_text(if release.msi { "Downloads and verifies the MSI, then asks Windows to install it. RillDisk restarts afterward." } else { "Downloads, verifies and replaces both programs, then restarts RillDisk." }).clicked() {
-                        actions.push(Action::Install(Box::new(release.clone())));
-                    }
-                } else {
-                    if let Some(url) = &release.download_url
-                        && w::button(ui, Kind::Soft, None, "Download package").clicked() { ui.ctx().open_url(egui::OpenUrl::new_tab(url)); }
-                    if let Some(reason) = release.blocked.as_ref().or(release.update_command.as_ref()) { ui.label(reason); }
-                }
-                if ui.link("What's new").clicked() { ui.ctx().open_url(egui::OpenUrl::new_tab(&release.notes_url)); }
-            } else {
-                if let Some(notice) = &self.update_notice { ui.label(RichText::new(notice).color(th.good)); }
-                let checking = self.update_check.is_some();
-                if checking { ui.spinner(); ui.label("Checking for updates..."); }
-                else if w::button(ui, Kind::Ghost, Some(Icon::Refresh), "Check for updates").clicked() { actions.push(Action::CheckUpdates); }
-            }
-        });
-        actions
-    }
-
     fn paint_toast(&mut self, ctx: &egui::Context) {
-        let Some((text, since)) = &self.toast else {
+        let Some((text, since, success)) = &self.toast else {
             return;
         };
         let age = ctx.input(|i| i.time) - since;
@@ -3363,8 +3491,18 @@ impl RillApp {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             let (r, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
-                            ui.painter().circle_filled(r.center(), 9.0, th.good);
-                            icons::paint(ui.painter(), r.shrink(3.0), Icon::Check, Color32::WHITE);
+                            if *success {
+                                ui.painter().circle_filled(r.center(), 9.0, th.good);
+                                icons::paint(
+                                    ui.painter(),
+                                    r.shrink(3.0),
+                                    Icon::Check,
+                                    Color32::WHITE,
+                                );
+                            } else {
+                                icons::paint(ui.painter(), r.shrink(1.0), Icon::Warning, th.warn);
+                            }
+                            ui.add_space(2.0);
                             ui.label(RichText::new(text).font(style::semibold(13.0)));
                         });
                     });
@@ -3382,6 +3520,7 @@ impl eframe::App for RillApp {
         }
         self.poll(&ctx);
         self.elevate.poll(&ctx);
+        self.poll_git(&ctx);
         let title = match (&self.running, &self.data) {
             (Some(running), _) => format!("Scanning {} · RillDisk", running.root),
             (None, Some(data)) => {
@@ -3406,24 +3545,15 @@ impl eframe::App for RillApp {
         {
             self.dark = system == egui::Theme::Dark;
         }
-        let update_bar = egui::Panel::bottom("update-status")
-            .resizable(false)
-            .show_separator_line(true)
-            .frame(
-                Frame::new()
-                    .fill(th.sidebar)
-                    .inner_margin(Margin::symmetric(18, 10)),
-            )
-            .show(ui, |ui| self.update_bar(ui));
-        actions.extend(update_bar.inner);
         if self.data.is_none() && self.running.is_none() {
             let central = egui::CentralPanel::default()
                 .frame(Frame::new().fill(th.bg).inner_margin(Margin::same(24)))
                 .show(ui, |ui| {
-                    if self.installing.is_some() {
-                        ui.disable();
-                    }
+                    // Home keeps its update card live and greys out the rest itself.
                     if self.settings_open {
+                        if self.installing.is_some() {
+                            ui.disable();
+                        }
                         self.settings_page(ui)
                     } else {
                         self.home(ui)
@@ -3757,7 +3887,7 @@ fn filter_chip(ui: &mut Ui, label: &str, count: Option<usize>, active: bool) -> 
     response
 }
 
-fn drive_row(ui: &mut Ui, volume: &Volume) -> Option<Action> {
+fn drive_row(ui: &mut Ui, volume: &Volume, actions: &mut Vec<Action>) {
     let th = t();
     let width = ui.available_width();
     let (rect, response) = ui.allocate_exact_size(vec2(width, 80.0), Sense::click());
@@ -3829,7 +3959,11 @@ fn drive_row(ui: &mut Ui, volume: &Volume) -> Option<Action> {
         pos2(rect.right() - 16.0, rect.center().y + 16.0),
     )));
     let clicked = w::button(&mut button, Kind::Primary, None, "Scan").clicked();
-    (clicked || response.clicked()).then_some(Action::Scan(letter))
+    let response = response.on_hover_text("Click to scan · right-click for more");
+    response.context_menu(|ui| place_menu(ui, &letter, actions));
+    if clicked || response.clicked() {
+        actions.push(Action::Scan(letter));
+    }
 }
 
 fn error_banner(ui: &mut Ui, error: &str, data: Option<&Data>) {
@@ -3920,23 +4054,81 @@ fn entry_tooltip(ui: &mut Ui, data: &Data, id: usize, allocated: bool, view_tota
 
 fn entry_menu(ui: &mut Ui, snapshot: &Snapshot, id: usize, actions: &mut Vec<Action>) {
     let entry = &snapshot.entries[id];
-    if ui.button("Show in Explore").clicked() {
-        actions.push(Action::Explore(id));
+    let folder = entry.kind == EntryKind::Directory;
+    let path = snapshot.path(id).display().to_string();
+    ui.set_min_width(220.0);
+    let open = if folder {
+        "Open in Explore"
+    } else {
+        "Find in Explore"
+    };
+    if w::menu_item(ui, Icon::Grid, open, "").clicked() {
+        if folder {
+            actions.extend([Action::Tab(Tab::Explore), Action::Zoom(id)]);
+        } else {
+            actions.push(Action::Explore(id));
+        }
         ui.close();
     }
-    if ui.button("Copy path").clicked() {
-        actions.push(Action::Copy(
-            snapshot.path(id).display().to_string(),
-            "path",
-        ));
+    if w::menu_item(ui, Icon::Folder, crate::reveal::label(), "").clicked() {
+        actions.push(Action::Reveal(path.clone()));
         ui.close();
     }
-    if ui.button("Copy name").clicked() {
+    w::menu_gap(ui);
+    if w::menu_item(ui, Icon::Copy, "Copy path", "Ctrl+C").clicked() {
+        actions.push(Action::Copy(path.clone(), "path"));
+        ui.close();
+    }
+    if w::menu_item(ui, Icon::Copy, "Copy name", "").clicked() {
         actions.push(Action::Copy(snapshot.name(id).into_owned(), "name"));
         ui.close();
     }
-    if entry.kind == EntryKind::Directory && ui.button("Scan only this folder").clicked() {
-        actions.push(Action::Scan(snapshot.path(id).display().to_string()));
+    if folder {
+        w::menu_gap(ui);
+        if w::menu_item(ui, Icon::Search, "Scan only this folder", "").clicked() {
+            actions.push(Action::Scan(path));
+            ui.close();
+        }
+    }
+}
+
+/// `155 GB size · 155 GB unique · …`: values in the text color, words dimmed.
+fn meta_line(ui: &mut Ui, parts: &[(String, &str)]) -> egui::Response {
+    let th = t();
+    let mut job = egui::text::LayoutJob::default();
+    let value = egui::TextFormat::simple(style::semibold(12.0), th.dim);
+    let word = egui::TextFormat::simple(style::regular(12.0), th.faint);
+    for (i, (number, label)) in parts.iter().enumerate() {
+        if i > 0 {
+            job.append("   ·   ", 0.0, word.clone());
+        }
+        job.append(number, 0.0, value.clone());
+        job.append(label, 5.0, word.clone());
+    }
+    job.wrap = egui::text::TextWrapping::truncate_at_width(ui.available_width());
+    ui.add(egui::Label::new(job).sense(Sense::hover()))
+}
+
+/// Context menu of a drive or place in the sidebar.
+fn place_menu(ui: &mut Ui, path: &str, actions: &mut Vec<Action>) {
+    ui.set_min_width(220.0);
+    if w::menu_item(ui, Icon::Folder, crate::reveal::label(), "").clicked() {
+        actions.push(Action::Reveal(path.to_string()));
+        ui.close();
+    }
+    if w::menu_item(ui, Icon::Copy, "Copy path", "").clicked() {
+        actions.push(Action::Copy(path.to_string(), "path"));
+        ui.close();
+    }
+    w::menu_gap(ui);
+    let drive = path.trim_end_matches(['\\', '/']).ends_with(':') || path == "/";
+    let scan = if drive {
+        "Scan this drive"
+    } else {
+        "Scan only this folder"
+    };
+    if w::menu_item(ui, Icon::Search, scan, "").clicked() {
+        actions.push(Action::Scan(path.to_string()));
         ui.close();
     }
 }
@@ -4282,6 +4474,44 @@ mod tests {
         d.settle();
         assert!(d.app.hovered.is_some(), "the pointer is on the chart");
         assert_eq!(listed(&d), before);
+    }
+
+    #[test]
+    fn a_chart_tile_menu_stays_open_over_the_pointer_and_offers_the_file_manager() {
+        let mut d = Driver::new("chart-menu");
+        d.click_row("Projects");
+        let web = d.id("Projects/atlas-web");
+        let tile = d
+            .app
+            .map
+            .tile_of(web)
+            .expect("atlas-web has a tile")
+            .rect
+            .center();
+        d.pointer = tile;
+        d.run(vec![egui::Event::PointerMoved(tile)]);
+        d.run(
+            [true, false]
+                .map(|pressed| egui::Event::PointerButton {
+                    pos: tile,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: Default::default(),
+                })
+                .to_vec(),
+        );
+        // The menu opens under the pointer, so the tile stops being hovered; the
+        // menu must stay open anyway.
+        d.settle();
+        let target = d.app.menu_target.expect("the menu remembers its tile");
+        let snapshot = &d.app.data.as_ref().unwrap().snapshot;
+        assert!(snapshot.path(target).starts_with(snapshot.path(web)));
+        assert!(egui::Popup::is_any_open(&d.ctx), "the menu is still open");
+        // Escape closes it and forgets the target.
+        d.press(egui::Key::Escape);
+        d.settle();
+        assert!(!egui::Popup::is_any_open(&d.ctx));
+        assert_eq!(d.app.menu_target, None);
     }
 
     #[test]

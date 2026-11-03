@@ -17,6 +17,7 @@ use rayon::prelude::*;
 use serde::{Serialize, Serializer, ser::SerializeStruct};
 
 pub mod cleanup;
+pub mod git;
 mod live;
 mod platform;
 mod reclaim;
@@ -244,6 +245,9 @@ pub struct Summary {
     pub issues: Vec<ScanIssue>,
     pub cancelled: bool,
     pub complete: bool,
+    /// The scan stopped at its entry limit (`ScanOptions::max_entries`): some
+    /// folders were not read. Set even when the issue list is full.
+    pub entry_limit_reached: bool,
     /// The scanning process was elevated (administrator or root).
     pub elevated: bool,
 }
@@ -863,6 +867,7 @@ impl Collector {
             issues: Vec::new(),
             cancelled: false,
             complete: true,
+            entry_limit_reached: false,
             elevated: is_elevated(),
         };
         let entry = Entry {
@@ -1168,6 +1173,7 @@ fn finish(
     drop(links);
     // Report the memory bound once rather than once per truncated directory.
     if control.limit_reached.load(Ordering::Relaxed) {
+        summary.entry_limit_reached = true;
         let path = summary.root.clone();
         add_issue(
             &mut summary,

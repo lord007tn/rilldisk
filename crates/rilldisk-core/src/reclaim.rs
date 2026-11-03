@@ -112,7 +112,34 @@ pub struct Candidate {
     pub idle_days: Option<u64>,
     /// Enclosing candidate. Nested candidates are excluded from totals.
     pub nested_in: Option<usize>,
+    /// Git's view of a linked worktree, when it was asked
+    /// ([`ReclaimReport::inspect_git`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git: Option<crate::git::GitReport>,
+    /// Which folder this was when found; cleanup refuses a different one.
+    #[serde(skip)]
+    pub identity: Option<crate::cleanup::FolderId>,
 }
+
+impl Candidate {
+    /// A linked worktree Git can be asked about (not an orphaned folder).
+    pub fn is_linked_worktree(&self) -> bool {
+        self.category == Category::GitWorktree && self.label == WORKTREE_LABEL
+    }
+
+    /// Ask Git about this worktree. Runs `git`; see docs/proposals/git-inspection.md.
+    pub fn inspect_git(&self, now_unix_ms: u64, stale_days: u64) -> crate::git::GitReport {
+        crate::git::GitReport::new(
+            crate::git::inspect(&self.path),
+            &self.path,
+            self.newest_modified_unix_ms,
+            now_unix_ms,
+            stale_days,
+        )
+    }
+}
+
+const WORKTREE_LABEL: &str = "Git worktree";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ReclaimReport {
@@ -746,6 +773,37 @@ const LOCATIONS: &[(&[&str], Rule)] = {
 };
 
 impl ReclaimReport {
+    /// Ask Git about every linked worktree (a few at a time) and attach its
+    /// verdict; the suggested action becomes Git-aware. Runs `git`; see
+    /// docs/proposals/git-inspection.md. Other candidates are untouched.
+    pub fn inspect_git(&mut self, now_unix_ms: u64, stale_days: u64) {
+        let worktrees: Vec<usize> = (0..self.candidates.len())
+            .filter(|&i| self.candidates[i].is_linked_worktree())
+            .collect();
+        let reports: Vec<(usize, crate::git::GitReport)> = std::thread::scope(|scope| {
+            worktrees
+                .chunks(worktrees.len().div_ceil(4).max(1))
+                .map(|chunk| {
+                    let candidates = &self.candidates;
+                    scope.spawn(move || {
+                        chunk
+                            .iter()
+                            .map(|&i| (i, candidates[i].inspect_git(now_unix_ms, stale_days)))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .flat_map(|handle| handle.join().unwrap_or_default())
+                .collect()
+        });
+        for (i, report) in reports {
+            let candidate = &mut self.candidates[i];
+            candidate.suggested_action = report.suggested_action.clone();
+            candidate.git = Some(report);
+        }
+    }
+
     /// Keep matching candidates and recompute every total from what remains.
     pub fn retain(&mut self, keep: impl Fn(&Candidate) -> bool) {
         self.candidates.retain(|c| keep(c));
@@ -789,7 +847,7 @@ pub fn find_reclaimable(snapshot: &Snapshot, now_unix_ms: u64) -> ReclaimReport 
     const WORKTREE: Rule = rule(
         Category::GitWorktree,
         Safety::Review,
-        "Git worktree",
+        WORKTREE_LABEL,
         "Linked Git worktree: '.git' is a pointer file, so history lives in another repository. Git refuses to remove it while it has uncommitted changes.",
         "",
     );
@@ -914,6 +972,7 @@ pub fn find_reclaimable(snapshot: &Snapshot, now_unix_ms: u64) -> ReclaimReport 
         let agent = (rule.category == Category::GitWorktree)
             .then(|| agent_owner(&path.join("x")))
             .flatten();
+        let identity = crate::cleanup::folder_identity(&path);
         candidates.push(Candidate {
             entry_id: *id,
             path,
@@ -932,6 +991,8 @@ pub fn find_reclaimable(snapshot: &Snapshot, now_unix_ms: u64) -> ReclaimReport 
             newest_modified_unix_ms: entry.modified_unix_ms,
             idle_days,
             nested_in: enclosing.map(|(parent, _)| parent),
+            git: None,
+            identity,
         });
     }
     candidates.sort_by(|a, b| {
@@ -1345,7 +1406,7 @@ fn child_named(snapshot: &Snapshot, id: usize, name: &str) -> Option<usize> {
 /// Double-quote a path for a copied command when that is safe in both PowerShell
 /// and POSIX shells; otherwise return None so callers omit it. On Unix a backslash
 /// is an ordinary filename byte that POSIX double quotes may still interpret.
-fn quoted(path: &std::path::Path) -> Option<String> {
+pub(crate) fn quoted(path: &std::path::Path) -> Option<String> {
     let text = path.to_str()?;
     let special: &[char] = if cfg!(windows) {
         &['"', '$', '`', '\'', '%', '!']

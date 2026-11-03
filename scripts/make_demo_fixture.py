@@ -7,12 +7,20 @@ comes from a real machine. Usage:
 
 The tree holds ~150 GB of logical data while using only a few hundred MB of disk.
 
+With `git` on PATH, the projects become real repositories and the AI-agent and
+linked worktrees real Git worktrees in fixed states (two with no changes, one with
+an uncommitted edit, one with a commit only on its detached HEAD), so RillDisk's
+Git verdicts in screenshots are Git's own answers. Without Git they stay pointer
+files and their verdicts read "unknown".
+
 Use the "Size" (logical) view when capturing; sparse files have ~0 bytes on disk.
 """
 import ctypes
 import os
 import pathlib
 import random
+import shutil
+import subprocess
 import sys
 import time
 
@@ -62,6 +70,72 @@ def spread(base, names, total, age, jitter=0.6):
     scale = total / sum(weights)
     for name, weight in zip(names, weights):
         write(base / name, int(weight * scale), age + rng.random() * age * jitter)
+
+
+def git(cwd, *args, age_days=None):
+    env = dict(os.environ, GIT_AUTHOR_NAME="RillDisk demo", GIT_AUTHOR_EMAIL="demo@example.invalid",
+               GIT_COMMITTER_NAME="RillDisk demo", GIT_COMMITTER_EMAIL="demo@example.invalid")
+    if age_days is not None:
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(NOW - age_days * DAY))
+        env["GIT_AUTHOR_DATE"] = env["GIT_COMMITTER_DATE"] = stamp
+    subprocess.run(["git", "-C", str(cwd), *args], check=True, env=env,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+
+def age_tree(path, age_days):
+    stamp = NOW - age_days * DAY
+    for directory, _, files in os.walk(path):
+        for name in files:
+            os.utime(os.path.join(directory, name), (stamp, stamp))
+
+
+def repository(path, ignored, age_days):
+    """Commit everything in `path` except `ignored` folders (shared by its worktrees)."""
+    git(path, "init", "-q", "-b", "main")
+    (path / ".git" / "info" / "exclude").write_text("".join(f"{name}/\n" for name in ignored))
+    git(path, "add", "-A")
+    git(path, "commit", "-q", "-m", "Import", age_days=age_days)
+
+
+def worktree(repo, path, age_days, branch=None):
+    """Make the folder at `path` a linked worktree of `repo` holding its current files,
+    committed `age_days` ago on `branch` (detached when None)."""
+    (path / ".git").unlink()
+    aside = path.with_name(path.name + ".aside")
+    path.rename(aside)
+    args = ["worktree", "add", "-q"] + (["-b", branch] if branch else ["--detach"]) + [str(path)]
+    git(repo, *args)
+    for item in path.iterdir():
+        if item.name != ".git":
+            shutil.rmtree(item) if item.is_dir() else item.unlink()
+    for item in aside.iterdir():
+        shutil.move(str(item), str(path / item.name))
+    aside.rmdir()
+    git(path, "add", "-A")
+    git(path, "commit", "-q", "--allow-empty", "-m", f"Work in {path.name}", age_days=age_days)
+    age_tree(path, age_days)
+
+
+def gitify(root):
+    if shutil.which("git") is None:
+        print("git not found: worktrees stay pointer files (Git verdicts will read unknown)")
+        return
+    p = root / "Projects"
+    web, rust = p / "atlas-web", p / "ferrite-engine"
+    repository(web, [".claude", "node_modules", ".next"], 2)
+    repository(rust, ["target"], 3)
+    # No changes Git can see; idle for weeks.
+    worktree(web, web / ".claude" / "worktrees" / "agent-3f9c2a", 41, "claude/agent-3f9c2a")
+    worktree(web, root / "Users" / "demo" / ".codex" / "worktrees" / "a71c" / "atlas-web", 63, "codex/search")
+    # A commit made on a detached HEAD: nothing else holds it.
+    worktree(web, root / "Users" / "demo" / ".t3" / "worktrees" / "atlas-web-spike", 25)
+    # Idle for months, yet one tracked file holds an uncommitted edit.
+    perf = p / "ferrite-engine-perf"
+    worktree(rust, perf, 118, "perf-experiment")
+    edited = perf / "src" / "module_0.rs"
+    with open(edited, "ab") as f:
+        f.write(b"// unfinished benchmark tweak\n")
+    age_tree(perf, 118)
 
 
 def main():
@@ -139,6 +213,16 @@ def main():
     write(rust / "target" / "debug" / "ferrite.pdb", int(640 * MiB), 3)
     spread(rust / "target" / "release" / "deps", [f"libcrate_{i}.rlib" for i in range(80)], 1.2 * GiB, 12)
 
+    # More agent worktrees of atlas-web, kept where Codex and T3 Code put them.
+    for wt, age, count in [(root / "Users" / "demo" / ".codex" / "worktrees" / "a71c" / "atlas-web", 63, 8),
+                           (root / "Users" / "demo" / ".t3" / "worktrees" / "atlas-web-spike", 25, 6)]:
+        write(wt / ".git", 60, age)
+        write(wt / "package.json", 900, age)
+        spread(wt / "src", [f"component-{i}.tsx" for i in range(12)], 1 * MiB, age)
+        for name in packages[:count]:
+            spread(wt / "node_modules" / name / "dist", [f"chunk-{i}.js" for i in range(30)],
+                   rng.uniform(10, 60) * MiB, age)
+
     # A stale linked worktree for a perf experiment.
     perf = p / "ferrite-engine-perf"
     write(perf / ".git", 60, 118)
@@ -166,6 +250,8 @@ def main():
     spread(local / "npm-cache" / "_cacache" / "content-v2", [f"sha512-{i:04x}" for i in range(300)], 1.3 * GiB, 15)
     spread(local / "pip" / "Cache" / "http", [f"wheel-{i:03}" for i in range(80)], 0.7 * GiB, 30)
     spread(local / "NVIDIA" / "DXCache", [f"shader-{i:03}.bin" for i in range(90)], 0.6 * GiB, 4)
+
+    gitify(root)
 
     # Marks the tree as synthetic: `rilldisk-desktop --capture-cleanup` only
     # removes folders from a scan that has this file at its root (or lives in temp).

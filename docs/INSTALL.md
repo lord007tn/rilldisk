@@ -164,15 +164,17 @@ On Windows: `Get-FileHash .\RillDisk-<version>-x64.msi` and compare with
 
 | Installed with | How it updates |
 | --- | --- |
-| `.zip` / `.tar.gz` | `rilldisk update`, or **Install and restart** in the app. Verified with SHA-256, both programs replaced. |
-| `.msi` | Choose **Update and restart** in the bottom bar. The app downloads and verifies the MSI, then Windows Installer upgrades it after administrator consent. The CLI links the matching package. |
+| `.zip` / `.tar.gz` | `rilldisk update`, or **Update and restart** in the app. Verified with SHA-256, both programs replaced. |
+| `.msi` | Choose **Update and restart** on the update card. The app downloads and verifies the MSI, then Windows Installer upgrades it after administrator consent. The CLI links the matching package. |
 | `.deb` / `.rpm` | They link the new package; install it with `apt` / `dnf` / `zypper` as above. |
 | AppImage | They link the new AppImage; replace the old file (or use AppImageUpdate). |
 | `.dmg` | They link the new `.dmg`; drag the new RillDisk over the old one. |
 
 RillDisk leaves package-managed files to their owner. For its own Windows MSI,
 the desktop can launch the verified installer after you choose **Update and restart**.
-Downloads show byte progress in the bottom bar on every page. Windows Installer
+The update card appears only when there is news: above Settings in the sidebar,
+on the home screen and in Settings. Downloads show byte progress there. Click
+the version at the bottom of the sidebar (or on the home screen) to check now. Windows Installer
 shows installation progress after RillDisk closes, and the app reopens afterward.
 A declined permission prompt leaves the app open; failures offer details and retry.
 Finish active scans or cleanup before updating. Other package managers keep the

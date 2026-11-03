@@ -62,7 +62,8 @@ plain reason such as "in use by another program" or "access denied", or not
 started after cancellation), and stops between items when cancelled. Freed
 space is the snapshot's exclusive bytes, which already account for hard links.
 
-**Git worktrees.** RillDisk does not run Git. Removing a linked worktree folder
+**Git worktrees.** Cleanup never runs Git (Git state is only read, see
+[git-inspection.md](git-inspection.md)). Removing a linked worktree folder
 leaves a stale entry in the original repository's `.git/worktrees`; the result
 tells the user to run `git worktree prune` there once they will not restore the
 folder from the Trash.

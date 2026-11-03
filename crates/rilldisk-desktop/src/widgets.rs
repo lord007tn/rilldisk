@@ -460,3 +460,66 @@ pub fn fit(
     job.wrap = egui::text::TextWrapping::truncate_at_width(width.max(8.0));
     painter.layout_job(job)
 }
+
+/// A context-menu row: icon, label and an optional faint hint (a shortcut).
+pub fn menu_item(ui: &mut Ui, icon: Icon, label: &str, hint: &str) -> Response {
+    let th = t();
+    let font = style::regular(13.0);
+    let text = ui
+        .painter()
+        .layout_no_wrap(label.to_string(), font, Color32::PLACEHOLDER);
+    let hint = (!hint.is_empty()).then(|| {
+        ui.painter()
+            .layout_no_wrap(hint.to_string(), style::regular(11.5), th.faint)
+    });
+    let hint_w = hint.as_ref().map_or(0.0, |g| g.size().x + 24.0);
+    // A natural width: a menu fits its longest item, never the window.
+    let width = (text.size().x + 52.0 + hint_w).max(232.0);
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 30.0), Sense::click());
+    let p = ui.painter();
+    if response.hovered() {
+        p.rect_filled(rect, 7, th.hover);
+    }
+    let color = if response.hovered() {
+        th.text
+    } else {
+        style::mix(th.text, th.dim, 0.35)
+    };
+    icons::paint(
+        p,
+        Rect::from_center_size(pos2(rect.left() + 17.0, rect.center().y), vec2(15.0, 15.0)),
+        icon,
+        if response.hovered() { th.text } else { th.dim },
+    );
+    p.galley(
+        pos2(rect.left() + 34.0, rect.center().y - text.size().y / 2.0),
+        text,
+        color,
+    );
+    if let Some(hint) = hint {
+        p.galley(
+            pos2(
+                rect.right() - 10.0 - hint.size().x,
+                rect.center().y - hint.size().y / 2.0,
+            ),
+            hint,
+            th.faint,
+        );
+    }
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
+    response
+}
+
+/// A quiet gap between groups of menu items.
+pub fn menu_gap(ui: &mut Ui) {
+    let th = t();
+    let width = ui.min_rect().width().max(232.0);
+    let (rect, _) = ui.allocate_exact_size(vec2(width, 9.0), Sense::hover());
+    ui.painter().line_segment(
+        [
+            pos2(rect.left() + 10.0, rect.center().y),
+            pos2(rect.right() - 10.0, rect.center().y),
+        ],
+        Stroke::new(1.0, style::alpha(th.faint, 40)),
+    );
+}

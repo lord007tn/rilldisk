@@ -90,7 +90,8 @@ for each system, verification and uninstalling.
 Each package holds two programs:
 
 * **`rilldisk-desktop`** (RillDisk in your app menu): the desktop app. Pick a drive,
-  a place or any folder.
+  a place or any folder. Right-click any folder or file for **Show in Explorer**
+  (Finder, or your file manager), copying its path or scanning just that folder.
 * **`rilldisk`**: the CLI and MCP server.
 
 No account, no admin rights to scan. Protected system folders are listed under
@@ -107,7 +108,7 @@ grant **Full Disk Access**. Issues carry a `kind` (`access_denied`, `in_use`,
 `not_found`, ...) and the summary an `access_denied_count`.
 
 **Updates.** The desktop checks GitHub once a day for a newer release and offers
-it; nothing is installed until you click **Install and restart**. From a terminal,
+it; nothing is installed until you click **Update and restart**. From a terminal,
 `rilldisk update --check` reports whether a newer release exists and
 `rilldisk update` downloads it, verifies its SHA-256 and replaces both programs
 after you confirm. Installed with the MSI, a `.deb`, an `.rpm`, the AppImage or the
@@ -174,6 +175,37 @@ with their owner. Folders left in an agent's `worktrees` directory **without** a
 `.git` are flagged as *orphaned*: Git no longer knows them, so `git worktree remove`
 cannot help and they silently keep their full `node_modules`. Totals never double
 count nested candidates.
+
+### Ask Git which worktrees are safe to drop
+
+Removing a worktree folder never deletes commits: they live in the main repository
+and the branch stays. What can be lost is uncommitted work and commits made on a
+detached HEAD that nothing else holds. So RillDisk can ask your own `git`,
+read-only (no index writes, no fetch, no hooks), and turns the answer into a
+verdict: **uncommitted changes**, **commits only here**, **locked**, **active**,
+**clean and idle** (no commits or file changes for 14 days, adjustable), or
+**unknown**. Each comes with the right next step.
+
+```text
+> rilldisk reclaim D:\code --git --min-size 1MB
+      SIZE       FREES  SAFETY         IDLE  KIND                       PATH
+  12.0 MiB    12.0 MiB  Review first     0d  Git worktree               D:\code\atlas-web\.claude\worktrees\add-search
+                        git: Uncommitted changes - 1 changed file and 1 untracked item would be lost; last work today; branch add-search (no remote; kept in the repository).
+                        -> Commit or stash the changes in "…\add-search" (git -C "…\add-search" status), then git worktree remove "…\add-search"
+  12.0 MiB    12.0 MiB  Review first    25d  Git worktree               D:\code\atlas-web\.claude\worktrees\spike-cache
+                        git: Commits only here - 1 commit on a detached HEAD exists nowhere else; last work 25 days ago; detached HEAD.
+                        -> Keep the commits on a branch first: git -C "…\spike-cache" switch -c <name>, then git worktree remove "…\spike-cache"
+  12.0 MiB    12.0 MiB  Review first    41d  Git worktree               D:\code\atlas-web\.claude\worktrees\fix-login
+                        git: Clean and idle - Clean: removing it loses no work; last work 41 days ago; branch fix-login (no remote; kept in the repository).
+                        -> git worktree remove "…\fix-login"
+```
+
+The desktop does this in the background after a scan: worktree cards show the
+verdict, **Select clean idle worktrees** ticks only the ones that lose nothing, and
+the removal dialog names any ticked worktree that would lose work. With
+`reclaim --git --delete`, worktrees that would lose work (or that Git could not
+check) are left out. The MCP server does not run Git. Scope and safeguards:
+[docs/proposals/git-inspection.md](docs/proposals/git-inspection.md).
 
 ### Remove what you selected
 

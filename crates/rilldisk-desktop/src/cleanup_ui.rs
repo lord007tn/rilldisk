@@ -11,7 +11,7 @@ use eframe::egui::{
     self, Align, Align2, Color32, Frame, Layout, Margin, RichText, Sense, Ui, pos2, vec2,
 };
 use rilldisk_core::{
-    Category, CleanupMode, CleanupPlan, CleanupReport, Safety,
+    Category, CleanupMode, CleanupPlan, CleanupReport, ReclaimReport, Safety,
     cleanup::{self, CleanupControl, Guard, Outcome},
 };
 use std::{
@@ -31,6 +31,10 @@ pub struct CleanupUi {
 
 struct Confirm {
     data: Arc<Data>,
+    /// The report removal runs on: the scan's, with Git expectations attached
+    /// to worktrees when Git checks are on.
+    reclaim: Arc<ReclaimReport>,
+    git: crate::app::PickNotes,
     ids: Vec<usize>,
     plan: CleanupPlan,
     /// Permanent deletion needs an extra tick.
@@ -102,9 +106,18 @@ pub fn toolbar(app: &mut RillApp, ui: &mut Ui, data: &Arc<Data>) {
         .copied()
         .filter(|&i| category.is_none_or(|c| report.candidates[i].category == c))
         .collect();
+    // Only when worktrees are shown: never tick what a filter hides.
+    let idle: Vec<usize> = if category.is_none_or(|c| c == Category::GitWorktree)
+        && app.safety_filter.is_none_or(|s| s == Safety::Review)
+    {
+        app.clean_idle_worktrees(data)
+    } else {
+        Vec::new()
+    };
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
-        let width = (ui.available_width() - 300.0).max(200.0);
+        let buttons = if idle.is_empty() { 300.0 } else { 560.0 };
+        let width = (ui.available_width() - buttons).max(200.0);
         ui.allocate_ui_with_layout(
             vec2(width, 32.0),
             Layout::left_to_right(Align::Center),
@@ -147,6 +160,27 @@ pub fn toolbar(app: &mut RillApp, ui: &mut Ui, data: &Arc<Data>) {
                     app.picked.extend(safe.iter().copied());
                 }
             });
+            // Worktrees with no Git-reported changes and no recent activity.
+            if !idle.is_empty() {
+                let all = idle.iter().all(|i| app.picked.contains(i));
+                ui.add_enabled_ui(!all, |ui| {
+                    if w::button(
+                        ui,
+                        Kind::Soft,
+                        Some(Icon::Agent),
+                        &format!("Select clean idle worktrees · {}", idle.len()),
+                    )
+                    .on_hover_text(format!(
+                        "Ticks worktrees where Git reports no uncommitted or untracked changes, no commits that exist only there and no lock, and nothing changed for {} days or more (Settings). Git does not see ignored files such as .env, and RillDisk cannot tell whether an agent is still running there: they stay Review first. Branch commits stay in the repository.",
+                        app.stale_days()
+                    ))
+                    .on_disabled_hover_text("Every clean idle worktree is already ticked.")
+                    .clicked()
+                    {
+                        app.picked.extend(idle.iter().copied());
+                    }
+                });
+            }
         });
     });
 }
@@ -212,9 +246,14 @@ fn open_confirm(app: &mut RillApp, data: &Arc<Data>, mode: CleanupMode) {
         .filter_map(|&i| data.reclaim.candidates.get(i).map(|c| c.entry_id))
         .collect();
     ids.sort_unstable();
-    let plan = cleanup::plan(&data.snapshot, &data.reclaim, &ids, mode, guard());
+    let reclaim = Arc::new(app.annotated(&data.reclaim));
+    let picked: Vec<usize> = app.picked.iter().copied().collect();
+    let git = app.pick_notes(data, &picked);
+    let plan = cleanup::plan(&data.snapshot, &reclaim, &ids, mode, guard());
     app.cleanup.confirm = Some(Confirm {
         data: data.clone(),
+        reclaim,
+        git,
         ids,
         plan,
         understood: false,
@@ -287,14 +326,19 @@ fn start(app: &mut RillApp, ctx: &egui::Context, confirm: Confirm) {
         .total
         .store(confirm.plan.items.len(), Ordering::Relaxed);
     let (tx, rx) = mpsc::channel();
-    let (data, ids, mode) = (confirm.data.clone(), confirm.ids, confirm.plan.mode);
+    let (data, reclaim, ids, mode) = (
+        confirm.data.clone(),
+        confirm.reclaim.clone(),
+        confirm.ids,
+        confirm.plan.mode,
+    );
     let (thread_data, thread_control, repaint) = (data.clone(), control.clone(), ctx.clone());
     std::thread::Builder::new()
         .name("rilldisk-cleanup".into())
         .spawn(move || {
             let report = cleanup::execute(
                 &thread_data.snapshot,
-                &thread_data.reclaim,
+                &reclaim,
                 &ids,
                 mode,
                 guard(),
@@ -563,6 +607,54 @@ fn confirm_dialog(app: &mut RillApp, ctx: &egui::Context) {
             );
         }
         ui.add_space(10.0);
+        let git = &confirm.git;
+        if !git.risky.is_empty() {
+            note(
+                ui,
+                th.danger,
+                Icon::Warning,
+                &format!(
+                    "Git reports changes in {}, so {} skipped: RillDisk asks Git again right before removing a worktree. {}",
+                    style::plural(git.risky.len() as u64, "ticked worktree"),
+                    if git.risky.len() == 1 {
+                        "it will be"
+                    } else {
+                        "they will be"
+                    },
+                    git.risky.join(" ")
+                ),
+            );
+            ui.add_space(6.0);
+        }
+        if !git.unchecked.is_empty() {
+            note(
+                ui,
+                th.warn,
+                Icon::Warning,
+                &format!(
+                    "Not checked by Git yet: {}. Git is asked right before removal; any worktree it reports changes for, or cannot check, is skipped.",
+                    git.unchecked.join(", ")
+                ),
+            );
+            ui.add_space(6.0);
+        }
+        if git.worktrees > 0 && git.checks_off {
+            note(
+                ui,
+                th.warn,
+                Icon::Warning,
+                "Git checks are off (Settings), so these worktrees are removed without asking Git. Uncommitted work in them goes to the Trash with the folder.",
+            );
+            ui.add_space(6.0);
+        } else if git.worktrees > 0 {
+            note(
+                ui,
+                th.info,
+                Icon::Eye,
+                "Git does not see ignored files (such as .env or local settings), and RillDisk cannot tell whether an agent is still running in a worktree.",
+            );
+            ui.add_space(6.0);
+        }
         if reviews > 0 {
             note(
                 ui,
@@ -580,7 +672,7 @@ fn confirm_dialog(app: &mut RillApp, ctx: &egui::Context) {
                 ui,
                 th.info,
                 Icon::Terminal,
-                "Git still lists removed worktrees. Afterwards, run `git worktree prune` in each original repository. RillDisk does not run Git.",
+                "Git still lists removed worktrees. Afterwards, run `git worktree prune` in each original repository. RillDisk only reads Git; it never changes a repository.",
             );
             ui.add_space(6.0);
         }

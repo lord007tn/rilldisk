@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Remembered preferences: palette, theme and the size metric. A small
+//! Remembered preferences: palette, theme, the size metric and worktree checks. A small
 //! `key=value` text file next to the update preferences; anything unreadable
 //! falls back to defaults.
 use crate::style::Identity;
@@ -13,7 +13,16 @@ pub struct Saved {
     pub theme: Option<Option<bool>>,
     /// Show sizes as allocated "On disk" instead of logical "Size".
     pub allocated: Option<bool>,
+    /// Ask Git about worktree candidates.
+    pub git_checks: Option<bool>,
+    /// Days without work after which a clean worktree counts as idle.
+    pub stale_days: Option<u64>,
+    /// Entry limit of desktop scans (one of [`SCAN_LIMITS`]).
+    pub max_entries: Option<usize>,
 }
+
+/// Entry limits the desktop offers: the default and two larger memory bounds.
+pub const SCAN_LIMITS: [usize; 3] = [30_000_000, 60_000_000, 120_000_000];
 
 /// Everything the Settings page can change.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -22,6 +31,9 @@ pub struct Prefs {
     /// None follows the operating system.
     pub theme: Option<bool>,
     pub allocated: bool,
+    pub git_checks: bool,
+    pub stale_days: u64,
+    pub max_entries: usize,
 }
 
 fn path() -> Option<PathBuf> {
@@ -51,6 +63,23 @@ pub fn load() -> Saved {
                     _ => None,
                 }
             }
+            Some(("git-checks", value)) => {
+                saved.git_checks = match value.trim() {
+                    "on" => Some(true),
+                    "off" => Some(false),
+                    _ => None,
+                }
+            }
+            Some(("scan-limit", value)) => {
+                saved.max_entries = value
+                    .trim()
+                    .parse()
+                    .ok()
+                    .filter(|n| SCAN_LIMITS.contains(n))
+            }
+            Some(("stale-days", value)) => {
+                saved.stale_days = value.trim().parse().ok().filter(|d| (1..=3650).contains(d))
+            }
             _ => {}
         }
     }
@@ -71,9 +100,12 @@ pub fn save(prefs: &Prefs) {
     let _ = std::fs::write(
         path,
         format!(
-            "palette={}\ntheme={theme}\nsizes={}\n",
+            "palette={}\ntheme={theme}\nsizes={}\ngit-checks={}\nstale-days={}\nscan-limit={}\n",
             prefs.identity.name().to_lowercase(),
-            if prefs.allocated { "on-disk" } else { "size" }
+            if prefs.allocated { "on-disk" } else { "size" },
+            if prefs.git_checks { "on" } else { "off" },
+            prefs.stale_days,
+            prefs.max_entries
         ),
     );
 }

@@ -121,6 +121,16 @@ enum Command {
         /// Do not ask for confirmation. Required when stdin is not a terminal.
         #[arg(long, short = 'y', requires = "delete")]
         yes: bool,
+        /// Ask Git about each linked worktree: uncommitted changes, commits that
+        /// exist only there, locks and the last commit. Runs your `git` read-only
+        /// (no index writes, no network). With --delete, worktrees that would lose
+        /// work are left out.
+        #[arg(long)]
+        git: bool,
+        /// With --git: a clean worktree with no commits or file changes for this
+        /// many days is reported as idle.
+        #[arg(long, default_value_t = rilldisk_core::git::DEFAULT_STALE_DAYS, requires = "git")]
+        stale_days: u64,
     },
     /// List local drives with capacity and free space.
     Drives {
@@ -351,6 +361,8 @@ async fn main() -> Result<ExitCode> {
             delete,
             permanent,
             yes,
+            git,
+            stale_days,
         } if delete => {
             let code = std::cell::Cell::new(None);
             // No elevation hint: it would suggest removing folders as root.
@@ -360,6 +372,17 @@ async fn main() -> Result<ExitCode> {
                 report.retain(|c| {
                     c.logical_bytes >= min_size && safety.iter().any(|s| s.matches(c.safety))
                 });
+                if git {
+                    report.inspect_git(now_ms(), stale_days);
+                    let before = report.candidates.len();
+                    report.retain(|c| c.git.as_ref().is_none_or(|g| g.verdict.no_reported_loss()));
+                    let kept = before - report.candidates.len();
+                    if kept > 0 {
+                        eprintln!(
+                            "Left out {kept} worktree(s) that Git says would lose work or could not check. Run `rilldisk reclaim --git` to see why."
+                        );
+                    }
+                }
                 code.set(Some(cleanup::run(
                     writer,
                     snapshot,
@@ -380,6 +403,8 @@ async fn main() -> Result<ExitCode> {
             format,
             min_size,
             safety,
+            git,
+            stale_days,
             ..
         } => {
             let hint = if matches!(format, ReportFormat::Table) {
@@ -395,6 +420,9 @@ async fn main() -> Result<ExitCode> {
                             .as_ref()
                             .is_none_or(|s| s.iter().any(|s| s.matches(c.safety)))
                 });
+                if git {
+                    report.inspect_git(now_ms(), stale_days);
+                }
                 match format {
                     ReportFormat::Json => {
                         serde_json::to_writer(&mut *writer, &report)?;
@@ -776,7 +804,27 @@ fn write_reclaim(
                 ""
             }
         )?;
+        if let Some(git) = &c.git {
+            writeln!(
+                writer,
+                "{:>22}  git: {} - {}",
+                "",
+                git.verdict.label(),
+                git.summary
+            )?;
+        }
         writeln!(writer, "{:>22}  -> {}", "", c.suggested_action)?;
+    }
+    let worktrees = report
+        .candidates
+        .iter()
+        .filter(|c| c.is_linked_worktree())
+        .count();
+    if worktrees > 0 && report.candidates.iter().all(|c| c.git.is_none()) {
+        writeln!(
+            writer,
+            "\nAdd --git to check the {worktrees} worktree(s) for uncommitted changes and commits that exist only there."
+        )?;
     }
     Ok(())
 }
@@ -917,6 +965,7 @@ mod tests {
             issues: Vec::new(),
             cancelled: false,
             complete: false,
+            entry_limit_reached: false,
             elevated,
         }
     }

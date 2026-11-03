@@ -45,6 +45,14 @@ pub enum Step {
     Record(bool),
     Move(Target, u32),
     Click(Target),
+    /// Right-click a target to open its context menu.
+    Menu(Target),
+    /// Close an open menu (Escape).
+    CloseMenu,
+    /// Clean up: show one category (or everything).
+    Filter(Option<Category>),
+    /// Until Git has answered for every worktree (the fixture's real repositories).
+    WaitGit,
     Tab(View),
     Highlight(bool),
     Search(&'static str),
@@ -443,12 +451,22 @@ impl Tour {
                 Wait(20),
                 ExpectFolder(""),
                 Shot("navigation-parent"),
+                Menu(Row("Projects")),
+                Wait(12),
+                Shot("context-menu"),
+                CloseMenu,
+                Wait(8),
                 Tab(View::Cleanup),
                 Wait(14),
                 Pick(Category::GitWorktree, 2),
                 Pick(Category::BuildOutput, 1),
                 Wait(18),
                 Shot("cleanup"),
+                WaitGit,
+                Filter(Some(Category::GitWorktree)),
+                Wait(14),
+                Shot("worktrees"),
+                Filter(None),
                 Tab(View::Largest),
                 Wait(18),
                 Record(false),
@@ -472,9 +490,19 @@ impl Tour {
                 ChartKind(Chart::Map),
                 Wait(14),
                 Shot("explore-dark"),
+                Menu(Entry("VMs/ubuntu-dev.vhdx")),
+                Wait(12),
+                Shot("context-menu-dark"),
+                CloseMenu,
+                Wait(8),
                 Tab(View::Cleanup),
                 Wait(16),
                 Shot("cleanup-dark"),
+                WaitGit,
+                Filter(Some(Category::GitWorktree)),
+                Wait(14),
+                Shot("worktrees-dark"),
+                Filter(None),
                 Settings(true),
                 Wait(20),
                 Shot("settings-dark"),
@@ -772,6 +800,38 @@ pub fn advance(app: &mut RillApp, ctx: &egui::Context) {
                     pressed: false,
                     modifiers: Default::default(),
                 });
+            }
+        }
+        Step::Menu(target) => {
+            if let Some(pos) = position(app, ctx, target) {
+                tour.pointer = pos;
+                app.injected.push(egui::Event::PointerMoved(pos));
+                for pressed in [true, false] {
+                    app.injected.push(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Secondary,
+                        pressed,
+                        modifiers: Default::default(),
+                    });
+                }
+            }
+        }
+        Step::CloseMenu => {
+            for pressed in [true, false] {
+                app.injected.push(egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed,
+                    repeat: false,
+                    modifiers: Default::default(),
+                });
+            }
+        }
+        Step::Filter(category) => app.category_filter = category,
+        Step::WaitGit => {
+            if !app.git_settled() {
+                app.tour = Some(tour);
+                return;
             }
         }
         Step::Tab(tab) => app.tab = tab,

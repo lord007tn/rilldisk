@@ -9,6 +9,7 @@ mod cleanup_ui;
 mod elevation;
 mod icons;
 mod live;
+mod reveal;
 mod settings;
 mod style;
 mod sunburst;

@@ -19,9 +19,9 @@ pub const PARENT_BUTTON: &str = "parent-button";
 /// Hit id of the control that opens the hidden levels.
 pub const MORE_LEVELS: usize = usize::MAX;
 
-const ROW: f32 = 34.0;
+const ROW: f32 = 36.0;
 const TRAIL_ROW: f32 = 30.0;
-const CURRENT_ROW: f32 = 48.0;
+const CURRENT_ROW: f32 = 54.0;
 const INDENT: f32 = 14.0;
 const CRUMB_MAX: f32 = 200.0;
 const CRUMB_GAP: f32 = 12.0;
@@ -50,6 +50,8 @@ pub struct Row {
     pub id: usize,
     pub name: String,
     pub size: String,
+    /// Share of the current folder, 0..1, drawn as a faint bar.
+    pub share: f32,
     pub folder: bool,
     pub dot: Color32,
     /// Cleanup safety color, for folders that can be reclaimed.
@@ -420,7 +422,8 @@ pub fn panel(
         result.notice_clicked = response.on_hover_text(&notice.text).clicked();
     }
     ui.add_space(2.0);
-    let indent = 8.0 + (depth + 1.0) * INDENT;
+    // Children line up with the open folder's name: the trail above is the tree.
+    let indent = 8.0 + depth * INDENT;
     let list = ui.available_rect_before_wrap();
     let folder = spec.places.last().map_or(0, |p| p.id);
     let offset_id = egui::Id::unique(("folder-panel-offset", folder));
@@ -472,15 +475,6 @@ pub fn panel(
     result
 }
 
-fn elbow(ui: &Ui, rect: Rect, x: f32) {
-    let line = Stroke::new(1.0, style::alpha(t().faint, 110));
-    let y = rect.center().y;
-    ui.painter()
-        .line_segment([pos2(x, rect.top()), pos2(x, y)], line);
-    ui.painter()
-        .line_segment([pos2(x, y), pos2(x + 7.0, y)], line);
-}
-
 fn trail_row(
     ui: &mut Ui,
     depth: f32,
@@ -495,29 +489,33 @@ fn trail_row(
     response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, name));
     let p = ui.painter();
     w::row_fill(p, rect.shrink2(vec2(2.0, 1.0)), response.hovered(), false);
-    let left = rect.left() + 8.0 + depth * INDENT;
-    if depth > 0.0 {
-        elbow(ui, rect, left - INDENT + 7.0);
-    }
-    let tile = Rect::from_center_size(pos2(left + 8.0, rect.center().y), vec2(15.0, 15.0));
-    icons::paint(p, tile, icon, th.dim);
-    let size = p.layout_no_wrap(size.to_string(), style::regular(12.0), th.dim);
+    let left = rect.left() + 10.0 + depth * INDENT;
+    let tile = Rect::from_center_size(pos2(left + 7.0, rect.center().y), vec2(14.0, 14.0));
+    let tint = if response.hovered() { th.dim } else { th.faint };
+    icons::paint(p, tile, icon, tint);
+    let size = p.layout_no_wrap(size.to_string(), style::regular(11.5), th.faint);
     let right = rect.right() - 12.0;
     p.galley(
         pos2(right - size.size().x, rect.center().y - size.size().y / 2.0),
         size.clone(),
-        th.dim,
+        th.faint,
     );
-    let color = if collapsed { th.faint } else { th.dim };
+    let color = if collapsed {
+        th.faint
+    } else if response.hovered() {
+        th.text
+    } else {
+        th.dim
+    };
     let name = w::fit(
         p,
         name.to_string(),
-        style::regular(13.0),
+        style::regular(12.5),
         color,
-        right - size.size().x - tile.right() - 16.0,
+        right - size.size().x - tile.right() - 18.0,
     );
     p.galley(
-        pos2(tile.right() + 8.0, rect.center().y - name.size().y / 2.0),
+        pos2(tile.right() + 9.0, rect.center().y - name.size().y / 2.0),
         name,
         color,
     );
@@ -530,54 +528,33 @@ fn current_row(ui: &mut Ui, depth: f32, place: &Place, summary: &str) {
     let (rect, response) =
         ui.allocate_exact_size(vec2(ui.available_width(), CURRENT_ROW), Sense::hover());
     let p = ui.painter();
-    let fill = rect.shrink2(vec2(2.0, 1.0));
+    let fill = rect.shrink2(vec2(2.0, 2.0));
     p.rect_filled(
         fill,
-        10,
-        style::alpha(th.accent, if th.dark { 46 } else { 30 }),
-    );
-    p.rect_filled(
-        Rect::from_min_size(
-            fill.left_top() + vec2(0.0, 9.0),
-            vec2(3.0, fill.height() - 18.0),
-        ),
-        2,
-        th.accent,
+        12,
+        style::alpha(th.accent, if th.dark { 30 } else { 22 }),
     );
     let left = rect.left() + 8.0 + depth * INDENT;
-    if depth > 0.0 {
-        elbow(ui, rect, left - INDENT + 7.0);
-    }
-    icons::paint(
-        p,
-        Rect::from_center_size(pos2(left + 8.0, rect.top() + 16.0), vec2(16.0, 16.0)),
-        Icon::Folder,
-        th.accent,
+    let tile = Rect::from_min_size(pos2(left, fill.center().y - 15.0), vec2(30.0, 30.0));
+    p.rect_filled(
+        tile,
+        9,
+        style::alpha(th.accent, if th.dark { 54 } else { 40 }),
     );
+    icons::paint(p, tile.shrink(8.0), Icon::Folder, th.accent);
     let right = rect.right() - 12.0;
     let size = p.layout_no_wrap(place.size.clone(), style::semibold(14.0), th.text);
     p.galley(
-        pos2(right - size.size().x, rect.top() + 7.0),
+        pos2(right - size.size().x, fill.center().y - size.size().y / 2.0),
         size.clone(),
         th.text,
     );
-    let text_left = left + 24.0;
-    let name = w::fit(
-        p,
-        place.name.clone(),
-        style::semibold(14.0),
-        th.text,
-        right - size.size().x - text_left - 8.0,
-    );
-    p.galley(pos2(text_left, rect.top() + 6.0), name, th.text);
-    let line = w::fit(
-        p,
-        summary.to_string(),
-        style::regular(11.5),
-        th.dim,
-        right - text_left,
-    );
-    p.galley(pos2(text_left, rect.top() + 26.0), line, th.dim);
+    let text_left = tile.right() + 10.0;
+    let room = right - size.size().x - text_left - 10.0;
+    let name = w::fit(p, place.name.clone(), style::semibold(14.0), th.text, room);
+    p.galley(pos2(text_left, fill.top() + 8.0), name, th.text);
+    let line = w::fit(p, summary.to_string(), style::regular(11.5), th.dim, room);
+    p.galley(pos2(text_left, fill.top() + 27.0), line, th.dim);
     response.on_hover_text(&place.detail);
 }
 
@@ -591,27 +568,32 @@ fn child_row(ui: &mut Ui, row: &Row, indent: f32, selected: bool, highlighted: b
         egui::WidgetInfo::labeled(egui::Role::Button, true, label)
     });
     let p = ui.painter();
-    w::row_fill(
-        p,
-        rect.shrink2(vec2(2.0, 1.0)),
-        response.hovered() || highlighted,
-        selected,
+    let hovered = response.hovered() || highlighted;
+    w::row_fill(p, rect.shrink2(vec2(2.0, 1.0)), hovered, selected);
+    // Folders: a filled swatch in their chart color. Files: an outlined one.
+    let swatch = Rect::from_center_size(
+        pos2(rect.left() + indent + 15.0, rect.center().y),
+        vec2(10.0, 10.0),
     );
-    let guide = rect.left() + indent - INDENT + 7.0;
-    p.line_segment(
-        [pos2(guide, rect.top()), pos2(guide, rect.bottom())],
-        Stroke::new(1.0, style::alpha(th.faint, 70)),
-    );
-    let dot = pos2(rect.left() + indent + 8.0, rect.center().y);
     if row.folder {
-        p.circle_filled(dot, 5.0, row.dot);
+        p.rect_filled(swatch, 3, row.dot);
     } else {
-        p.circle_stroke(dot, 4.0, Stroke::new(2.0, row.dot));
+        p.rect_stroke(
+            swatch.shrink(0.75),
+            3,
+            Stroke::new(1.5, row.dot),
+            egui::StrokeKind::Inside,
+        );
     }
     let mut right = rect.right() - 10.0;
     if row.folder {
         let chevron = Rect::from_center_size(pos2(right - 5.0, rect.center().y), vec2(10.0, 10.0));
-        icons::paint(p, chevron, Icon::Chevron, th.faint);
+        icons::paint(
+            p,
+            chevron,
+            Icon::Chevron,
+            if hovered { th.dim } else { th.faint },
+        );
     }
     right -= 18.0;
     let size = p.layout_no_wrap(row.size.clone(), style::semibold(12.5), th.text);
@@ -620,6 +602,7 @@ fn child_row(ui: &mut Ui, row: &Row, indent: f32, selected: bool, highlighted: b
         size.clone(),
         th.text,
     );
+    let bar_right = right;
     right -= size.size().x + 10.0;
     if row.partial {
         let badge = p.layout_no_wrap("partial".to_string(), style::regular(11.0), th.warn);
@@ -637,7 +620,7 @@ fn child_row(ui: &mut Ui, row: &Row, indent: f32, selected: bool, highlighted: b
         p.circle_filled(pos2(right - 3.0, rect.center().y), 3.0, color);
         right -= 14.0;
     }
-    let left = dot.x + 14.0;
+    let left = swatch.right() + 10.0;
     let name = w::fit(
         p,
         row.name.clone(),
@@ -646,10 +629,29 @@ fn child_row(ui: &mut Ui, row: &Row, indent: f32, selected: bool, highlighted: b
         right - left,
     );
     p.galley(
-        pos2(left, rect.center().y - name.size().y / 2.0),
+        pos2(left, rect.center().y - name.size().y / 2.0 - 1.0),
         name,
         th.text,
     );
+    // How much of this folder the row holds, as a hairline under the name.
+    let share = row.share.clamp(0.0, 1.0);
+    let track = Rect::from_min_max(
+        pos2(left, rect.bottom() - 7.0),
+        pos2(bar_right, rect.bottom() - 5.0),
+    );
+    p.rect_filled(
+        track,
+        1,
+        style::alpha(th.faint, if th.dark { 26 } else { 34 }),
+    );
+    if share > 0.0 {
+        let bar = Rect::from_min_size(track.min, vec2((track.width() * share).max(2.0), 2.0));
+        p.rect_filled(
+            bar,
+            1,
+            style::alpha(row.dot, if th.dark { 170 } else { 210 }),
+        );
+    }
     response.on_hover_text(&row.tip)
 }
 

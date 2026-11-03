@@ -982,6 +982,7 @@ mod tests {
             issues,
             cancelled: false,
             complete: false,
+            entry_limit_reached: false,
             elevated: false,
         }
     }

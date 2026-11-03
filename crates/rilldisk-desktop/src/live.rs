@@ -373,9 +373,16 @@ pub fn paint(
         hovered: hovered_top,
         reveal,
     };
+    let total = view
+        .folders
+        .iter()
+        .map(|f| value(f, allocated))
+        .sum::<u64>()
+        .max(1);
     let row = |index: usize| {
         let folder = &view.folders[index];
         nav::Row {
+            share: value(folder, allocated) as f32 / total as f32,
             id: folder.id,
             name: folder.name.clone(),
             size: style::bytes(value(folder, allocated)),
