@@ -797,10 +797,35 @@ impl ReclaimReport {
                 .flat_map(|handle| handle.join().unwrap_or_default())
                 .collect()
         });
+        self.attach_git(reports, now_unix_ms, stale_days);
+    }
+
+    /// Attach Git reports. Every linked worktree ends up with one: a worktree whose
+    /// check did not finish gets an explicit unknown verdict, never none.
+    fn attach_git(
+        &mut self,
+        reports: Vec<(usize, crate::git::GitReport)>,
+        now_unix_ms: u64,
+        stale_days: u64,
+    ) {
         for (i, report) in reports {
-            let candidate = &mut self.candidates[i];
+            self.candidates[i].git = Some(report);
+        }
+        for candidate in self
+            .candidates
+            .iter_mut()
+            .filter(|c| c.is_linked_worktree())
+        {
+            let report = candidate.git.get_or_insert_with(|| {
+                crate::git::GitReport::new(
+                    Err("the Git check did not finish".into()),
+                    &candidate.path,
+                    candidate.newest_modified_unix_ms,
+                    now_unix_ms,
+                    stale_days,
+                )
+            });
             candidate.suggested_action = report.suggested_action.clone();
-            candidate.git = Some(report);
         }
     }
 
@@ -1468,5 +1493,40 @@ mod tests {
     fn recognizes_drive_roots_only() {
         assert!(volume_root_path(Path::new(r"D:\")));
         assert!(!volume_root_path(Path::new(r"D:\Projects")));
+    }
+
+    /// A worktree whose Git check produced no report (a failed worker) is marked
+    /// unknown, never left without a verdict; other candidates are untouched.
+    #[test]
+    fn a_missing_git_report_becomes_unknown() {
+        use crate::git::Verdict;
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::simplify(dir.path().canonicalize().unwrap());
+        std::fs::create_dir_all(root.join("wt/feature")).unwrap();
+        std::fs::write(root.join("wt/feature/.git"), "gitdir: /nowhere\n").unwrap();
+        std::fs::create_dir_all(root.join("py/pkg/__pycache__")).unwrap();
+        std::fs::write(root.join("py/pkg/__pycache__/m.pyc"), [0_u8; 900]).unwrap();
+        let snapshot =
+            crate::scan(&root, crate::ScanOptions::default(), Default::default()).unwrap();
+        let mut report = super::find_reclaimable(&snapshot, 0);
+        report.attach_git(Vec::new(), 0, 14);
+        let worktree = report
+            .candidates
+            .iter()
+            .find(|c| c.is_linked_worktree())
+            .unwrap();
+        let git = worktree
+            .git
+            .as_ref()
+            .expect("a report for every linked worktree");
+        assert_eq!(git.verdict, Verdict::Unknown);
+        assert!(git.error.as_deref().unwrap().contains("did not finish"));
+        assert!(!git.verdict.no_reported_loss());
+        let cache = report
+            .candidates
+            .iter()
+            .find(|c| !c.is_linked_worktree())
+            .unwrap();
+        assert!(cache.git.is_none());
     }
 }

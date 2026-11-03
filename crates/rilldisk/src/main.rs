@@ -375,7 +375,7 @@ async fn main() -> Result<ExitCode> {
                 if git {
                     report.inspect_git(now_ms(), stale_days);
                     let before = report.candidates.len();
-                    report.retain(|c| c.git.as_ref().is_none_or(|g| g.verdict.no_reported_loss()));
+                    report.retain(git_allows_removal);
                     let kept = before - report.candidates.len();
                     if kept > 0 {
                         eprintln!(
@@ -880,9 +880,83 @@ pub(crate) fn human(bytes: u64) -> String {
     format!("{size:.1} {}", UNITS[unit])
 }
 
+/// `reclaim --git --delete`: a linked worktree stays only with a Git report that
+/// shows no Git-reported loss; a missing report counts as unchecked. Other
+/// candidates are not Git's business.
+fn git_allows_removal(candidate: &rilldisk_core::Candidate) -> bool {
+    !candidate.is_linked_worktree()
+        || candidate
+            .git
+            .as_ref()
+            .is_some_and(|g| g.verdict.no_reported_loss())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_delete_keeps_linked_worktrees_only_with_a_clean_report() {
+        use rilldisk_core::{Candidate, Category, git};
+        let candidate = |category, label| Candidate {
+            entry_id: 1,
+            path: "/w/feature".into(),
+            category,
+            safety: Safety::Review,
+            label,
+            agent: None,
+            reason: String::new(),
+            suggested_action: String::new(),
+            logical_bytes: 0,
+            unique_logical_bytes: 0,
+            allocated_bytes: None,
+            file_count: 0,
+            exclusive_bytes: 0,
+            shared_bytes: 0,
+            newest_modified_unix_ms: None,
+            idle_days: None,
+            nested_in: None,
+            git: None,
+            identity: None,
+        };
+        let report = |state: Result<git::GitState, String>| {
+            Some(git::GitReport::new(
+                state,
+                std::path::Path::new("/w/feature"),
+                Some(0),
+                40 * 86_400_000,
+                14,
+            ))
+        };
+        let mut worktree = candidate(Category::GitWorktree, "Git worktree");
+        assert!(
+            !git_allows_removal(&worktree),
+            "no report: unchecked, never allowed"
+        );
+        worktree.git = report(Err("the Git check did not finish".into()));
+        assert!(!git_allows_removal(&worktree), "unknown");
+        worktree.git = report(Ok(git::GitState {
+            untracked_items: 1,
+            head_commit_unix_ms: Some(0),
+            ..Default::default()
+        }));
+        assert!(!git_allows_removal(&worktree), "untracked work");
+        worktree.git = report(Ok(git::GitState {
+            branch: Some("main".into()),
+            head_commit_unix_ms: Some(0),
+            ..Default::default()
+        }));
+        assert!(git_allows_removal(&worktree), "no Git-reported changes");
+        // Not linked worktrees: Git has no say.
+        assert!(git_allows_removal(&candidate(
+            Category::BuildOutput,
+            "Rust build output"
+        )));
+        assert!(git_allows_removal(&candidate(
+            Category::GitWorktree,
+            "Orphaned agent worktree"
+        )));
+    }
 
     #[test]
     fn rerun_command_quotes_for_a_shell() {
