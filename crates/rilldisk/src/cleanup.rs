@@ -120,9 +120,10 @@ pub fn run(
         }
         writeln!(
             err,
-            "{} folders, {} files, frees at least {}{}.",
+            "{} folders, {} files, frees {} {} on disk{}.",
             plan.items.len(),
             plan.total_files,
+            crate::floor_word(report),
             human(plan.total_exclusive_bytes),
             if mode == CleanupMode::Trash {
                 format!(" once the {} is emptied", CleanupMode::trash_name())
@@ -186,7 +187,8 @@ pub fn run(
         };
         writeln!(
             writer,
-            "{verb}; frees at least {}{}. {} failed, {} skipped{}.",
+            "{verb}; frees {} {} on disk{}. {} failed, {} skipped{}.",
+            crate::floor_word(report),
             human(result.freed_bytes),
             if mode == CleanupMode::Trash {
                 " once it is emptied"

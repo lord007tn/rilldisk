@@ -149,7 +149,10 @@ contents are read and nothing is modified.
 ## Cleanup
 
 `rilldisk-core::cleanup` is the only code that changes the filesystem
-([scope and threat model](proposals/cleanup.md)). `plan` turns selected entry
+([scope and threat model](proposals/cleanup.md)). `rilldisk-core::git` reads
+worktree state with the user's `git`, read-only
+([scope](proposals/git-inspection.md)); cleanup asks it again before removing a
+Git-checked worktree, and compares each folder's recorded identity. `plan` turns selected entry
 IDs into the outermost reclaim candidates of the current report and refuses
 anything else (non-candidates, the scan root, Trash folders, volume roots, the
 home, temp and system folders and their ancestors, folders holding the running

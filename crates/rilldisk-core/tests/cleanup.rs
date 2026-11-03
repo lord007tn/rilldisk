@@ -186,6 +186,8 @@ fn fake_candidate(snapshot: &Snapshot, id: usize, category: Category) -> Candida
         newest_modified_unix_ms: None,
         idle_days: None,
         nested_in: None,
+        git: None,
+        identity: None,
     }
 }
 
@@ -302,6 +304,41 @@ fn refuses_a_candidate_whose_parent_became_a_link() {
         "{result:#?}"
     );
     assert!(elsewhere.path().join("target/keep.bin").exists());
+}
+
+#[test]
+fn refuses_a_different_folder_created_at_a_candidate_path_after_the_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture(dir.path());
+    let (snapshot, report) = analyze(&root);
+    let target = id_of(&report, &root.join("app/target"));
+    // The scanned folder moves away and an ordinary folder takes its name: same
+    // path, still a real directory, no link anywhere.
+    fs::rename(root.join("app/target"), root.join("app/target-moved")).unwrap();
+    write(&root.join("app/target/precious.txt"), 10);
+    let mut removed = Vec::new();
+    let result = cleanup::execute_with(
+        &snapshot,
+        &report,
+        &[target],
+        CleanupMode::Permanent,
+        &Guard::system(),
+        &CleanupControl::default(),
+        &mut |path, _| {
+            removed.push(path.to_path_buf());
+            Ok(())
+        },
+    );
+    assert!(
+        removed.is_empty(),
+        "the replacement folder reached the remover"
+    );
+    assert!(
+        refusal(&result).contains("not the folder that was scanned"),
+        "{}",
+        refusal(&result)
+    );
+    assert!(root.join("app/target/precious.txt").exists());
 }
 
 #[test]

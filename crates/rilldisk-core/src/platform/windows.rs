@@ -744,18 +744,26 @@ fn emit_mft(
     let whole_volume = root_record == mft::ROOT_RECORD;
     // While the table is read, show volume-wide counts (exact only for a whole
     // volume); the exact count restarts when entries are produced.
-    let progress = |files: u64, folders: u64| {
+    let progress = |files: u64, folders: u64, records: u64| {
+        control.mft_read.fetch_add(records, Ordering::Relaxed);
         if whole_volume {
             control.files.fetch_add(files, Ordering::Relaxed);
             control.directories.fetch_add(folders, Ordering::Relaxed);
         }
     };
+    let total = |records: u64| control.mft_total.store(records, Ordering::Relaxed);
     let mut phase = std::time::Instant::now();
     // Parsing needs ~90 bytes per record whatever the scan keeps, so the entry
     // limit (the memory bound) also bounds the table this backend will read.
     let max_entries = control.remaining_entries.load(Ordering::Relaxed) as u64 + 1;
     let max_records = max_entries.saturating_mul(2);
-    let table = match mft::Mft::read(source, max_records, &|| control.should_stop(), &progress) {
+    let table = match mft::Mft::read(
+        source,
+        max_records,
+        &|| control.should_stop(),
+        &total,
+        &progress,
+    ) {
         Err(error) if error.kind() == io::ErrorKind::Interrupted && control.should_stop() => {
             return Ok(());
         }
@@ -763,6 +771,7 @@ fn emit_mft(
     };
     control.files.store(0, Ordering::Relaxed);
     control.directories.store(1, Ordering::Relaxed);
+    control.mft_building.store(true, Ordering::Relaxed);
     let unit = unit.or(Some(table.cluster));
     table
         .slots

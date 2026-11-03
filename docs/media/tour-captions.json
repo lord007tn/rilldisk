@@ -1,0 +1,11 @@
+[
+  {"frame": 1, "text": "A synthetic demo disk with fictional paths, scanned by RillDisk 0.1.3"},
+  {"frame": 81, "text": "Size counts every byte; Clean up counts what removal would actually free"},
+  {"frame": 166, "text": "Git worktrees: four found, with their size and what removing them frees"},
+  {"frame": 253, "text": "Each worktree is checked with your own Git, read-only"},
+  {"frame": 345, "text": "118 days idle, yet Git reports an uncommitted edit: it stays Review first"},
+  {"frame": 436, "text": "A commit that exists only on a detached HEAD would be lost: kept"},
+  {"frame": 521, "text": "Bulk select ticks only worktrees with no Git-reported changes and no recent work"},
+  {"frame": 589, "text": "Removal asks first, uses the Recycle Bin, and checks Git again right before each worktree"},
+  {"frame": 690, "text": "Right-click any folder: Show in Explorer, copy its path, or scan just that folder"}
+]

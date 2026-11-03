@@ -17,6 +17,7 @@ use rayon::prelude::*;
 use serde::{Serialize, Serializer, ser::SerializeStruct};
 
 pub mod cleanup;
+pub mod git;
 mod live;
 mod platform;
 mod reclaim;
@@ -244,6 +245,9 @@ pub struct Summary {
     pub issues: Vec<ScanIssue>,
     pub cancelled: bool,
     pub complete: bool,
+    /// The scan stopped at its entry limit (`ScanOptions::max_entries`): some
+    /// folders were not read. Set even when the issue list is full.
+    pub entry_limit_reached: bool,
     /// The scanning process was elevated (administrator or root).
     pub elevated: bool,
 }
@@ -359,6 +363,21 @@ pub struct ScanControl {
     live: std::sync::Mutex<Option<Arc<LiveView>>>,
     live_focus: AtomicUsize,
     backend_status: std::sync::Mutex<String>,
+    /// NTFS table scans: records read so far and in total (0 for other scans).
+    mft_read: AtomicU64,
+    mft_total: AtomicU64,
+    /// The table is read; folders are being built from it.
+    mft_building: AtomicBool,
+}
+
+/// Where an NTFS table (MFT) scan is, for progress displays. The table is read in
+/// one pass before any folder exists, so this is the only progress until then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MftProgress {
+    pub records_read: u64,
+    pub records_total: u64,
+    /// Reading is done and folders are being built.
+    pub building: bool,
 }
 
 impl ScanControl {
@@ -389,6 +408,16 @@ impl ScanControl {
         self.live_focus.load(Ordering::Relaxed)
     }
     /// Partial totals below the requested directory, refreshed during scanning.
+    /// Progress of an NTFS table scan, if this is one.
+    pub fn mft_progress(&self) -> Option<MftProgress> {
+        let total = self.mft_total.load(Ordering::Relaxed);
+        (total > 0).then(|| MftProgress {
+            records_read: self.mft_read.load(Ordering::Relaxed).min(total),
+            records_total: total,
+            building: self.mft_building.load(Ordering::Relaxed),
+        })
+    }
+
     pub fn live(&self) -> Option<Arc<LiveView>> {
         self.live.lock().ok().and_then(|slot| slot.clone())
     }
@@ -863,6 +892,7 @@ impl Collector {
             issues: Vec::new(),
             cancelled: false,
             complete: true,
+            entry_limit_reached: false,
             elevated: is_elevated(),
         };
         let entry = Entry {
@@ -1168,6 +1198,7 @@ fn finish(
     drop(links);
     // Report the memory bound once rather than once per truncated directory.
     if control.limit_reached.load(Ordering::Relaxed) {
+        summary.entry_limit_reached = true;
         let path = summary.root.clone();
         add_issue(
             &mut summary,
@@ -1508,5 +1539,29 @@ impl Snapshot {
                 .take(limit.min(500))
                 .collect(),
         )
+    }
+}
+
+#[cfg(test)]
+mod mft_progress_tests {
+    use super::{MftProgress, ScanControl};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn only_table_scans_report_table_progress() {
+        let control = ScanControl::default();
+        assert_eq!(control.mft_progress(), None);
+        control.mft_total.store(100, Ordering::Relaxed);
+        control.mft_read.store(150, Ordering::Relaxed);
+        assert_eq!(
+            control.mft_progress(),
+            Some(MftProgress {
+                records_read: 100,
+                records_total: 100,
+                building: false
+            })
+        );
+        control.mft_building.store(true, Ordering::Relaxed);
+        assert!(control.mft_progress().unwrap().building);
     }
 }

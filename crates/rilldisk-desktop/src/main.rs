@@ -9,6 +9,7 @@ mod cleanup_ui;
 mod elevation;
 mod icons;
 mod live;
+mod reveal;
 mod settings;
 mod style;
 mod sunburst;
@@ -89,7 +90,7 @@ fn main() -> eframe::Result {
             "--help" | "-h" => {
                 attach_console();
                 println!(
-                    "rilldisk-desktop [PATH] [--theme light|dark] [--palette tide|moss|aurora] [--size WIDTHxHEIGHT] [--capture DIR [--tour issues|navigation|updates]] [--capture-cleanup DIR]\n\nOpens the RillDisk desktop app. PATH starts a scan immediately.\n--capture runs a scripted tour and saves screenshots to DIR (development).\n--capture-cleanup captures the cleanup dialogs; it only removes folders from a synthetic fixture.\n--version prints the version."
+                    "rilldisk-desktop [PATH] [--theme light|dark] [--palette tide|moss|aurora] [--size WIDTHxHEIGHT] [--capture DIR [--tour issues|navigation|video|updates]] [--capture-cleanup DIR]\n\nOpens the RillDisk desktop app. PATH starts a scan immediately.\n--capture runs a scripted tour and saves screenshots to DIR (development).\n--capture-cleanup captures the cleanup dialogs; it only removes folders from a synthetic fixture.\n--version prints the version."
                 );
                 return Ok(());
             }
@@ -102,6 +103,7 @@ fn main() -> eframe::Result {
         }
     }
     let navigation_tour = tour_name.as_deref() == Some("navigation");
+    let video_tour = tour_name.as_deref() == Some("video");
     let updates_tour = tour_name.as_deref() == Some("updates");
     let issues_tour = match tour_name.as_deref() {
         None => false,
@@ -111,7 +113,9 @@ fn main() -> eframe::Result {
             return Ok(());
         }
         Some("updates") if matches!(capture, Some((_, Capture::Tour))) => false,
-        Some("navigation") if path.is_some() && matches!(capture, Some((_, Capture::Tour))) => {
+        Some("navigation" | "video")
+            if path.is_some() && matches!(capture, Some((_, Capture::Tour))) =>
+        {
             false
         }
         // Named tours replace the --capture tour only; --capture-live and
@@ -133,7 +137,7 @@ fn main() -> eframe::Result {
         Some(other) => {
             attach_console();
             eprintln!(
-                "invalid --tour {other}; use `issues` or `navigation` with PATH --capture DIR, or `updates` with --capture DIR."
+                "invalid --tour {other}; use `issues`, `navigation` or `video` with PATH --capture DIR, or `updates` with --capture DIR."
             );
             return Ok(());
         }
@@ -144,6 +148,7 @@ fn main() -> eframe::Result {
         }
         let kind = match (path.is_none(), mode) {
             (false, Capture::Tour) if navigation_tour => return capture::Tour::navigation(dir),
+            (false, Capture::Tour) if video_tour => return capture::Tour::video(dir),
             (_, Capture::Cleanup) => return capture::Tour::cleanup(dir),
             (true, _) => capture::TourKind::Welcome,
             (false, _) if issues_tour => capture::TourKind::Issues,

@@ -784,15 +784,17 @@ pub(crate) struct Mft {
 }
 
 impl Mft {
-    /// Read and index every record. `stop` is polled between blocks; `progress`
-    /// receives the files and folders found in each block.
+    /// Read and index every record. `stop` is polled between blocks; `total`
+    /// receives the record count before reading; `progress` receives the files,
+    /// folders and records of each block.
     /// Tables with more than `max_records` records are refused before anything
     /// is allocated for them (parsing needs ~90 bytes per record).
     pub(crate) fn read(
         source: &dyn ReadAt,
         max_records: u64,
         stop: &(dyn Fn() -> bool + Sync),
-        progress: &(dyn Fn(u64, u64) + Sync),
+        total: &dyn Fn(u64),
+        progress: &(dyn Fn(u64, u64, u64) + Sync),
     ) -> io::Result<Self> {
         let alignment = source.alignment();
         let mut boot = Aligned::new(4096, alignment);
@@ -810,6 +812,7 @@ impl Mft {
                  ({max_records}); raise --max-entries or scan with --backend dir"
             )));
         }
+        total(records);
         let unit = geometry.record.max(geometry.cluster);
         let chunk_bytes = CHUNK_BYTES.div_ceil(unit) * unit;
         let per_chunk = (chunk_bytes / geometry.record) as usize;
@@ -849,7 +852,7 @@ impl Mft {
                             }
                         }
                     }
-                    progress(files, folders);
+                    progress(files, folders, slots.len() as u64);
                     Ok(chunk)
                 })
             })

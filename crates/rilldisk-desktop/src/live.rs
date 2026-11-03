@@ -162,6 +162,7 @@ pub fn paint(
     places: &[nav::Place],
     anim: &mut Anim,
     allocated: bool,
+    waiting: &str,
 ) -> Option<usize> {
     let mut clicked = None;
     let th = t();
@@ -189,7 +190,7 @@ pub fn paint(
         p.text(
             map_rect.center(),
             Align2::CENTER_CENTER,
-            "Reading the first folders…",
+            waiting,
             style::regular(13.0),
             th.faint,
         );
@@ -373,9 +374,16 @@ pub fn paint(
         hovered: hovered_top,
         reveal,
     };
+    let total = view
+        .folders
+        .iter()
+        .map(|f| value(f, allocated))
+        .sum::<u64>()
+        .max(1);
     let row = |index: usize| {
         let folder = &view.folders[index];
         nav::Row {
+            share: value(folder, allocated) as f32 / total as f32,
             id: folder.id,
             name: folder.name.clone(),
             size: style::bytes(value(folder, allocated)),
@@ -546,6 +554,7 @@ mod tests {
                     &places,
                     &mut anim,
                     false,
+                    "",
                 )
                 .or(opened);
             })
@@ -597,6 +606,7 @@ mod tests {
                     &places,
                     &mut anim,
                     false,
+                    "",
                 )
                 .or(selected);
             })

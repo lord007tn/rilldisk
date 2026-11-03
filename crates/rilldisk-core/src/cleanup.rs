@@ -11,6 +11,11 @@
 //!   junction or other reparse point at the path or above it), must not be a
 //!   volume root or mount point, the scan root, the home folder, a system or
 //!   temp folder, or hold the running program.
+//! * The folder must be the one the scan found ([`FolderId`]): a different folder
+//!   created at the same path since is refused.
+//! * A linked Git worktree that carried a Git verdict is checked with Git again
+//!   right before removal and refused unless nothing would be lost
+//!   (`docs/proposals/git-inspection.md`).
 //! * The default mode moves items to the Recycle Bin / Trash. Permanent
 //!   deletion is an explicit opt-in.
 //! * Callers must ask the user first; this module does no prompting.
@@ -61,6 +66,14 @@ pub struct PlanItem {
     /// Space removal frees, counting hard links found in the scan.
     pub exclusive_bytes: u64,
     pub file_count: u64,
+    /// Set when the candidate carried a Git verdict: Git is asked again right
+    /// before removal and the item is refused unless nothing would be lost.
+    /// `None` is the explicit, unchecked path (Git checks off or not requested).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git: Option<crate::git::GitExpectation>,
+    /// The folder as found by the scan; see [`FolderId`].
+    #[serde(skip)]
+    pub identity: Option<FolderId>,
 }
 
 /// A requested item that will not be touched, and why.
@@ -438,6 +451,11 @@ pub fn plan(
             logical_bytes: c.logical_bytes,
             exclusive_bytes: c.exclusive_bytes,
             file_count: c.file_count,
+            git: c.git.as_ref().map(|report| crate::git::GitExpectation {
+                newest_file_ms: c.newest_modified_unix_ms,
+                ..report.into()
+            }),
+            identity: c.identity,
         })
         .collect();
     CleanupPlan {
@@ -502,7 +520,14 @@ pub fn execute_with(
         if let Ok(mut current) = control.current.lock() {
             current.clone_from(&item.path);
         }
-        let outcome = match live_refusal(&item.path, guard) {
+        let refusal = live_refusal(&item.path, guard)
+            .or_else(|| replaced(&item.path, item.identity))
+            .or_else(|| {
+                // Git-checked worktrees: a verdict from the scan may be stale by now.
+                let expected = item.git.as_ref()?;
+                crate::git::recheck(&item.path, expected, now_ms())
+            });
+        let outcome = match refusal {
             Some(reason) => Outcome::Refused { reason },
             None => match remover(&item.path, mode) {
                 Ok(()) => Outcome::Removed {
@@ -542,7 +567,7 @@ pub fn execute_with(
         .count();
     if worktrees > 0 {
         follow_ups.push(format!(
-            "{worktrees} Git worktree folder(s) removed. Their repositories still list them: once you are sure you will not restore them{}, run `git worktree prune` in each original repository. RillDisk does not run Git.",
+            "{worktrees} Git worktree folder(s) removed. Their repositories still list them: once you are sure you will not restore them{}, run `git worktree prune` in each original repository. RillDisk never changes a repository.",
             if mode == CleanupMode::Trash {
                 format!(" from the {}", CleanupMode::trash_name())
             } else {
@@ -574,6 +599,93 @@ pub fn execute_with(
         refused: plan.refused,
         cancelled,
         follow_ups,
+    }
+}
+
+/// A different folder now at the path, or one that cannot be told apart.
+fn replaced(path: &Path, scanned: Option<FolderId>) -> Option<String> {
+    let Some(scanned) = scanned else {
+        return Some("could not be identified when it was scanned, so it is not removed".into());
+    };
+    match folder_identity(path) {
+        Some(now) if now == scanned => None,
+        Some(_) => Some(
+            "is not the folder that was scanned: something else was created at this path since; rescan".into(),
+        ),
+        None => Some("cannot be identified now, so it is not removed".into()),
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// Which folder a path names, independent of its spelling: volume and file ID on
+/// Windows, device and inode elsewhere. Recorded when candidates are found and
+/// compared right before removal, so a different folder created at the same
+/// path after the scan is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FolderId([u64; 3]);
+
+/// The identity of the folder at `path` itself (a link is not followed).
+pub fn folder_identity(path: &Path) -> Option<FolderId> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+        use windows_sys::Win32::Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, FILE_ID_INFO, FileIdInfo, GetFileInformationByHandle,
+            GetFileInformationByHandleEx,
+        };
+        const FILE_READ_ATTRIBUTES: u32 = 0x80;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        let file = std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(7)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .ok()?;
+        let handle = file.as_raw_handle();
+        // SAFETY: `handle` is open for the duration of both calls and each buffer
+        // matches the size passed for its information class.
+        unsafe {
+            let mut info: FILE_ID_INFO = std::mem::zeroed();
+            if GetFileInformationByHandleEx(
+                handle,
+                FileIdInfo,
+                (&mut info as *mut FILE_ID_INFO).cast(),
+                std::mem::size_of::<FILE_ID_INFO>() as u32,
+            ) != 0
+            {
+                let id = info.FileId.Identifier;
+                let low = u64::from_le_bytes(id[..8].try_into().ok()?);
+                let high = u64::from_le_bytes(id[8..].try_into().ok()?);
+                return Some(FolderId([info.VolumeSerialNumber, low, high]));
+            }
+            // Older systems: the 64-bit index, unique on NTFS.
+            let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+            if GetFileInformationByHandle(handle, &mut info) == 0 {
+                return None;
+            }
+            Some(FolderId([
+                u64::from(info.dwVolumeSerialNumber),
+                (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+                0,
+            ]))
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        Some(FolderId([metadata.dev(), metadata.ino(), 0]))
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = path;
+        None
     }
 }
 

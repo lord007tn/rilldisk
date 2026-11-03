@@ -77,6 +77,79 @@ impl RillApp {
                         }
                     },
                 );
+                ui.add_space(10.0);
+                let limits = crate::settings::SCAN_LIMITS;
+                let estimates = limits
+                    .iter()
+                    .map(|&l| {
+                        format!(
+                            "{} needs up to about {}",
+                            super::scope::short_limit(l),
+                            style::bytes(super::scope::memory_for(l))
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                row(
+                    ui,
+                    "Scan limit",
+                    &format!(
+                        "Entries one scan may hold. A scan that reaches it stops and says so; raise it for very large folders such as a whole home folder full of worktrees. {estimates} of memory."
+                    ),
+                    |ui| {
+                        let mut limit = self.prefs.max_entries;
+                        let labels: Vec<String> =
+                            limits.iter().map(|&l| super::scope::short_limit(l)).collect();
+                        let options: Vec<(usize, Option<Icon>, &str)> = limits
+                            .iter()
+                            .zip(&labels)
+                            .map(|(&l, label)| (l, None, label.as_str()))
+                            .collect();
+                        if w::segmented(ui, &mut limit, &options, "Entry limit of desktop scans") {
+                            actions.push(Action::ScanLimit(limit, false));
+                        }
+                    },
+                );
+            });
+
+            // ----------------------------------------------------- worktrees
+            section(ui, "Git worktrees", |ui| {
+                row(
+                    ui,
+                    "Check worktrees with Git",
+                    "Asks your installed Git, read-only, whether each worktree has uncommitted changes, commits that exist only there or a lock. Nothing is written, fetched or sent.",
+                    |ui| {
+                        let mut on = self.prefs.git_checks;
+                        if toggle(ui, &mut on, true) {
+                            actions.push(Action::GitChecks(on));
+                        }
+                    },
+                );
+                ui.add_space(10.0);
+                row(
+                    ui,
+                    "Idle after",
+                    "A worktree with no Git-reported changes and no commits or file changes for this long is offered by \"Select clean idle worktrees\". Ignored files and running agents are not detected.",
+                    |ui| {
+                        let mut days = self.prefs.stale_days;
+                        ui.add_enabled_ui(self.prefs.git_checks, |ui| {
+                            if w::segmented(
+                                ui,
+                                &mut days,
+                                &[
+                                    (7, None, "7 d"),
+                                    (14, None, "14 d"),
+                                    (30, None, "30 d"),
+                                    (60, None, "60 d"),
+                                    (90, None, "90 d"),
+                                ],
+                                "Days without work",
+                            ) {
+                                actions.push(Action::StaleDays(days));
+                            }
+                        });
+                    },
+                );
             });
 
             // ------------------------------------------------------- updates
@@ -115,13 +188,16 @@ impl RillApp {
                         });
                     },
                 );
-                ui.label("Update availability and progress appear in the bottom bar.");
+                if self.update_pending() {
+                    ui.add_space(12.0);
+                    actions.extend(self.update_card(ui, true));
+                }
             });
 
             // ------------------------------------------------------- privacy
             section(ui, "Privacy", |ui| {
                 for (icon, text) in [
-                    (Icon::Eye, "Reads file names, sizes and dates only. File contents are never opened."),
+                    (Icon::Eye, "Reads file names, sizes and dates. RillDisk never opens file contents; the optional Git check runs your git, which compares worktree files as git status does."),
                     (Icon::Check, "Nothing is uploaded. The only network request is the optional update check."),
                     (Icon::Trash, "Nothing is deleted unless you select it and confirm; it goes to the Recycle Bin or Trash by default."),
                     (Icon::Terminal, "The MCP server for AI assistants is read-only: it can never delete anything."),
