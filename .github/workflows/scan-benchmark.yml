@@ -17,6 +17,7 @@ on:
     paths:
       - 'crates/rilldisk-core/**'
       - 'scripts/benchmark.py'
+      - 'scripts/test_benchmark.py'
       - '.github/workflows/scan-benchmark.yml'
 
 permissions:
@@ -40,6 +41,8 @@ jobs:
       - name: Benchmark
         shell: bash
         run: |
+          set -euo pipefail
+          python scripts/test_benchmark.py
           python scripts/benchmark.py target/release/examples \
             --files "${{ github.event.inputs.files || '300000' }}" --runs 3 \
             --flush --verify-allocation --require-identical --json bench.json | tee bench.md
@@ -55,6 +58,7 @@ jobs:
           # Phase timings and the reparse tags the MFT treats as links (counts).
           RILLDISK_TRACE_PHASES: '1'
         run: |
+          set -euo pipefail
           python scripts/benchmark.py target/release/examples --path 'C:\' --runs 2 \
             --backends directory mft --json bench-volume.json | tee bench-volume.md
           cat bench-volume.md >> "$GITHUB_STEP_SUMMARY"
