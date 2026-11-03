@@ -475,8 +475,8 @@ pub enum Backend {
     Directory,
     /// The directory walk of RillDisk 0.1: full-path opens with
     /// `GetFileInformationByHandleEx` on Windows (kept as a reference for
-    /// benchmarks and comparisons), `std::fs::read_dir` on Linux and macOS (the
-    /// default there).
+    /// benchmarks and comparisons), `std::fs::read_dir` on Linux and macOS
+    /// without the descriptor-relative opens that `Auto` uses.
     Legacy,
 }
 

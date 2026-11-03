@@ -69,13 +69,17 @@ compact name arena and indexed queries should follow profiling, not precede it.
 
 `linux-getdents` / `unix-openat` (the default and `--backend dir`) plug into
 one parallel walk with shared budgets, cancellation and stall reporting. Queued
-directories open relative to their parent's descriptor with `O_NOFOLLOW`.
+directories open relative to their parent's descriptor with no-follow semantics.
 Listings use `getdents64` on Linux and `readdir` on macOS; metadata uses
 `fstatat(AT_SYMLINK_NOFOLLOW)`. Parent descriptors remain open until queued
-children open. Under descriptor pressure, full-path reopens walk every component
-from `/` using no-follow directory opens; a replaced symlink ancestor becomes a
-scan issue rather than an outside traversal. Root opens use the same procedure.
-This trades extra opens under pressure for bounded descriptor retention.
+children open. Under descriptor pressure, full-path reopens reject symlinks in
+every component using Linux `openat2(RESOLVE_NO_SYMLINKS)` or macOS 11+ `O_NOFOLLOW_ANY`.
+These native opens need one free descriptor and only search permission on
+ancestors. Root opens use the same procedure. On Linux kernels without openat2
+(or where syscall filtering blocks it), a component walk uses `O_PATH` for
+ancestors and `O_RDONLY` for the final directory, with no-follow checks at every
+step. This fallback needs two free descriptors; if unavailable, the subtree is
+reported incomplete instead of retrying an unsafe path open.
 
 `Backend::Legacy` retains the old path-based walker for comparisons; it is not
 qualified against concurrent symlink replacement. Neither backend is an OS
@@ -264,9 +268,11 @@ and partial results are shared. Measurements are in [PERFORMANCE.md](PERFORMANCE
   has opened.
 * **`win32-batched-directory`** (`Backend::Legacy`): RillDisk 0.1's walk, kept as
   a reference for benchmarks and backend comparisons.
-* **`unix-readdir`** (Linux and macOS default) and **`linux-getdents`** /
-  **`unix-openat`** (`--backend dir`): see the Unix section. Past half the soft
-  descriptor limit, the descriptor-relative walk opens children by path.
+* **`linux-getdents`** / **`unix-openat`** (Linux and macOS default, `--backend dir`):
+  see the Unix section. Past half the soft descriptor limit, the descriptor-relative
+  walk opens children by path using the no-symlink procedure described there.
+* **`unix-readdir`** (`Backend::Legacy`): the path-based reference walker, without
+  qualification against symlink replacement.
 * **`ntfs-mft`**: below.
 
 Hard links on NTFS start in a hash map keyed by file ID; once a scan has seen

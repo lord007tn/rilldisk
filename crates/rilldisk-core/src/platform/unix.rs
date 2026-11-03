@@ -47,6 +47,8 @@ pub(crate) struct VolumeInfo {
     warning: Option<String>,
     /// Use RillDisk 0.1's `std::fs::read_dir` walk.
     legacy: bool,
+    #[cfg(test)]
+    descriptor_budget: Option<usize>,
 }
 
 pub(crate) fn volume_info(
@@ -411,35 +413,101 @@ fn open_at(parent: Option<&DirFd>, name: &CStr) -> io::Result<DirFd> {
     // O_NOFOLLOW protects only the final component. Full-path reopens under
     // descriptor pressure must also protect every ancestor, including the root.
     if parent.is_none() {
-        let path = Path::new(OsStr::from_bytes(name.to_bytes()));
-        if !path.is_absolute() {
-            return Err(io::Error::other("expected an absolute directory path"));
+        #[cfg(target_os = "macos")]
+        // macOS 11+: reject symlinks throughout the path in one open. Ancestors
+        // need search permission only, and the operation consumes one descriptor.
+        return open_one(None, name, libc::O_RDONLY);
+
+        #[cfg(target_os = "linux")]
+        match open_absolute(name) {
+            Ok(dir) => return Ok(dir),
+            // Old kernels or syscall filters may not offer openat2. Keep the
+            // component walk safe; never retry with an ordinary full-path open.
+            Err(error) if matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EPERM)) => {}
+            Err(error) => return Err(error),
         }
-        let mut dir = open_one(None, c"/")?;
-        for component in path.components() {
-            match component {
-                std::path::Component::RootDir => {}
-                std::path::Component::Normal(part) => {
-                    let part = CString::new(part.as_bytes())?;
-                    dir = open_at(Some(&dir), &part)?;
-                }
-                _ => return Err(io::Error::other("expected an absolute directory path")),
-            }
-        }
-        return Ok(dir);
+
+        #[cfg(not(target_os = "macos"))]
+        return open_components(name);
     }
-    open_one(parent, name)
+    open_one(parent, name, libc::O_RDONLY)
 }
 
-fn open_one(parent: Option<&DirFd>, name: &CStr) -> io::Result<DirFd> {
+#[cfg(target_os = "linux")]
+fn open_absolute(name: &CStr) -> io::Result<DirFd> {
+    // SAFETY: open_how consists of integer fields; zero initializes all of them,
+    // including any reserved fields in later libc versions.
+    let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+    how.flags = (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64;
+    how.resolve = libc::RESOLVE_NO_SYMLINKS;
+    // SAFETY: name is terminated and how remains readable for the specified size.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            libc::AT_FDCWD,
+            name.as_ptr(),
+            &how,
+            size_of::<libc::open_how>(),
+        )
+    };
+    own_directory(fd as libc::c_int)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_components(name: &CStr) -> io::Result<DirFd> {
+    let path = Path::new(OsStr::from_bytes(name.to_bytes()));
+    if !path.is_absolute() {
+        return Err(io::Error::other("expected an absolute directory path"));
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let search = libc::O_PATH;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let search = libc::O_RDONLY;
+    let mut components = path.components().peekable();
+    let mut dir = open_one(
+        None,
+        c"/",
+        if path == Path::new("/") {
+            libc::O_RDONLY
+        } else {
+            search
+        },
+    )?;
+    while let Some(component) = components.next() {
+        match component {
+            std::path::Component::RootDir => {}
+            std::path::Component::Normal(part) => {
+                let part = CString::new(part.as_bytes())?;
+                let mode = if components.peek().is_none() {
+                    libc::O_RDONLY
+                } else {
+                    search
+                };
+                dir = open_one(Some(&dir), &part, mode)?;
+            }
+            _ => return Err(io::Error::other("expected an absolute directory path")),
+        }
+    }
+    Ok(dir)
+}
+
+fn open_one(parent: Option<&DirFd>, name: &CStr, mode: libc::c_int) -> io::Result<DirFd> {
+    #[cfg(target_os = "macos")]
+    let nofollow = libc::O_NOFOLLOW_ANY;
+    #[cfg(not(target_os = "macos"))]
+    let nofollow = libc::O_NOFOLLOW;
     // SAFETY: name is terminated; the parent descriptor (if any) is open.
     let fd = unsafe {
         libc::openat(
             parent.map_or(libc::AT_FDCWD, |p| p.as_raw_fd()),
             name.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            mode | libc::O_DIRECTORY | nofollow | libc::O_CLOEXEC,
         )
     };
+    own_directory(fd)
+}
+
+fn own_directory(fd: libc::c_int) -> io::Result<DirFd> {
     if fd < 0 {
         let error = io::Error::last_os_error();
         if error.raw_os_error() == Some(libc::ELOOP) {
@@ -450,7 +518,7 @@ fn open_one(parent: Option<&DirFd>, name: &CStr) -> io::Result<DirFd> {
         return Err(error);
     }
     OPEN_DIRS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    // SAFETY: openat returned a new descriptor that nothing else owns.
+    // SAFETY: the open call returned a new descriptor that nothing else owns.
     Ok(DirFd(unsafe { OwnedFd::from_raw_fd(fd) }))
 }
 
@@ -582,6 +650,9 @@ fn fd_enumerate(
     volume: &VolumeInfo,
     listing: &mut Listing,
 ) -> io::Result<bool> {
+    let budget = descriptor_budget();
+    #[cfg(test)]
+    let budget = volume.descriptor_budget.unwrap_or(budget);
     let dir = Arc::new(open_at(parent.as_deref(), name)?);
     // The parent stays open only until its last child has opened.
     drop(parent);
@@ -610,8 +681,7 @@ fn fd_enumerate(
             let child = path.join(os);
             // Under descriptor pressure the child opens by full path and does
             // not keep this folder open.
-            let relative =
-                OPEN_DIRS.load(std::sync::atomic::Ordering::Relaxed) < descriptor_budget();
+            let relative = OPEN_DIRS.load(std::sync::atomic::Ordering::Relaxed) < budget;
             let target = if relative {
                 CString::new(name.to_bytes()).map(|name| Target::Relative {
                     parent: Some(dir.clone()),
@@ -1043,6 +1113,119 @@ mod tests {
     use super::*;
 
     #[test]
+    fn descriptor_pressure_selects_full_path_children() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("child")).unwrap();
+        let path = root.path().canonicalize().unwrap();
+        let mut volume = volume_info(&path, &ScanOptions::default(), Backend::Directory).unwrap();
+        for (budget, expect_parent) in [(usize::MAX, true), (0, false)] {
+            volume.descriptor_budget = Some(budget);
+            let control = ScanControl::default();
+            crate::reset_progress(&control, &ScanOptions::default());
+            let listing = read_directory(root_target(&path, &volume), &control, &volume);
+            assert!(listing.batch.complete, "{:?}", listing.batch.errors);
+            let (_, child) = listing.children.into_iter().next().unwrap();
+            match child {
+                Target::Relative {
+                    parent,
+                    name,
+                    path: child,
+                } => {
+                    assert_eq!(parent.is_some(), expect_parent);
+                    assert_eq!(
+                        name.to_bytes(),
+                        if expect_parent {
+                            b"child"
+                        } else {
+                            child.as_os_str().as_bytes()
+                        }
+                    );
+                }
+                _ => panic!("descriptor walk emitted a legacy target"),
+            }
+        }
+    }
+
+    #[test]
+    fn readable_root_beneath_search_only_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let ancestor = root.path().join("search-only");
+        let target = ancestor.join("readable");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("inside"), b"fictional").unwrap();
+        let path = target.canonicalize().unwrap();
+        let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o111)).unwrap();
+        let result = crate::scan(&path, ScanOptions::default(), Arc::default());
+        #[cfg(not(target_os = "macos"))]
+        let fallback = open_components(&name);
+        #[cfg(target_os = "macos")]
+        let fallback = open_at(None, &name);
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(fallback.is_ok(), "{:?}", fallback.err());
+        let snapshot = result.unwrap();
+        assert!(snapshot.summary.complete, "{:?}", snapshot.summary.issues);
+        assert_eq!(snapshot.summary.files, 1);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn absolute_open_works_with_one_free_descriptor() {
+        const CHILD: &str = "RILLDISK_TEST_ONE_FREE_DESCRIPTOR";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "platform::unix::tests::absolute_open_works_with_one_free_descriptor",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().canonicalize().unwrap();
+        let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+        #[cfg(target_os = "linux")]
+        if let Err(error) = open_absolute(&name) {
+            assert!(
+                matches!(error.raw_os_error(), Some(libc::ENOSYS | libc::EPERM)),
+                "{error}"
+            );
+            eprintln!("openat2 unavailable; component fallback needs two free descriptors");
+            return;
+        }
+        // The subprocess isolates descriptor limits from the parallel test harness.
+        let limit = libc::rlimit {
+            rlim_cur: 64,
+            rlim_max: 64,
+        };
+        // SAFETY: limit is initialized; only this test subprocess is affected.
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        let mut held = Vec::new();
+        loop {
+            // SAFETY: /dev/null is terminated and opened read-only.
+            let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+            if fd < 0 {
+                assert_eq!(
+                    io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EMFILE)
+                );
+                break;
+            }
+            // SAFETY: open returned a new descriptor owned only here.
+            held.push(unsafe { OwnedFd::from_raw_fd(fd) });
+        }
+        drop(held.pop().unwrap());
+        let result = open_at(None, &name);
+        drop(held);
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    #[test]
     fn queued_directory_replaced_with_symlink_is_not_followed() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
@@ -1081,6 +1264,10 @@ mod tests {
         };
         fs::rename(root.path().join("ancestor"), root.path().join("original")).unwrap();
         std::os::unix::fs::symlink(outside.path(), root.path().join("ancestor")).unwrap();
+        #[cfg(not(target_os = "macos"))]
+        if let Target::Relative { name, .. } = &target {
+            assert!(open_components(name).is_err());
+        }
         let volume = volume_info(root.path(), &ScanOptions::default(), Backend::Directory).unwrap();
         let result = read_directory(target, &ScanControl::default(), &volume);
         assert!(!result.batch.complete);

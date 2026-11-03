@@ -14,6 +14,8 @@ Windows remains the primary platform. These checks do not establish an OS sandbo
 | Warm/cold conditions | Rotating backend order; optional `--cold-first`; PERFORMANCE.md | First observed run is not controlled cold storage; no cache purge or workstation-wide performance claim |
 | Queued directory replacement | `queued_directory_replaced_with_symlink_is_not_followed` | Deterministic replacement after discovery and before child open |
 | Ancestor replacement | `relative_child_keeps_its_parent_after_ancestor_replacement`, `full_path_reopen_rejects_a_replaced_ancestor` | Retained parent handles and descriptor-pressure full-path reopens tested separately |
+| Descriptor pressure | `descriptor_pressure_selects_full_path_children`, `absolute_open_works_with_one_free_descriptor` | Forces real child selection with an isolated per-scan test budget; one-free-descriptor test runs in a subprocess on native Linux/macOS opens |
+| Search-only ancestors | `readable_root_beneath_search_only_ancestor` | Readable root beneath mode 0111 ancestors, including Linux's component fallback |
 | Unix default | `auto_status_describes_the_unix_backend_that_actually_runs` | Auto and Directory use no-follow opens; Legacy remains an unqualified reference path |
 
 Local follow-up on November 3, 2026: six benchmark-gate regressions pass. A
@@ -33,3 +35,10 @@ new runs. Private inventories must never be attached to either issue.
 No-follow opens prevent traversing symlink components. Directory relocation,
 mount replacement and mutations between MCP validation and scan startup remain
 outside the allowed-root guarantee. Legacy explicitly lacks race protection.
+
+Native full-path opens use [Linux openat2](https://man7.org/linux/man-pages/man2/openat2.2.html)
+with RESOLVE_NO_SYMLINKS and [macOS O_NOFOLLOW_ANY](https://github.com/apple/darwin-xnu/blob/main/bsd/man/man2/open.2).
+Both need only one new descriptor. Linux's compatibility component walk uses
+O_PATH for ancestors (search permission suffices); it still needs two transient
+free slots. Old kernels or syscall filters that deny openat2 retain that safe
+fallback. Actual descriptor exhaustion remains visible as an incomplete scan.
