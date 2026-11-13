@@ -159,3 +159,78 @@ fn reclaim_delete_removes_safe_candidates_and_keeps_review_items() {
     assert!(table.contains("git worktree prune"), "{table}");
     assert!(!root.path().join("wt/feature").exists());
 }
+
+/// The protected-paths file and `--protect` keep folders out of the list and out
+/// of `--delete`. Uses a private state folder, never the user's own list.
+#[test]
+fn protected_paths_are_neither_listed_nor_deleted() {
+    let root = cleanup_fixture();
+    let state = tempfile::tempdir().unwrap();
+    let folder = if cfg!(windows) {
+        state.path().join("RillDisk")
+    } else if cfg!(target_os = "macos") {
+        state.path().join("Library/Application Support/RillDisk")
+    } else {
+        state.path().join("rilldisk")
+    };
+    fs::create_dir_all(&folder).unwrap();
+    let web = root.path().join("web");
+    fs::write(
+        folder.join("protected-paths.txt"),
+        format!("# client work\n{}\n", web.display()),
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_rilldisk"))
+            .arg("reclaim")
+            .arg(root.path())
+            .args(["--min-size", "0"])
+            .args(args)
+            .env("LOCALAPPDATA", state.path())
+            .env("XDG_STATE_HOME", state.path())
+            .env("HOME", state.path())
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let target = root.path().join("app/target");
+    let output = run(&["--format", "json", "--protect", target.to_str().unwrap()]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["protected_excluded"], 2, "{report:#}");
+    let paths: Vec<&str> = report["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths.len(), 1, "{paths:?}");
+    assert!(paths[0].ends_with("feature"), "{paths:?}");
+
+    let table = run(&[]);
+    assert!(
+        String::from_utf8_lossy(&table.stdout)
+            .contains("Not listed: 1 candidate(s) under your protected paths")
+    );
+
+    // Only the file applies now: app/target goes, web/node_modules stays.
+    let output = run(&["--delete", "--permanent", "--yes", "--format", "json"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["removed"], 1, "{result:#}");
+    assert!(!target.exists());
+    assert!(web.join("node_modules/a/index.js").exists());
+
+    let relative = run(&["--protect", "relative/dir"]);
+    assert!(!relative.status.success());
+    assert!(String::from_utf8_lossy(&relative.stderr).contains("not an absolute path"));
+}

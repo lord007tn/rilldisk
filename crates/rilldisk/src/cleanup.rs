@@ -6,6 +6,7 @@ use anyhow::{Result, bail};
 use rilldisk_core::{
     CleanupMode, ReclaimReport, Snapshot,
     cleanup::{self, CleanupControl, Guard, Outcome},
+    protect::Protected,
 };
 use std::{
     io::{self, BufRead, IsTerminal, Write},
@@ -19,6 +20,8 @@ pub struct Options {
     pub permanent: bool,
     pub yes: bool,
     pub json: bool,
+    /// `--protect` paths, on top of the protected-paths file the guard loads.
+    pub protected: Protected,
 }
 
 static RUNNING: AtomicBool = AtomicBool::new(false);
@@ -51,7 +54,8 @@ pub fn run(
     } else {
         CleanupMode::Trash
     };
-    let guard = Guard::system();
+    let mut guard = Guard::system();
+    guard.protect_user(&options.protected);
     let selected: Vec<usize> = report.candidates.iter().map(|c| c.entry_id).collect();
     let plan = cleanup::plan(snapshot, report, &selected, mode, &guard);
     let mut err = io::stderr().lock();

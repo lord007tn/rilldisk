@@ -20,6 +20,7 @@ pub mod cleanup;
 pub mod git;
 mod live;
 mod platform;
+pub mod protect;
 mod reclaim;
 mod stats;
 

@@ -15,7 +15,7 @@ use rilldisk_core::{
     cleanup::{self, CleanupControl, Guard, Outcome},
 };
 use std::{
-    sync::{Arc, OnceLock, atomic::Ordering, mpsc},
+    sync::{Arc, atomic::Ordering, mpsc},
     time::Instant,
 };
 
@@ -67,9 +67,10 @@ fn are(n: usize, noun: &str) -> String {
     }
 }
 
-fn guard() -> &'static Guard {
-    static GUARD: OnceLock<Guard> = OnceLock::new();
-    GUARD.get_or_init(Guard::system)
+/// Built for each plan and run, not cached: it reads the user's protected-paths
+/// file, and an edit must apply without restarting the app.
+fn guard() -> Guard {
+    Guard::system()
 }
 
 impl CleanupUi {
@@ -83,7 +84,7 @@ impl CleanupUi {
     fn safe(&mut self, data: &Arc<Data>) -> &[usize] {
         let key = Arc::as_ptr(data) as usize;
         if self.safe.as_ref().is_none_or(|(k, _)| *k != key) {
-            let ids = cleanup::select_safe(&data.snapshot, &data.reclaim, guard());
+            let ids = cleanup::select_safe(&data.snapshot, &data.reclaim, &guard());
             let indices = ids
                 .into_iter()
                 .filter_map(|id| data.candidate_of.get(&id).copied())
@@ -228,7 +229,7 @@ fn open_confirm(app: &mut RillApp, data: &Arc<Data>, mode: CleanupMode) {
     let reclaim = Arc::new(app.annotated(&data.reclaim));
     let picked: Vec<usize> = app.picked.iter().copied().collect();
     let git = app.pick_notes(data, &picked);
-    let plan = cleanup::plan(&data.snapshot, &reclaim, &ids, mode, guard());
+    let plan = cleanup::plan(&data.snapshot, &reclaim, &ids, mode, &guard());
     app.cleanup.confirm = Some(Confirm {
         data: data.clone(),
         reclaim,
@@ -320,7 +321,7 @@ fn start(app: &mut RillApp, ctx: &egui::Context, confirm: Confirm) {
                 &reclaim,
                 &ids,
                 mode,
-                guard(),
+                &guard(),
                 &thread_control,
             );
             let removed = report.removed_entry_ids();

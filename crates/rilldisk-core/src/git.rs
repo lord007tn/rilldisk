@@ -6,7 +6,8 @@
 //! repository and the branch stays. What is lost is uncommitted work (changed,
 //! staged or untracked files) and commits made on a detached HEAD that no branch,
 //! tag or remote holds. That is what [`inspect`] measures, using the user's own
-//! `git`, and what [`GitReport::new`] turns into a verdict and a suggested command.
+//! `git`, and what [`GitReport::new`] turns into a verdict, a [`NextStep`] and a
+//! suggested command.
 //!
 //! Every command is read-only: optional locks are off (the index is never
 //! refreshed or written), fsmonitor hooks and the untracked cache are disabled,
@@ -48,6 +49,12 @@ pub struct GitState {
     /// Detached HEAD only: commits that no branch, tag or remote holds. They become
     /// unreachable once the worktree is removed.
     pub commits_only_here: u64,
+    /// Of `commits_only_here`, commits whose change another branch already has as
+    /// the same patch (after a cherry-pick or rebase). Their content is not lost.
+    pub commits_only_here_applied: u64,
+    /// Of `unpushed_commits`, commits whose change a remote branch already has as
+    /// the same patch, so there is nothing left to push for them.
+    pub unpushed_applied: u64,
     /// `git worktree lock` was used: Git refuses to remove or prune it.
     pub locked: bool,
 }
@@ -91,6 +98,36 @@ impl Verdict {
     }
 }
 
+/// What to do with a worktree, from Git's view alone. Git cannot see whether a
+/// program, an assistant thread or a terminal still uses the folder, so even
+/// [`NextStep::Remove`] asks a person to check that first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NextStep {
+    /// Locked, worked on within the idle threshold, or Git could not answer.
+    Keep,
+    /// Idle and clean, but its branch has commits no remote has (as the same
+    /// change). The branch stays in the repository either way; pushing keeps a
+    /// copy off this machine.
+    Push,
+    /// Idle, with work that exists only here: changed or untracked files, or
+    /// commits on a detached HEAD. Save it (patch, branch or bundle) first.
+    ArchiveThenRemove,
+    /// Idle, and Git reports nothing that removal would lose.
+    Remove,
+}
+
+impl NextStep {
+    pub fn label(self) -> &'static str {
+        match self {
+            NextStep::Keep => "Keep",
+            NextStep::Push => "Push, then remove",
+            NextStep::ArchiveThenRemove => "Archive, then remove",
+            NextStep::Remove => "Remove",
+        }
+    }
+}
+
 /// Git's view of a worktree candidate: the state, the verdict and what to do.
 #[derive(Debug, Clone, Serialize)]
 pub struct GitReport {
@@ -106,6 +143,8 @@ pub struct GitReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idle_days: Option<u64>,
     pub stale_days: u64,
+    /// Keep, push, archive or remove, judged from Git state and idle time.
+    pub next_step: NextStep,
     /// One sentence for people.
     pub summary: String,
     /// The command or step to take next.
@@ -135,6 +174,7 @@ impl GitReport {
                     last_work_unix_ms: newest_file_ms,
                     idle_days: newest_file_ms.map(|m| days(now_unix_ms, m)),
                     stale_days,
+                    next_step: NextStep::Keep,
                     suggested_action: format!(
                         "Run git status in {here} and check for unsaved work before removing it"
                     ),
@@ -144,7 +184,11 @@ impl GitReport {
         let last_work = state.head_commit_unix_ms.max(newest_file_ms);
         let idle = last_work.map(|m| days(now_unix_ms, m));
         let dirty = state.changed_files + state.untracked_items;
-        let only_here = state.branch.is_none() && state.commits_only_here > 0;
+        // Detached commits whose change no other branch has as the same patch.
+        let lost_commits = state
+            .commits_only_here
+            .saturating_sub(state.commits_only_here_applied);
+        let only_here = state.branch.is_none() && lost_commits > 0;
         let verdict = if dirty > 0 {
             Verdict::UncommittedChanges
         } else if only_here {
@@ -170,15 +214,20 @@ impl GitReport {
                 }
                 parts.push(format!("{} would be lost", what.join(" and ")));
             }
-            Verdict::CommitsOnlyHere => parts.push(format!(
-                "{} on a detached HEAD {} nowhere else",
-                plural(state.commits_only_here, "commit"),
-                if state.commits_only_here == 1 {
-                    "exists"
-                } else {
-                    "exist"
+            Verdict::CommitsOnlyHere => {
+                let mut text = format!(
+                    "{} on a detached HEAD {} nowhere else",
+                    plural(lost_commits, "commit"),
+                    if lost_commits == 1 { "exists" } else { "exist" }
+                );
+                if state.commits_only_here_applied > 0 {
+                    text.push_str(&format!(
+                        " ({} more already applied on another branch)",
+                        state.commits_only_here_applied
+                    ));
                 }
-            )),
+                parts.push(text);
+            }
             Verdict::Locked => parts.push("Locked with git worktree lock".into()),
             Verdict::Active | Verdict::CleanIdle => {
                 parts.push("No changes Git reports (ignored files are not checked)".into())
@@ -192,17 +241,55 @@ impl GitReport {
                 d => format!("last work {d} days ago"),
             });
         }
+        let to_push = state
+            .unpushed_commits
+            .saturating_sub(state.unpushed_applied);
         match (&state.branch, state.unpushed_commits, state.has_remote) {
             (Some(branch), 0, true) => parts.push(format!("branch {branch} is pushed")),
-            (Some(branch), n, true) => parts.push(format!(
-                "branch {branch} has {} not on any remote (kept in the repository)",
+            (Some(branch), n, true) if to_push == 0 => parts.push(format!(
+                "branch {branch} has {} not on any remote, but a remote branch already has the same changes",
                 plural(n, "commit")
             )),
+            (Some(branch), _, true) => {
+                let mut text = format!(
+                    "branch {branch} has {} not on any remote (kept in the repository)",
+                    plural(to_push, "commit")
+                );
+                if state.unpushed_applied > 0 {
+                    text.push_str(&format!(
+                        "; {} more already applied on a remote branch",
+                        state.unpushed_applied
+                    ));
+                }
+                parts.push(text);
+            }
             (Some(branch), _, false) => parts.push(format!(
                 "branch {branch} (no remote; kept in the repository)"
             )),
+            (None, ..) if state.commits_only_here > 0 && lost_commits == 0 => parts.push(format!(
+                "detached HEAD; its {} only here {} already applied on another branch",
+                plural(state.commits_only_here, "commit"),
+                if state.commits_only_here == 1 {
+                    "is"
+                } else {
+                    "are"
+                }
+            )),
             (None, ..) => parts.push("detached HEAD".into()),
         }
+        let idle_enough = idle.is_some_and(|d| d >= stale_days);
+        let next_step = match verdict {
+            _ if state.locked => NextStep::Keep,
+            Verdict::Unknown | Verdict::Locked | Verdict::Active => NextStep::Keep,
+            Verdict::UncommittedChanges | Verdict::CommitsOnlyHere if idle_enough => {
+                NextStep::ArchiveThenRemove
+            }
+            Verdict::UncommittedChanges | Verdict::CommitsOnlyHere => NextStep::Keep,
+            Verdict::CleanIdle if state.branch.is_some() && state.has_remote && to_push > 0 => {
+                NextStep::Push
+            }
+            Verdict::CleanIdle => NextStep::Remove,
+        };
         let suggested_action = match verdict {
             Verdict::UncommittedChanges => format!(
                 "Commit or stash the changes in {here} (git -C {here} status), then git worktree remove {here}"
@@ -213,6 +300,12 @@ impl GitReport {
             Verdict::Locked => format!(
                 "Check why it is locked (git worktree list -v); if it is no longer needed: git worktree unlock {here}, then git worktree remove {here}"
             ),
+            Verdict::CleanIdle if next_step == NextStep::Push => match &state.branch {
+                Some(branch) => format!(
+                    "Push the branch first (git -C {here} push -u <remote> {branch}), then git worktree remove {here}"
+                ),
+                None => format!("git worktree remove {here}"),
+            },
             Verdict::Active | Verdict::CleanIdle | Verdict::Unknown => {
                 format!("git worktree remove {here}")
             }
@@ -226,6 +319,7 @@ impl GitReport {
             last_work_unix_ms: last_work,
             idle_days: idle,
             stale_days,
+            next_step,
             summary,
             suggested_action,
         }
@@ -333,6 +427,14 @@ pub fn inspect(path: &Path) -> Result<GitState, String> {
                     "--remotes",
                 ],
             )?);
+            if state.commits_only_here > 0 {
+                let bases = equivalence_bases(path, None, true);
+                state.commits_only_here_applied =
+                    applied_elsewhere(path, &["--branches", "--tags", "--remotes"], &bases);
+            }
+        } else if state.has_remote && state.unpushed_commits > 0 {
+            let bases = equivalence_bases(path, state.upstream.as_deref(), false);
+            state.unpushed_applied = applied_elsewhere(path, &["--remotes"], &bases);
         }
     }
     let git_dir = run(path, &["rev-parse", "--absolute-git-dir"])?;
@@ -342,6 +444,77 @@ pub fn inspect(path: &Path) -> Result<GitState, String> {
 
 fn count(text: &str) -> u64 {
     text.trim().parse().unwrap_or(0)
+}
+
+/// Most commits whose patches are compared; beyond this nothing counts as applied.
+const MAX_COMPARED_COMMITS: usize = 500;
+
+/// Refs to compare HEAD's commits with: the upstream, each remote's default
+/// branch, and with `local` the usual local default branches. At most four.
+fn equivalence_bases(path: &Path, upstream: Option<&str>, local: bool) -> Vec<String> {
+    let mut bases: Vec<String> = upstream.map(str::to_string).into_iter().collect();
+    if let Ok(refs) = run(
+        path,
+        &["for-each-ref", "--format=%(refname)", "refs/remotes/"],
+    ) {
+        bases.extend(
+            refs.lines()
+                .filter(|r| r.ends_with("/HEAD"))
+                .map(str::to_string),
+        );
+    }
+    if local {
+        for name in ["refs/heads/main", "refs/heads/master"] {
+            if run(path, &["rev-parse", "--verify", "-q", name]).is_ok() {
+                bases.push(name.to_string());
+            }
+        }
+    }
+    bases.dedup();
+    bases.truncate(4);
+    bases
+}
+
+/// How many of HEAD's commits outside `exclude` (`--remotes` and so on) have the
+/// same patch on one of `bases` (`git rev-list --cherry-pick`). Merge commits are
+/// never counted as applied, and any Git failure counts nothing as applied: an
+/// error must not make work look safe to lose.
+fn applied_elsewhere(path: &Path, exclude: &[&str], bases: &[String]) -> u64 {
+    if bases.is_empty() {
+        return 0;
+    }
+    let mut args = vec!["rev-list", "--no-merges", "HEAD", "--not"];
+    args.extend_from_slice(exclude);
+    let Ok(candidates) = run(path, &args) else {
+        return 0;
+    };
+    let mut pending: std::collections::HashSet<&str> = candidates.lines().collect();
+    if pending.is_empty() || pending.len() > MAX_COMPARED_COMMITS {
+        return 0;
+    }
+    let total = pending.len();
+    for base in bases {
+        let range = format!("{base}...HEAD");
+        // HEAD-side commits with no equivalent patch on `base`.
+        let Ok(unmatched) = run(
+            path,
+            &[
+                "rev-list",
+                "--cherry-pick",
+                "--right-only",
+                "--no-merges",
+                &range,
+            ],
+        ) else {
+            continue;
+        };
+        let unmatched: std::collections::HashSet<&str> = unmatched.lines().collect();
+        pending.retain(|commit| unmatched.contains(commit));
+        if pending.is_empty() {
+            break;
+        }
+    }
+    (total - pending.len()) as u64
 }
 
 /// `git status --porcelain=v2 --branch -z` output, without the timestamps.
@@ -506,6 +679,68 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0\
         let mut recent = clean(Some("main"));
         recent.head_commit_unix_ms = Some(now - 3 * DAY);
         assert_eq!(judge(recent), Verdict::Active);
+    }
+
+    #[test]
+    fn next_steps_follow_state_and_idle_time() {
+        let path = Path::new("/w/wt");
+        let now = 40 * DAY;
+        let step = |state: GitState, newest: u64| {
+            GitReport::new(Ok(state), path, Some(newest), now, 14).next_step
+        };
+        let old = now - 30 * DAY;
+        let recent = now - DAY;
+        assert_eq!(step(clean(Some("main")), old), NextStep::Remove);
+        assert_eq!(step(clean(Some("main")), recent), NextStep::Keep);
+        let mut dirty = clean(Some("main"));
+        dirty.changed_files = 2;
+        assert_eq!(step(dirty.clone(), old), NextStep::ArchiveThenRemove);
+        assert_eq!(step(dirty.clone(), recent), NextStep::Keep, "in use");
+        dirty.locked = true;
+        assert_eq!(step(dirty, old), NextStep::Keep, "locked wins");
+        let mut ahead = clean(Some("feat"));
+        ahead.unpushed_commits = 3;
+        assert_eq!(step(ahead.clone(), old), NextStep::Push);
+        ahead.unpushed_applied = 3;
+        let report = GitReport::new(Ok(ahead), path, Some(old), now, 14);
+        assert_eq!(report.next_step, NextStep::Remove);
+        assert!(
+            report.summary.contains("already has the same changes"),
+            "{}",
+            report.summary
+        );
+        let mut local = clean(Some("feat"));
+        local.has_remote = false;
+        local.unpushed_commits = 3;
+        assert_eq!(step(local, old), NextStep::Remove, "nowhere to push");
+    }
+
+    #[test]
+    fn detached_commits_already_applied_elsewhere_are_not_lost() {
+        let path = Path::new("/w/wt");
+        let now = 40 * DAY;
+        let mut detached = clean(None);
+        detached.commits_only_here = 2;
+        detached.commits_only_here_applied = 1;
+        let report = GitReport::new(Ok(detached.clone()), path, None, now, 14);
+        assert_eq!(report.verdict, Verdict::CommitsOnlyHere);
+        assert!(
+            report
+                .summary
+                .starts_with("1 commit on a detached HEAD exists nowhere else (1 more"),
+            "{}",
+            report.summary
+        );
+        assert_eq!(report.next_step, NextStep::ArchiveThenRemove);
+        detached.commits_only_here_applied = 2;
+        let report = GitReport::new(Ok(detached), path, None, now, 14);
+        assert_eq!(report.verdict, Verdict::CleanIdle);
+        assert_eq!(report.next_step, NextStep::Remove);
+        assert!(
+            report.summary.contains("already applied on another branch"),
+            "{}",
+            report.summary
+        );
     }
 
     #[test]

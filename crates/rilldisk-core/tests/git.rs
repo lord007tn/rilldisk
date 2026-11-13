@@ -156,6 +156,123 @@ fn worktree_verdicts_come_from_git_and_change_nothing() {
     }
 }
 
+fn git_out(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(output.status.success(), "git {args:?}");
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+/// Commit one new file in `dir` and return the commit.
+fn commit_file(dir: &Path, name: &str) -> String {
+    std::fs::write(dir.join(name), format!("{name}\n")).unwrap();
+    git(dir, &["add", name]);
+    git(dir, &["commit", "-q", "-m", name]);
+    git_out(dir, &["rev-parse", "HEAD"])
+}
+
+/// Commits whose change already landed elsewhere (cherry-picked or rebased) are
+/// not lost work; the next step follows from that and from idle time.
+#[test]
+fn applied_commits_and_next_steps_come_from_real_repositories() {
+    use rilldisk_core::git::{GitReport, NextStep};
+    if !have_git() {
+        eprintln!("git is not installed; skipping");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = rilldisk_core::simplify(dir.path().canonicalize().unwrap());
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    commit_file(&repo, "README.md");
+    let remote = root.join("remote.git");
+    git(&root, &["init", "-q", "--bare", remote.to_str().unwrap()]);
+    git(
+        &repo,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&repo, &["push", "-q", "origin", "main"]);
+    git(&repo, &["remote", "set-head", "origin", "main"]);
+    for (name, extra) in [
+        ("picked", vec!["--detach"]),
+        ("unique", vec!["--detach"]),
+        ("rebased", vec!["-b", "feat-rebased"]),
+        ("ahead", vec!["-b", "feat-ahead"]),
+    ] {
+        let path = root.join("wt").join(name);
+        let mut args = vec!["worktree", "add", "-q"];
+        args.extend(extra);
+        let text = path.to_str().unwrap().to_string();
+        args.push(&text);
+        git(&repo, &args);
+    }
+    let wt = |name: &str| root.join("wt").join(name);
+    // Detached commits: one later cherry-picked onto main, one nowhere else.
+    let picked = commit_file(&wt("picked"), "picked.txt");
+    commit_file(&wt("unique"), "unique.txt");
+    // Branch commits: one whose change main got through a cherry-pick (as a
+    // rebase-merge does), one that was never pushed anywhere.
+    let rebased = commit_file(&wt("rebased"), "rebased.txt");
+    commit_file(&wt("ahead"), "ahead.txt");
+    // Main moves on first, so a cherry-pick is a new commit with the same patch
+    // (on the same parent within the same second it would be the same commit).
+    commit_file(&repo, "main.txt");
+    git(&repo, &["cherry-pick", &picked]);
+    git(&repo, &["cherry-pick", &rebased]);
+    git(&repo, &["push", "-q", "origin", "main"]);
+    let refs_before = git_out(&repo, &["for-each-ref"]);
+
+    let state = |name: &str| git::inspect(&wt(name)).unwrap();
+    let picked = state("picked");
+    assert_eq!(
+        (picked.commits_only_here, picked.commits_only_here_applied),
+        (1, 1)
+    );
+    let unique = state("unique");
+    assert_eq!(
+        (unique.commits_only_here, unique.commits_only_here_applied),
+        (1, 0)
+    );
+    let rebased = state("rebased");
+    assert_eq!((rebased.unpushed_commits, rebased.unpushed_applied), (1, 1));
+    let ahead = state("ahead");
+    assert_eq!((ahead.unpushed_commits, ahead.unpushed_applied), (1, 0));
+
+    let later = now_ms() + 30 * DAY;
+    let judge = |name: &str, state: git::GitState, now: u64| {
+        let report = GitReport::new(Ok(state), &wt(name), None, now, git::DEFAULT_STALE_DAYS);
+        (report.verdict, report.next_step)
+    };
+    assert_eq!(
+        judge("picked", picked, later),
+        (Verdict::CleanIdle, NextStep::Remove)
+    );
+    assert_eq!(
+        judge("unique", unique.clone(), later),
+        (Verdict::CommitsOnlyHere, NextStep::ArchiveThenRemove)
+    );
+    assert_eq!(
+        judge("unique", unique, now_ms()),
+        (Verdict::CommitsOnlyHere, NextStep::Keep),
+        "worked on today"
+    );
+    assert_eq!(
+        judge("rebased", rebased, later),
+        (Verdict::CleanIdle, NextStep::Remove)
+    );
+    assert_eq!(
+        judge("ahead", ahead, later),
+        (Verdict::CleanIdle, NextStep::Push)
+    );
+    // Inspection wrote no refs.
+    assert_eq!(git_out(&repo, &["for-each-ref"]), refs_before);
+}
+
 fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(dir).unwrap().flatten() {

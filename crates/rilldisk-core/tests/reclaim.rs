@@ -524,3 +524,69 @@ fn unix_suggested_commands_omit_unsafe_paths() {
         "cargo clean --manifest-path <this project's Cargo.toml>"
     );
 }
+
+const DAY_MS: u64 = 86_400_000;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+fn age(path: &Path, days: u64) {
+    let when = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86_400);
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(when)
+        .unwrap();
+}
+
+#[test]
+fn idle_days_come_from_files_not_folder_times() {
+    let root = tempfile::tempdir().unwrap();
+    let r = root.path();
+    write(&r.join("web/package.json"), 10);
+    write(&r.join("web/node_modules/a/index.js"), 20_000);
+    write(&r.join("web/node_modules/b/index.js"), 20_000);
+    age(&r.join("web/node_modules/a/index.js"), 60);
+    age(&r.join("web/node_modules/b/index.js"), 90);
+    // Removing an entry refreshes its folder's time, as a partial cleanup does;
+    // nobody worked here.
+    write(&r.join("web/node_modules/c/stale.txt"), 10);
+    fs::remove_dir_all(r.join("web/node_modules/c")).unwrap();
+    // An empty leftover folder in an agent worktrees folder has no files at all.
+    fs::create_dir_all(r.join(".t3/worktrees/leftover")).unwrap();
+    let snapshot = scan(r, ScanOptions::default(), Arc::default()).unwrap();
+    let now = now_ms();
+    let report = find_reclaimable(&snapshot, now);
+    let modules = report
+        .candidates
+        .iter()
+        .find(|c| c.path.ends_with("node_modules"))
+        .unwrap();
+    let folder = snapshot
+        .entries
+        .iter()
+        .find(|e| e.id == modules.entry_id)
+        .unwrap();
+    assert!(
+        now - folder.modified_unix_ms.unwrap() < DAY_MS,
+        "the folder itself looks recent"
+    );
+    assert_eq!(modules.idle_days, Some(60), "{modules:#?}");
+    assert!(
+        modules
+            .reason
+            .contains("Nothing inside changed for 60 days")
+    );
+    // No files: the folder's own time is all there is.
+    let leftover = report
+        .candidates
+        .iter()
+        .find(|c| c.path.ends_with("leftover"))
+        .unwrap();
+    assert_eq!(leftover.idle_days, Some(0));
+}

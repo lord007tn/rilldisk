@@ -286,6 +286,88 @@ fn refuses_a_candidate_replaced_by_a_link_or_junction_after_the_scan() {
     assert!(victim.path().join("precious.txt").exists());
 }
 
+/// Permanent removal deletes a link inside a candidate, never what it points to,
+/// and the scan never counted the link target as part of the candidate.
+#[test]
+fn permanent_cleanup_removes_links_inside_a_candidate_but_not_their_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture(dir.path());
+    let outside = tempfile::tempdir().unwrap();
+    write(&outside.path().join("store/data.bin"), 50_000);
+    // pnpm and agent tools link folders into node_modules and worktrees.
+    link_dir(
+        &root.join("web/node_modules/linked"),
+        &outside.path().join("store"),
+    );
+    let (snapshot, report) = analyze(&root);
+    let modules = id_of(&report, &root.join("web/node_modules"));
+    let candidate = report
+        .candidates
+        .iter()
+        .find(|c| c.entry_id == modules)
+        .unwrap();
+    assert_eq!(
+        candidate.logical_bytes, 20_010,
+        "the link target is not counted"
+    );
+    let result = run(&snapshot, &report, &[modules], &Guard::system());
+    assert_eq!(result.removed, 1, "{result:#?}");
+    assert!(!root.join("web/node_modules").exists());
+    assert_eq!(
+        fs::metadata(outside.path().join("store/data.bin"))
+            .unwrap()
+            .len(),
+        50_000
+    );
+}
+
+/// The user's protected paths hide candidates from suggestions and block their
+/// removal, even when a removal request names them directly.
+#[test]
+fn protected_paths_hide_candidates_and_block_their_removal() {
+    use rilldisk_core::protect::Protected;
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture(dir.path());
+    let (snapshot, report) = analyze(&root);
+    let modules = id_of(&report, &root.join("web/node_modules"));
+    let target = id_of(&report, &root.join("app/target"));
+    let other = id_of(&report, &root.join("lib/target"));
+    let mut protected = Protected::default();
+    // A whole project, and a folder inside a candidate (the candidate contains it).
+    protected.add(&root.join("web")).unwrap();
+    protected.add(&root.join("app/target/debug")).unwrap();
+
+    let mut shown = report.clone();
+    assert_eq!(shown.exclude_protected(&protected), 2);
+    assert_eq!(shown.protected_excluded, 2);
+    assert!(
+        shown
+            .candidates
+            .iter()
+            .all(|c| c.entry_id != modules && c.entry_id != target)
+    );
+    assert!(shown.candidates.iter().any(|c| c.entry_id == other));
+    assert!(shown.total_exclusive_bytes < report.total_exclusive_bytes);
+    assert_eq!(shown.candidate_count, shown.candidates.len());
+
+    let mut guard = Guard::system();
+    guard.protect_user(&protected);
+    assert!(!cleanup::select_safe(&snapshot, &report, &guard).contains(&modules));
+    let result = run(&snapshot, &report, &[modules, target, other], &guard);
+    assert_eq!(result.removed, 1, "{result:#?}");
+    assert_eq!(result.refused.len(), 2);
+    for refusal in &result.refused {
+        assert!(
+            refusal.reason.contains("a path you protected"),
+            "{}",
+            refusal.reason
+        );
+    }
+    assert!(root.join("web/node_modules/a/index.js").exists());
+    assert!(root.join("app/target/debug/app.bin").exists());
+    assert!(!root.join("lib/target").exists());
+}
+
 #[test]
 fn refuses_a_candidate_whose_parent_became_a_link() {
     let dir = tempfile::tempdir().unwrap();
