@@ -4,6 +4,8 @@ Status: implemented, November 2, 2026, in `rilldisk-core` (`cleanup` module), th
 CLI (`rilldisk reclaim --delete`) and the desktop (Clean up view). Amended
 November 3, 2026 (0.1.3): folder identity check, and a live Git check for
 worktrees that carried a Git verdict ([git-inspection.md](git-inspection.md)).
+Amended November 13, 2026: user-protected paths
+([cleanup-lessons.md](../cleanup-lessons.md)).
 
 AGENTS.md requires a scoped proposal before RillDisk deletes or moves files.
 This document is that scope. The project owner asked for the ability to "select
@@ -52,6 +54,7 @@ against the live filesystem immediately before each item, one item at a time.
 | Is not, and does not contain, the home folder, the system temp folder, `C:\Users`, `/home`, `/Users`, `/var`, `/tmp`, `/opt` and similar | ✓ | ✓ |
 | Is not, does not contain and is not inside a system folder: `%SystemRoot%`, Program Files, ProgramData, `/usr`, `/bin`, `/etc`, `/System`, `/Library`, `/Applications`, ... | ✓ | ✓ |
 | Does not contain the running RillDisk executable | ✓ | ✓ |
+| Is not, does not contain and is not inside a path the user protected (`protected-paths.txt` in the RillDisk state folder, or `--protect`); if that file exists but cannot be read, every item is refused | ✓ | ✓ |
 | Still exists | | ✓ |
 | Is not a symlink, junction or other reparse point (`symlink_metadata`, never followed) | | ✓ |
 | Is still a directory | | ✓ |
@@ -59,6 +62,12 @@ against the live filesystem immediately before each item, one item at a time.
 | Is not a mount point of another filesystem (Unix device check) | | ✓ |
 | Is the folder that was found: same volume and file ID (Windows) or device and inode (Unix), recorded when candidates were found | | ✓ |
 | Git-checked linked worktree: Git, asked again now, reports no changed or untracked files, no lock, no commits only on a detached HEAD, and no activity since it was judged idle; Git must answer | | ✓ |
+
+**Protected paths.** The user's list is read by `Guard::system()`, so every
+caller (CLI, desktop) applies it, and by the suggestion surfaces
+(`ReclaimReport::exclude_protected` in the CLI, MCP and desktop), so protected
+folders are neither suggested nor removable. RillDisk only reads the file; people
+edit it themselves.
 
 A selected candidate inside another selected candidate is removed with its
 parent and not processed twice. Removal keeps going after an error, reports

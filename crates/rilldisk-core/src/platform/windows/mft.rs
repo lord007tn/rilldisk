@@ -445,18 +445,26 @@ fn geometry(boot: &[u8]) -> io::Result<Geometry> {
     let sector = u64::from(u16_at(boot, 0x0B).ok_or_else(invalid)?);
     let per_cluster = u64::from(*boot.get(0x0D).ok_or_else(invalid)?);
     // Values above 0x80 are a negative power of two (large clusters).
+    // Checked: these bytes come from the disk, and a crafted value must be
+    // rejected, not overflow.
     let per_cluster = if per_cluster > 0x80 {
-        1 << (256 - per_cluster)
+        1_u64
+            .checked_shl((256 - per_cluster) as u32)
+            .ok_or_else(invalid)?
     } else {
         per_cluster
     };
-    let cluster = sector * per_cluster;
+    let cluster = sector.checked_mul(per_cluster).ok_or_else(invalid)?;
     let mft_lcn = u64_at(boot, 0x30).ok_or_else(invalid)?;
     let per_record = *boot.get(0x40).ok_or_else(invalid)? as i8;
     let record = if per_record < 0 {
-        1_u64 << u32::from(per_record.unsigned_abs())
+        1_u64
+            .checked_shl(u32::from(per_record.unsigned_abs()))
+            .ok_or_else(invalid)?
     } else {
-        per_record as u64 * cluster
+        (per_record as u64)
+            .checked_mul(cluster)
+            .ok_or_else(invalid)?
     };
     if !sector.is_power_of_two()
         || !cluster.is_power_of_two()
@@ -1565,6 +1573,28 @@ mod tests {
             !folder(0xA000_0003, FILE_ATTRIBUTE_RECALL_ON_OPEN).may_lack_children(),
             "a junction"
         );
+    }
+
+    #[test]
+    fn hostile_boot_sector_geometry_is_rejected_without_overflow() {
+        let boot = |per_cluster: u8, per_record: u8| {
+            let mut boot = vec![0_u8; 512];
+            boot[3..11].copy_from_slice(b"NTFS    ");
+            boot[0x0B..0x0D].copy_from_slice(&512_u16.to_le_bytes());
+            boot[0x0D] = per_cluster;
+            boot[0x40] = per_record;
+            boot
+        };
+        // A sane volume: 4 KiB clusters, 1 KiB records (0xF6 = -10).
+        let ok = geometry(&boot(8, 0xF6)).unwrap();
+        assert_eq!((ok.cluster, ok.record), (4096, 1024));
+        // Shifts of 64 and more, and products past u64, used to overflow.
+        for (per_cluster, per_record) in [(0x81, 0xF6), (0xC0, 0xF6), (8, 0x80), (8, 0xB6)] {
+            assert!(
+                geometry(&boot(per_cluster, per_record)).is_err(),
+                "{per_cluster:#x} {per_record:#x}"
+            );
+        }
     }
 
     #[test]

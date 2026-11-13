@@ -20,6 +20,7 @@ pub mod cleanup;
 pub mod git;
 mod live;
 mod platform;
+pub mod protect;
 mod reclaim;
 mod stats;
 
@@ -980,6 +981,11 @@ fn reset_progress(control: &ScanControl, options: &ScanOptions) {
         .remaining_entries
         .store(options.max_entries - 1, Ordering::Relaxed);
     control.limit_reached.store(false, Ordering::Relaxed);
+    // A failed NTFS table attempt must not keep showing table progress during
+    // the directory walk that replaces it.
+    control.mft_total.store(0, Ordering::Relaxed);
+    control.mft_read.store(0, Ordering::Relaxed);
+    control.mft_building.store(false, Ordering::Relaxed);
 }
 
 fn thread_pool(options: &ScanOptions) -> Result<rayon::ThreadPool> {
@@ -1415,9 +1421,6 @@ impl Snapshot {
                 gone[id] = true;
             }
         }
-        let tops: Vec<usize> = (1..count)
-            .filter(|&id| gone[id] && !self.entries[id].parent_id.is_some_and(|p| gone[p]))
-            .collect();
         // Parents precede children, so one forward pass marks whole subtrees.
         for id in 1..count {
             if let Some(parent) = self.entries[id].parent_id
@@ -1426,6 +1429,11 @@ impl Snapshot {
                 gone[id] = true;
             }
         }
+        // Outermost removals only, judged after the whole subtrees are marked: a
+        // removed entry inside another removed one must not be subtracted twice.
+        let tops: Vec<usize> = (1..count)
+            .filter(|&id| gone[id] && !self.entries[id].parent_id.is_some_and(|p| gone[p]))
+            .collect();
         let mut entries = self.entries.clone();
         for &top in &tops {
             let removed = self.entries[top].clone();

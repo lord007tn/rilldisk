@@ -202,17 +202,34 @@ pub struct Guard {
     trees: Vec<(PathBuf, &'static str)>,
     /// The running executable: no folder containing it is removed.
     exe: Option<PathBuf>,
+    /// The user's protected-paths file exists but could not be read: every
+    /// removal is refused rather than risk ignoring a protection.
+    unreadable: Option<String>,
 }
 
 impl Guard {
-    /// The protected locations of this machine and user.
+    /// The protected locations of this machine and user, including the user's
+    /// own list ([`crate::protect::config_path`]). What every removal uses.
     pub fn system() -> Self {
+        let mut guard = Self::built_in();
+        match crate::protect::Protected::load() {
+            Ok(protected) => guard.protect_user(&protected),
+            Err(error) => guard.unreadable = Some(error),
+        }
+        guard
+    }
+
+    /// The machine's protected locations (home, system and temp folders, the
+    /// running program) without the user's list, for callers that supply their
+    /// own [`Guard::protect_user`] list, such as tests.
+    pub fn built_in() -> Self {
         let mut guard = Self {
             exact: Vec::new(),
             trees: Vec::new(),
             exe: std::env::current_exe()
                 .ok()
                 .map(|p| canonical(&p).unwrap_or(p)),
+            unreadable: None,
         };
         let env = |key: &str| std::env::var_os(key).filter(|v| !v.is_empty());
         for home in [env("USERPROFILE"), env("HOME")].into_iter().flatten() {
@@ -310,8 +327,19 @@ impl Guard {
         }
     }
 
+    /// Refuse every path the user protected, everything inside them and every
+    /// folder that contains one.
+    pub fn protect_user(&mut self, protected: &crate::protect::Protected) {
+        for path in protected.spellings() {
+            self.trees.push((path.clone(), "a path you protected"));
+        }
+    }
+
     /// Why `path` (canonical) is protected, if it is.
     fn refuses(&self, path: &Path) -> Option<String> {
+        if let Some(error) = &self.unreadable {
+            return Some(format!("is not removed because {error}"));
+        }
         if is_volume_root(path) {
             return Some("is the top of a drive or volume".into());
         }
@@ -809,7 +837,7 @@ fn canonical(path: &Path) -> Option<PathBuf> {
     path.canonicalize().ok().map(crate::simplify)
 }
 
-fn is_volume_root(path: &Path) -> bool {
+pub(crate) fn is_volume_root(path: &Path) -> bool {
     path.parent().is_none() || crate::reclaim::volume_root_path(path)
 }
 
@@ -827,12 +855,12 @@ fn parts(path: &Path) -> Vec<String> {
         .collect()
 }
 
-fn same(a: &Path, b: &Path) -> bool {
+pub(crate) fn same(a: &Path, b: &Path) -> bool {
     parts(a) == parts(b)
 }
 
 /// `inner` is `outer` or below it.
-fn within(inner: &Path, outer: &Path) -> bool {
+pub(crate) fn within(inner: &Path, outer: &Path) -> bool {
     let (inner, outer) = (parts(inner), parts(outer));
     inner.len() >= outer.len() && inner[..outer.len()] == outer[..]
 }
@@ -857,6 +885,7 @@ mod tests {
                     .join("tools")
                     .join("rilldisk"),
             ),
+            unreadable: None,
         };
         guard.protect(&home, "your home folder");
         guard.protect_tree(&system, "a system folder");
@@ -880,11 +909,59 @@ mod tests {
     }
 
     #[test]
+    fn user_protections_refuse_the_path_its_contents_and_its_parents() {
+        let base = tempfile::tempdir().unwrap();
+        let keep = base.path().join("work").join("client");
+        std::fs::create_dir_all(keep.join("node_modules")).unwrap();
+        std::fs::create_dir_all(base.path().join("work").join("other")).unwrap();
+        let mut guard = Guard {
+            exact: Vec::new(),
+            trees: Vec::new(),
+            exe: None,
+            unreadable: None,
+        };
+        let mut protected = crate::protect::Protected::default();
+        protected.add(&keep).unwrap();
+        guard.protect_user(&protected);
+        let c = |p: &Path| canonical(p).unwrap();
+        assert_eq!(
+            guard.refuses(&c(&keep)).as_deref(),
+            Some("is a path you protected")
+        );
+        assert!(
+            guard
+                .refuses(&c(&keep.join("node_modules")))
+                .unwrap()
+                .contains("inside a path you protected")
+        );
+        assert!(
+            guard
+                .refuses(&c(&base.path().join("work")))
+                .unwrap()
+                .contains("contains a path you protected")
+        );
+        assert!(
+            guard
+                .refuses(&c(&base.path().join("work").join("other")))
+                .is_none()
+        );
+        // An unreadable list refuses everything instead of ignoring it.
+        guard.unreadable = Some("the list is locked".into());
+        assert!(
+            guard
+                .refuses(&c(&base.path().join("work").join("other")))
+                .unwrap()
+                .contains("the list is locked")
+        );
+    }
+
+    #[test]
     fn volume_roots_are_refused() {
         let guard = Guard {
             exact: Vec::new(),
             trees: Vec::new(),
             exe: None,
+            unreadable: None,
         };
         #[cfg(windows)]
         for root in [r"C:\", r"D:\", r"\\server\share\"] {

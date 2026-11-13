@@ -66,7 +66,12 @@ pub struct Data {
 impl Data {
     pub(crate) fn analyze(snapshot: Snapshot) -> Self {
         let start = Instant::now();
-        let reclaim = find_reclaimable(&snapshot, now_ms());
+        let mut reclaim = find_reclaimable(&snapshot, now_ms());
+        // The user's never-touch list (protected-paths.txt). An unreadable list
+        // hides nothing here, but cleanup then refuses every removal.
+        if let Ok(protected) = rilldisk_core::protect::Protected::load() {
+            reclaim.exclude_protected(&protected);
+        }
         let candidate_of = reclaim
             .candidates
             .iter()

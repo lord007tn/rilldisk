@@ -4,6 +4,8 @@ Status: implemented, November 3, 2026, in the core (`rilldisk_core::git`,
 `Candidate::inspect_git`, `ReclaimReport::inspect_git`), the CLI
 (`rilldisk reclaim --git [--stale-days N]`) and the desktop (verdict chips, "Select
 clean idle worktrees", a warning in the removal dialog, a Settings section).
+Amended November 13, 2026: commits already applied elsewhere, and a next step
+([cleanup-lessons.md](../cleanup-lessons.md)).
 
 AGENTS.md asks for a scoped proposal before RillDisk starts another program or
 reads more than metadata. This document is that scope. Anything not described here
@@ -41,6 +43,21 @@ A lock (`git worktree lock`) also matters: someone said "keep this".
    - `remote`
    - `rev-list --count HEAD --not --remotes`
    - `rev-list --count HEAD --not --branches --tags --remotes` (detached HEAD only)
+   - when there are commits only here (detached) or unpushed branch commits with a
+     remote: `for-each-ref --format=%(refname) refs/remotes/`,
+     `rev-parse --symbolic-full-name <upstream>` (an upstream counts for branch
+     commits only when it is a remote-tracking ref),
+     `rev-parse --verify -q refs/heads/main` (and `master`, detached only),
+     `rev-list --no-merges HEAD --not --branches --tags --remotes` (detached) or
+     `--not --remotes` (branch), and, for at most four bases (the upstream, each
+     `refs/remotes/<remote>/HEAD`, local `main` or `master`),
+     `rev-list --cherry-mark --no-merges <base>...HEAD`. Git's matching ignores
+     whitespace, so it only proposes pairs: each is confirmed byte for byte with
+     `log --no-walk -p --binary --full-index --no-textconv --no-ext-diff <commits>`
+     piped into `patch-id --verbatim` (Git 2.39 or later; older Git confirms
+     nothing). Patch IDs hash each line only up to a NUL byte, so patches that
+     contain one confirm nothing. Patch IDs are computed in memory; nothing is
+     written.
    - `rev-parse --absolute-git-dir`, then a metadata check for `<git-dir>/locked`
 3. **Read-only.** `--no-optional-locks` and `GIT_OPTIONAL_LOCKS=0` stop `status`
    from refreshing or writing the index. fsmonitor hooks and the untracked cache
@@ -59,7 +76,16 @@ A lock (`git worktree lock`) also matters: someone said "keep this".
    locked; active (clean, but commits or file changes within the idle threshold,
    14 days by default); clean and idle; unknown. Each verdict comes with a
    suggested command (commit or stash first, create a branch first, unlock first,
-   or `git worktree remove`). Verdicts never change a candidate's safety class:
+   or `git worktree remove`). A commit that no ref holds but whose patch another
+   branch already has (after a cherry-pick or rebase) is counted as applied
+   (`commits_only_here_applied`, `unpushed_applied`) and is not lost work; merge
+   commits and any Git error never count as applied, and at most 500 commits are
+   compared. Each report also has a `next_step`: keep (locked, worked on within
+   the idle threshold, or unknown), archive then remove (idle with unsaved work or
+   detached-only commits), push (idle and clean, branch has commits no remote has
+   as the same change), or remove. Git cannot see programs or assistant threads
+   still using a folder, so the CLI says so next to every step but keep.
+   Verdicts never change a candidate's safety class:
    worktrees stay "Review first". The wording says what Git reports, never that a
    worktree is safe: `git status` does not list ignored files (`.env`, local
    settings), and nothing here detects a program still working in the folder.
@@ -99,5 +125,8 @@ file changed. It also changes worktrees after they were judged (an untracked fil
 a lock, a detached-only commit, new activity, a moved main repository) and checks
 that removal refuses each one, while a clean worktree with unpushed branch commits
 and an explicitly unchecked one still reach the remover (nothing is deleted: the
-test records instead). `reclaim::tests` and the CLI tests check that a missing
+test records instead). A third test pushes to a bare remote, cherry-picks a
+detached commit and a branch commit onto `main`, and checks that both count as
+applied, that a commit found nowhere else does not, the next step of each, and
+that no ref was written. `reclaim::tests` and the CLI tests check that a missing
 report becomes unknown and keeps a worktree out of `--git --delete`.

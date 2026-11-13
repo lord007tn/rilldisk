@@ -332,6 +332,48 @@ fn retain_recomputes_totals() {
     assert_eq!(report.total_logical_bytes, 50_000);
 }
 
+/// Dropping an enclosing candidate (a safety filter, a protected path) must not
+/// leave its children pointing at it: they would be labelled "inside another
+/// candidate" and left out of every total.
+#[test]
+fn retain_repoints_children_of_dropped_candidates() {
+    let root = tempfile::tempdir().unwrap();
+    let r = root.path();
+    let outer = r.join(".claude/worktrees/outer");
+    let inner = outer.join(".codex/worktrees/inner");
+    write(&outer.join(".git"), 40);
+    write(&inner.join(".git"), 40);
+    write(&inner.join("package.json"), 10);
+    write(&inner.join("node_modules/x.js"), 30_000);
+    let snapshot = scan(r, ScanOptions::default(), Arc::default()).unwrap();
+    let report = find_reclaimable(&snapshot, 0);
+    let id = |report: &rilldisk_core::ReclaimReport, path: &Path| {
+        report
+            .candidates
+            .iter()
+            .find(|c| c.path.ends_with(path.strip_prefix(r).unwrap()))
+            .map(|c| (c.entry_id, c.nested_in))
+            .unwrap()
+    };
+    let (outer_id, _) = id(&report, &outer);
+    let (inner_id, inner_parent) = id(&report, &inner);
+    assert_eq!(inner_parent, Some(outer_id));
+    assert_eq!(id(&report, &inner.join("node_modules")).1, Some(inner_id));
+
+    // Only the middle one goes: node_modules now sits directly in `outer`.
+    let mut middle = report.clone();
+    middle.retain(|c| c.entry_id != inner_id);
+    assert_eq!(id(&middle, &inner.join("node_modules")).1, Some(outer_id));
+    assert_eq!(middle.total_logical_bytes, report.total_logical_bytes);
+
+    // Review items filtered out: node_modules is outermost and counted.
+    let mut regenerable = report.clone();
+    regenerable.retain(|c| c.safety == Safety::Regenerable);
+    assert_eq!(regenerable.candidate_count, 1);
+    assert_eq!(id(&regenerable, &inner.join("node_modules")).1, None);
+    assert_eq!(regenerable.total_logical_bytes, 30_000);
+}
+
 #[test]
 fn finds_unix_home_caches_trash_and_agent_worktrees() {
     let root = tempfile::tempdir().unwrap();
@@ -523,4 +565,70 @@ fn unix_suggested_commands_omit_unsafe_paths() {
         action("cash$crate/target"),
         "cargo clean --manifest-path <this project's Cargo.toml>"
     );
+}
+
+const DAY_MS: u64 = 86_400_000;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+fn age(path: &Path, days: u64) {
+    let when = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86_400);
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(when)
+        .unwrap();
+}
+
+#[test]
+fn idle_days_come_from_files_not_folder_times() {
+    let root = tempfile::tempdir().unwrap();
+    let r = root.path();
+    write(&r.join("web/package.json"), 10);
+    write(&r.join("web/node_modules/a/index.js"), 20_000);
+    write(&r.join("web/node_modules/b/index.js"), 20_000);
+    age(&r.join("web/node_modules/a/index.js"), 60);
+    age(&r.join("web/node_modules/b/index.js"), 90);
+    // Removing an entry refreshes its folder's time, as a partial cleanup does;
+    // nobody worked here.
+    write(&r.join("web/node_modules/c/stale.txt"), 10);
+    fs::remove_dir_all(r.join("web/node_modules/c")).unwrap();
+    // An empty leftover folder in an agent worktrees folder has no files at all.
+    fs::create_dir_all(r.join(".t3/worktrees/leftover")).unwrap();
+    let snapshot = scan(r, ScanOptions::default(), Arc::default()).unwrap();
+    let now = now_ms();
+    let report = find_reclaimable(&snapshot, now);
+    let modules = report
+        .candidates
+        .iter()
+        .find(|c| c.path.ends_with("node_modules"))
+        .unwrap();
+    let folder = snapshot
+        .entries
+        .iter()
+        .find(|e| e.id == modules.entry_id)
+        .unwrap();
+    assert!(
+        now - folder.modified_unix_ms.unwrap() < DAY_MS,
+        "the folder itself looks recent"
+    );
+    assert_eq!(modules.idle_days, Some(60), "{modules:#?}");
+    assert!(
+        modules
+            .reason
+            .contains("Nothing inside changed for 60 days")
+    );
+    // No files: the folder's own time is all there is.
+    let leftover = report
+        .candidates
+        .iter()
+        .find(|c| c.path.ends_with("leftover"))
+        .unwrap();
+    assert_eq!(leftover.idle_days, Some(0));
 }

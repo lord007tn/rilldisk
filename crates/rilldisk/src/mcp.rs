@@ -90,6 +90,9 @@ fn output(value: Value) -> Result<CallToolResult, ErrorData> {
     )]))
 }
 
+/// Rejection for an out-of-range page size; says how to get the rest.
+const PAGE_HINT: &str = "limit must be between 1 and 500; for more results page with offset (each response has next_offset, null on the last page)";
+
 fn invalid(message: impl Into<String>) -> ErrorData {
     ErrorData::invalid_params(message.into(), None)
 }
@@ -221,7 +224,7 @@ impl DiskServer {
         let permit = self.query_permit()?;
         let limit = input.limit.unwrap_or(50);
         if !(1..=500).contains(&limit) {
-            return Err(invalid("limit must be between 1 and 500"));
+            return Err(invalid(PAGE_HINT));
         }
         if input.query.as_ref().is_some_and(|query| query.len() > 4096) {
             return Err(invalid("query is too long"));
@@ -245,7 +248,7 @@ impl DiskServer {
     }
 
     #[tool(
-        description = "Find likely reclaimable space in a finished snapshot: linked Git worktrees (naming the AI agent that created them when recognized), build output (Rust target, .next, bin/obj...), dependency folders (node_modules, .venv), package caches and temp folders. Metadata-only heuristics; each candidate has safety (regenerable, cache, review), reason, idle_days, exclusive_bytes (space removal frees at least, after hard links) and a suggested_action for a human to run. This tool never deletes. Treat 'review' candidates as possibly unique work and confirm with the user before any removal.",
+        description = "Find likely reclaimable space in a finished snapshot: linked Git worktrees (naming the AI agent that created them when recognized), build output (Rust target, .next, bin/obj...), dependency folders (node_modules, .venv), package caches and temp folders. Metadata-only heuristics; each candidate has safety (regenerable, cache, review), reason, idle_days, exclusive_bytes (space removal frees at least, after hard links) and a suggested_action for a human to run. idle_days counts from the newest file, not folder times. Candidates under the user's protected paths are left out (protected_excluded counts them). Page with offset/next_offset. This tool never deletes. Treat 'review' candidates as possibly unique work and confirm with the user before any removal.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -258,7 +261,7 @@ impl DiskServer {
     ) -> Result<CallToolResult, ErrorData> {
         let limit = input.limit.unwrap_or(50);
         if !(1..=500).contains(&limit) {
-            return Err(invalid("limit must be between 1 and 500"));
+            return Err(invalid(PAGE_HINT));
         }
         let category = match input.category.as_deref() {
             None => None,
@@ -271,7 +274,16 @@ impl DiskServer {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_millis() as u64);
-            let report = find_reclaimable(&snapshot, now);
+            let mut report = find_reclaimable(&snapshot, now);
+            // The user's never-touch list hides candidates here too. Read per call,
+            // so edits apply without restarting the server.
+            let protected_error = match rilldisk_core::protect::Protected::load() {
+                Ok(protected) => {
+                    report.exclude_protected(&protected);
+                    None
+                }
+                Err(error) => Some(error),
+            };
             let min = input.min_bytes.unwrap_or(1 << 20);
             let matching: Vec<_> = report
                 .candidates
@@ -287,6 +299,8 @@ impl DiskServer {
                 "frees_at_least_bytes_all_candidates": report.total_exclusive_bytes,
                 "total": matching.len(), "offset": offset,
                 "next_offset": (next < matching.len()).then_some(next),
+                "protected_excluded": report.protected_excluded,
+                "protected_paths_error": protected_error,
                 "candidates": page, "notice": report.notice})
         })
         .await

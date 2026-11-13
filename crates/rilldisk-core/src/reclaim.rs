@@ -107,8 +107,12 @@ pub struct Candidate {
     /// Logical bytes of files that also have a name elsewhere (for example a pnpm
     /// store). Removing this folder alone does not free them.
     pub shared_bytes: u64,
+    /// Newest last-write time of a file in the folder. Folder times are left out:
+    /// adding or removing an entry refreshes a folder's time without anyone
+    /// working there (a partial cleanup would make its parent look active). The
+    /// folder's own time when it holds no files.
     pub newest_modified_unix_ms: Option<u64>,
-    /// Whole days since anything in the folder was written, if known.
+    /// Whole days since a file in the folder was written, if known.
     pub idle_days: Option<u64>,
     /// Enclosing candidate. Nested candidates are excluded from totals.
     pub nested_in: Option<usize>,
@@ -159,6 +163,9 @@ pub struct ReclaimReport {
     /// Space freed by removing every outermost candidate, counting hard links found
     /// within this scan.
     pub total_exclusive_bytes: u64,
+    /// Candidates left out because they are, are inside or contain a path the
+    /// user protected ([`ReclaimReport::exclude_protected`]).
+    pub protected_excluded: usize,
     pub candidates: Vec<Candidate>,
     pub notice: &'static str,
 }
@@ -829,15 +836,40 @@ impl ReclaimReport {
         }
     }
 
+    /// Leave out every candidate that is, is inside or contains a protected path,
+    /// and count them in `protected_excluded`. Returns how many were left out.
+    pub fn exclude_protected(&mut self, protected: &crate::protect::Protected) -> usize {
+        if protected.is_empty() {
+            return 0;
+        }
+        let before = self.candidates.len();
+        self.retain(|c| protected.covering(&c.path).is_none());
+        let excluded = before - self.candidates.len();
+        self.protected_excluded += excluded;
+        excluded
+    }
+
     /// Keep matching candidates and recompute every total from what remains.
+    /// A kept candidate whose enclosing candidate was dropped points at the
+    /// nearest enclosing one still kept, or at none, so totals and "inside another
+    /// candidate" labels stay right.
     pub fn retain(&mut self, keep: impl Fn(&Candidate) -> bool) {
+        let enclosing: HashMap<usize, Option<usize>> = self
+            .candidates
+            .iter()
+            .map(|c| (c.entry_id, c.nested_in))
+            .collect();
         self.candidates.retain(|c| keep(c));
         let kept: std::collections::HashSet<usize> =
             self.candidates.iter().map(|c| c.entry_id).collect();
-        let outer = self
-            .candidates
-            .iter()
-            .filter(|c| c.nested_in.is_none_or(|n| !kept.contains(&n)));
+        for candidate in &mut self.candidates {
+            let mut up = candidate.nested_in;
+            while let Some(id) = up.filter(|id| !kept.contains(id)) {
+                up = enclosing.get(&id).copied().flatten();
+            }
+            candidate.nested_in = up;
+        }
+        let outer = self.candidates.iter().filter(|c| c.nested_in.is_none());
         self.candidate_count = self.candidates.len();
         self.total_logical_bytes = outer.clone().map(|c| c.logical_bytes).sum();
         self.total_unique_logical_bytes = outer.clone().map(|c| c.unique_logical_bytes).sum();
@@ -962,9 +994,9 @@ pub fn find_reclaimable(snapshot: &Snapshot, now_unix_ms: u64) -> ReclaimReport 
             continue;
         }
         let entry = &entries[*id];
-        let idle_days = entry
-            .modified_unix_ms
-            .map(|m| now_unix_ms.saturating_sub(m) / 86_400_000);
+        let subtree = subtree(snapshot, *id);
+        let newest = subtree.newest_file_ms.or(entry.modified_unix_ms);
+        let idle_days = newest.map(|m| now_unix_ms.saturating_sub(m) / 86_400_000);
         let mut reason = rule.reason.to_string();
         if let Some(detail) = detail {
             reason.push(' ');
@@ -973,7 +1005,6 @@ pub fn find_reclaimable(snapshot: &Snapshot, now_unix_ms: u64) -> ReclaimReport 
         if let Some(days) = idle_days.filter(|&d| d >= 30) {
             reason.push_str(&format!(" Nothing inside changed for {days} days."));
         }
-        let (exclusive_bytes, shared_bytes) = exclusive(snapshot, *id);
         let path = snapshot.path(*id);
         let suggested_action = if rule.category == Category::GitWorktree && rule.action.is_empty() {
             match quoted(&path) {
@@ -1011,9 +1042,9 @@ pub fn find_reclaimable(snapshot: &Snapshot, now_unix_ms: u64) -> ReclaimReport 
             unique_logical_bytes: entry.unique_logical_bytes,
             allocated_bytes: entry.allocated_bytes,
             file_count: entry.file_count,
-            exclusive_bytes,
-            shared_bytes,
-            newest_modified_unix_ms: entry.modified_unix_ms,
+            exclusive_bytes: subtree.exclusive_bytes,
+            shared_bytes: subtree.shared_bytes,
+            newest_modified_unix_ms: newest,
             idle_days,
             nested_in: enclosing.map(|(parent, _)| parent),
             git: None,
@@ -1044,6 +1075,7 @@ pub fn find_reclaimable(snapshot: &Snapshot, now_unix_ms: u64) -> ReclaimReport 
             .filter(|c| c.nested_in.is_none())
             .map(|c| c.exclusive_bytes)
             .sum(),
+        protected_excluded: 0,
         candidates,
         notice: NOTICE,
     }
@@ -1333,16 +1365,33 @@ fn root_depth(snapshot: &Snapshot) -> usize {
     snapshot.path(0).components().count()
 }
 
-/// Split a subtree's files into space only this folder holds and hard-linked space.
-fn exclusive(snapshot: &Snapshot, id: usize) -> (u64, u64) {
-    let (mut exclusive, mut shared) = (0_u64, 0_u64);
+/// What one walk over a candidate's files finds.
+struct Subtree {
+    /// Space only this folder holds.
+    exclusive_bytes: u64,
+    /// Logical bytes of files with another hard link in the scan.
+    shared_bytes: u64,
+    /// Newest file write time; folder and link times are not work.
+    newest_file_ms: Option<u64>,
+}
+
+fn subtree(snapshot: &Snapshot, id: usize) -> Subtree {
+    let mut found = Subtree {
+        exclusive_bytes: 0,
+        shared_bytes: 0,
+        newest_file_ms: None,
+    };
     let mut stack = vec![id];
     while let Some(current) = stack.pop() {
         let entry = &snapshot.entries[current];
         match entry.kind {
-            EntryKind::File if entry.multiple_links => shared += entry.logical_bytes,
             EntryKind::File => {
-                exclusive += entry.allocated_bytes.unwrap_or(entry.logical_bytes);
+                if entry.multiple_links {
+                    found.shared_bytes += entry.logical_bytes;
+                } else {
+                    found.exclusive_bytes += entry.allocated_bytes.unwrap_or(entry.logical_bytes);
+                }
+                found.newest_file_ms = found.newest_file_ms.max(entry.modified_unix_ms);
             }
             EntryKind::Directory => {
                 stack.extend(snapshot.children(current).iter().map(|&c| c as usize));
@@ -1350,7 +1399,7 @@ fn exclusive(snapshot: &Snapshot, id: usize) -> (u64, u64) {
             _ => {}
         }
     }
-    (exclusive, shared)
+    found
 }
 
 /// `<tool>\worktrees` folders that AI coding agents create: `.claude`, `.codex`,

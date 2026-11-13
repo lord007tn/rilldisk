@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use rilldisk_core::{
     Backend, ReclaimReport, Safety, ScanControl, ScanOptions, Snapshot, Summary, find_reclaimable,
+    protect::{self, Protected},
     scan, volumes,
 };
 use std::{
@@ -133,6 +134,12 @@ enum Command {
         /// many days is reported as idle.
         #[arg(long, default_value_t = rilldisk_core::git::DEFAULT_STALE_DAYS, requires = "git")]
         stale_days: u64,
+        /// Never suggest or remove this folder, anything inside it or any folder
+        /// containing it. Repeat for more. Adds to the paths listed one per line in
+        /// protected-paths.txt in the RillDisk state folder (%LOCALAPPDATA%\RillDisk
+        /// on Windows).
+        #[arg(long, value_name = "PATH")]
+        protect: Vec<PathBuf>,
     },
     /// List local drives with capacity and free space.
     Drives {
@@ -367,7 +374,9 @@ async fn main() -> Result<ExitCode> {
             yes,
             git,
             stale_days,
+            protect,
         } if delete => {
+            let extra = extra_protections(&protect)?;
             let code = std::cell::Cell::new(None);
             // No elevation hint: it would suggest removing folders as root.
             let scan_code = run(args, Hint::Off, |writer, snapshot| {
@@ -376,6 +385,7 @@ async fn main() -> Result<ExitCode> {
                 report.retain(|c| {
                     c.logical_bytes >= min_size && safety.iter().any(|s| s.matches(c.safety))
                 });
+                apply_protections(&mut report, &extra);
                 if git {
                     report.inspect_git(now_ms(), stale_days);
                     let before = report.candidates.len();
@@ -395,6 +405,7 @@ async fn main() -> Result<ExitCode> {
                         permanent,
                         yes,
                         json: matches!(format, ReportFormat::Json),
+                        protected: extra.clone(),
                     },
                 )?));
                 Ok(())
@@ -409,8 +420,10 @@ async fn main() -> Result<ExitCode> {
             safety,
             git,
             stale_days,
+            protect,
             ..
         } => {
+            let extra = extra_protections(&protect)?;
             let hint = if matches!(format, ReportFormat::Table) {
                 Hint::Output
             } else {
@@ -424,6 +437,7 @@ async fn main() -> Result<ExitCode> {
                             .as_ref()
                             .is_none_or(|s| s.iter().any(|s| s.matches(c.safety)))
                 });
+                apply_protections(&mut report, &extra);
                 if git {
                     report.inspect_git(now_ms(), stale_days);
                 }
@@ -439,6 +453,38 @@ async fn main() -> Result<ExitCode> {
             .await
         }
     }
+}
+
+/// The `--protect` paths. Relative paths are refused rather than guessed.
+fn extra_protections(paths: &[PathBuf]) -> Result<Protected> {
+    let mut protected = Protected::default();
+    for path in paths {
+        protected
+            .add(path)
+            .map_err(|problem| anyhow::anyhow!("--protect: {problem}"))?;
+    }
+    for problem in &protected.problems {
+        eprintln!("warning: --protect: {problem}");
+    }
+    Ok(protected)
+}
+
+/// Leave out candidates under the user's protected paths (file and `--protect`).
+/// An unreadable file is reported; `--delete` then refuses every item, because
+/// the cleanup guard loads the same file.
+fn apply_protections(report: &mut ReclaimReport, extra: &Protected) {
+    let mut protected = match Protected::load() {
+        Ok(protected) => protected,
+        Err(error) => {
+            eprintln!("warning: {error}; protected paths from it are not applied");
+            Protected::default()
+        }
+    };
+    for problem in &protected.problems {
+        eprintln!("warning: {}: {problem}", protect::FILE_NAME);
+    }
+    protected.extend(extra);
+    report.exclude_protected(&protected);
 }
 
 /// Where the elevation hint goes, if anywhere.
@@ -789,6 +835,13 @@ fn write_reclaim(
         human(min_size)
     )?;
     writeln!(writer, "{}\n", report.notice)?;
+    if report.protected_excluded > 0 {
+        writeln!(
+            writer,
+            "Not listed: {} candidate(s) under your protected paths.\n",
+            report.protected_excluded
+        )?;
+    }
     writeln!(
         writer,
         "{:>10}  {:>10}  {:<12} {:>6}  {:<26} PATH",
@@ -817,6 +870,17 @@ fn write_reclaim(
                 "",
                 git.verdict.label(),
                 git.summary
+            )?;
+            writeln!(
+                writer,
+                "{:>22}  next: {}{}",
+                "",
+                git.next_step.label(),
+                if git.next_step == rilldisk_core::git::NextStep::Keep {
+                    ""
+                } else {
+                    " (Git cannot see programs or assistant threads still using it)"
+                }
             )?;
         }
         writeln!(writer, "{:>22}  -> {}", "", c.suggested_action)?;

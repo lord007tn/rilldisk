@@ -156,6 +156,177 @@ fn worktree_verdicts_come_from_git_and_change_nothing() {
     }
 }
 
+fn git_out(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .expect("run git");
+    assert!(output.status.success(), "git {args:?}");
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+/// Commit one new file in `dir` and return the commit.
+fn commit_file(dir: &Path, name: &str) -> String {
+    std::fs::write(dir.join(name), format!("{name}\n")).unwrap();
+    git(dir, &["add", name]);
+    git(dir, &["commit", "-q", "-m", name]);
+    git_out(dir, &["rev-parse", "HEAD"])
+}
+
+/// Commits whose change already landed elsewhere (cherry-picked or rebased) are
+/// not lost work; the next step follows from that and from idle time.
+#[test]
+fn applied_commits_and_next_steps_come_from_real_repositories() {
+    use rilldisk_core::git::{GitReport, NextStep};
+    if !have_git() {
+        eprintln!("git is not installed; skipping");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let root = rilldisk_core::simplify(dir.path().canonicalize().unwrap());
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    commit_file(&repo, "README.md");
+    let remote = root.join("remote.git");
+    git(&root, &["init", "-q", "--bare", remote.to_str().unwrap()]);
+    git(
+        &repo,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&repo, &["push", "-q", "origin", "main"]);
+    git(&repo, &["remote", "set-head", "origin", "main"]);
+    for (name, extra) in [
+        ("picked", vec!["--detach"]),
+        ("unique", vec!["--detach"]),
+        ("rebased", vec!["-b", "feat-rebased"]),
+        ("ahead", vec!["-b", "feat-ahead"]),
+        ("lookalike", vec!["--detach"]),
+        ("nul-lookalike", vec!["--detach"]),
+        ("tracks-local", vec!["--track", "-b", "feat-local"]),
+    ] {
+        let path = root.join("wt").join(name);
+        let mut args = vec!["worktree", "add", "-q"];
+        args.extend(extra);
+        let text = path.to_str().unwrap().to_string();
+        args.push(&text);
+        if name == "tracks-local" {
+            // Its upstream is the local `main`, not a remote branch.
+            args.push("main");
+        }
+        git(&repo, &args);
+    }
+    let wt = |name: &str| root.join("wt").join(name);
+    // Detached commits: one later cherry-picked onto main, one nowhere else.
+    let picked = commit_file(&wt("picked"), "picked.txt");
+    commit_file(&wt("unique"), "unique.txt");
+    // Branch commits: one whose change main got through a cherry-pick (as a
+    // rebase-merge does), one that was never pushed anywhere.
+    let rebased = commit_file(&wt("rebased"), "rebased.txt");
+    commit_file(&wt("ahead"), "ahead.txt");
+    // Same file, same words, different spacing: Git's own patch matching ignores
+    // whitespace and would call these equal.
+    let write_commit = |dir: &Path, text: &str| {
+        std::fs::write(dir.join("spaced.txt"), text).unwrap();
+        git(dir, &["add", "spaced.txt"]);
+        git(dir, &["commit", "-q", "-m", "spaced"]);
+    };
+    write_commit(&wt("lookalike"), "a b\n");
+    // The same, after a NUL byte in a file diffed as text: patch IDs, even
+    // verbatim ones, hash each line only up to its first NUL.
+    std::fs::write(repo.join(".git/info/attributes"), "zero.txt diff\n").unwrap();
+    let write_nul_commit = |dir: &Path, text: &[u8]| {
+        std::fs::write(dir.join("zero.txt"), text).unwrap();
+        git(dir, &["add", "zero.txt"]);
+        git(dir, &["commit", "-q", "-m", "nul"]);
+    };
+    write_nul_commit(&wt("nul-lookalike"), b"prefix\0a b\n");
+    let local = commit_file(&wt("tracks-local"), "local.txt");
+    // Main moves on first, so a cherry-pick is a new commit with the same patch
+    // (on the same parent within the same second it would be the same commit).
+    commit_file(&repo, "main.txt");
+    git(&repo, &["cherry-pick", &picked]);
+    git(&repo, &["cherry-pick", &rebased]);
+    write_commit(&repo, "ab\n");
+    write_nul_commit(&repo, b"prefix\0ab\n");
+    git(&repo, &["push", "-q", "origin", "main"]);
+    // Applied to local main only, after the push: no remote has it.
+    git(&repo, &["cherry-pick", &local]);
+    let refs_before = git_out(&repo, &["for-each-ref"]);
+
+    let state = |name: &str| git::inspect(&wt(name)).unwrap();
+    let picked = state("picked");
+    assert_eq!(
+        (picked.commits_only_here, picked.commits_only_here_applied),
+        (1, 1)
+    );
+    let unique = state("unique");
+    assert_eq!(
+        (unique.commits_only_here, unique.commits_only_here_applied),
+        (1, 0)
+    );
+    let rebased = state("rebased");
+    assert_eq!((rebased.unpushed_commits, rebased.unpushed_applied), (1, 1));
+    let ahead = state("ahead");
+    assert_eq!((ahead.unpushed_commits, ahead.unpushed_applied), (1, 0));
+    let lookalike = state("lookalike");
+    assert_eq!(
+        (
+            lookalike.commits_only_here,
+            lookalike.commits_only_here_applied
+        ),
+        (1, 0),
+        "a whitespace-only match is not the same work"
+    );
+    let nul_lookalike = state("nul-lookalike");
+    assert_eq!(
+        (
+            nul_lookalike.commits_only_here,
+            nul_lookalike.commits_only_here_applied
+        ),
+        (1, 0),
+        "a match hidden after a NUL byte is not confirmed"
+    );
+    let tracks_local = state("tracks-local");
+    assert_eq!(tracks_local.upstream.as_deref(), Some("main"));
+    assert_eq!(
+        (tracks_local.unpushed_commits, tracks_local.unpushed_applied),
+        (1, 0),
+        "a local upstream is not a remote"
+    );
+
+    let later = now_ms() + 30 * DAY;
+    let judge = |name: &str, state: git::GitState, now: u64| {
+        let report = GitReport::new(Ok(state), &wt(name), None, now, git::DEFAULT_STALE_DAYS);
+        (report.verdict, report.next_step)
+    };
+    assert_eq!(
+        judge("picked", picked, later),
+        (Verdict::CleanIdle, NextStep::Remove)
+    );
+    assert_eq!(
+        judge("unique", unique.clone(), later),
+        (Verdict::CommitsOnlyHere, NextStep::ArchiveThenRemove)
+    );
+    assert_eq!(
+        judge("unique", unique, now_ms()),
+        (Verdict::CommitsOnlyHere, NextStep::Keep),
+        "worked on today"
+    );
+    assert_eq!(
+        judge("rebased", rebased, later),
+        (Verdict::CleanIdle, NextStep::Remove)
+    );
+    assert_eq!(
+        judge("ahead", ahead, later),
+        (Verdict::CleanIdle, NextStep::Push)
+    );
+    // Inspection wrote no refs.
+    assert_eq!(git_out(&repo, &["for-each-ref"]), refs_before);
+}
+
 fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(dir).unwrap().flatten() {
@@ -301,7 +472,7 @@ fn cleanup_rechecks_git_and_refuses_stale_reassurance() {
         &report,
         &ids,
         cleanup::CleanupMode::Trash,
-        &Guard::system(),
+        &Guard::built_in(),
         &CleanupControl::default(),
         &mut |path, _| {
             reached.push(path.to_path_buf());

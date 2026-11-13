@@ -72,7 +72,8 @@ Exactly which files are written, the backups, consent and what is never done:
 4. Call `query_entries` with the ID, optionally `parent_id`, `query`, `files_only`,
    `offset` and `limit`. Root entry ID is 0. Results are ordered by logical size
    descending and entry ID ascending. `next_offset: null` ends pagination. Default
-   page size is 50, maximum 500.
+   page size is 50, maximum 500; a larger `limit` is rejected with a message that
+   points to `offset`/`next_offset`.
 5. Call `find_reclaimable` with the ID to list likely reclaimable folders: linked
    Git worktrees (naming the AI agent that created them when it is recognized), orphaned agent worktrees,
    build output, dependency folders, package caches, temp folders and the Recycle
@@ -85,6 +86,11 @@ Exactly which files are written, the backups, consent and what is never done:
    space removing it frees at least), `shared_bytes` (hard-linked elsewhere),
    `nested_in` and a
    `suggested_action` for the user to run. Totals count outermost candidates only.
+   `idle_days` counts from the newest file inside, not folder times. Candidates
+   under the user's protected paths (`protected-paths.txt`, see the README) are
+   left out and counted in `protected_excluded`; `protected_paths_error` is set
+   when that file exists but cannot be read. The server never runs Git, so
+   worktree verdicts and next steps are only in the CLI (`--git`) and desktop.
 6. Call `file_types` for space per extension.
 7. Call `cancel_scan` to request cooperative cancellation. Poll until it stops.
 

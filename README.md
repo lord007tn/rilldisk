@@ -145,7 +145,10 @@ activity since it was judged idle, or cannot answer.
 <sub>From a synthetic test repository; suggested commands omitted.</sub>
 
 The CLI asks Git only with `--git` (`--stale-days N` sets the threshold; JSON gains
-`candidates[].git`). With `--git --delete`, worktrees that Git did not report as
+`candidates[].git`). Each checked worktree also gets a next step: keep (locked,
+recent or unknown), archive then remove, push then remove, or remove. A commit
+whose change another branch already has (cherry-picked or rebased) does not count
+as lost. Idle days come from the newest file inside, not from folder times. With `--git --delete`, worktrees that Git did not report as
 clean, including unknown ones, are left out. The MCP server never runs Git.
 Folders left in an agent's `worktrees` directory without a `.git` are listed as
 *orphaned agent folders*: Git no longer knows them, so there is nothing to ask.
@@ -182,6 +185,14 @@ RillDisk checks again that it:
 * is the same folder the scan found, not a different one created at that path since;
 * is not a drive root, mount point, your home folder, a system folder or the scan root;
 * for Git-checked worktrees, still has no Git-reported changes (see above).
+
+**Protected paths.** List folders RillDisk must never suggest or remove, one
+absolute path per line (`#` comments, `~` for home), in `protected-paths.txt` in
+the RillDisk state folder (`%LOCALAPPDATA%\RillDisk` on Windows,
+`~/Library/Application Support/RillDisk` on macOS, `~/.local/state/rilldisk` on
+Linux), or pass `rilldisk reclaim --protect <path>` for one run. Candidates that
+are, are inside or contain a protected path are left out of the CLI, MCP and
+desktop lists, and cleanup refuses them.
 
 Anything that fails is skipped and reported. Permanent deletion is a separate,
 explicit choice. RillDisk never runs `git worktree prune`; the result tells you
