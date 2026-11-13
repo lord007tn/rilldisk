@@ -45,11 +45,17 @@ A lock (`git worktree lock`) also matters: someone said "keep this".
    - `rev-list --count HEAD --not --branches --tags --remotes` (detached HEAD only)
    - when there are commits only here (detached) or unpushed branch commits with a
      remote: `for-each-ref --format=%(refname) refs/remotes/`,
+     `rev-parse --symbolic-full-name <upstream>` (an upstream counts for branch
+     commits only when it is a remote-tracking ref),
      `rev-parse --verify -q refs/heads/main` (and `master`, detached only),
-     `rev-list --no-merges HEAD --not <the refs above>` and, for at most four
-     bases (the upstream, each `refs/remotes/<remote>/HEAD`, local `main` or
-     `master`), `rev-list --cherry-pick --right-only --no-merges <base>...HEAD`.
-     Patch IDs are computed by Git in memory; nothing is written.
+     `rev-list --no-merges HEAD --not --branches --tags --remotes` (detached) or
+     `--not --remotes` (branch), and, for at most four bases (the upstream, each
+     `refs/remotes/<remote>/HEAD`, local `main` or `master`),
+     `rev-list --cherry-mark --no-merges <base>...HEAD`. Git's matching ignores
+     whitespace, so it only proposes pairs: each is confirmed byte for byte with
+     `log --no-walk -p --binary --full-index --no-textconv --no-ext-diff <commits>`
+     piped into `patch-id --verbatim` (Git 2.39 or later; older Git confirms
+     nothing). Patch IDs are computed in memory; nothing is written.
    - `rev-parse --absolute-git-dir`, then a metadata check for `<git-dir>/locked`
 3. **Read-only.** `--no-optional-locks` and `GIT_OPTIONAL_LOCKS=0` stop `status`
    from refreshing or writing the index. fsmonitor hooks and the untracked cache

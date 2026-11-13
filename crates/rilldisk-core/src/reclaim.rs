@@ -850,14 +850,26 @@ impl ReclaimReport {
     }
 
     /// Keep matching candidates and recompute every total from what remains.
+    /// A kept candidate whose enclosing candidate was dropped points at the
+    /// nearest enclosing one still kept, or at none, so totals and "inside another
+    /// candidate" labels stay right.
     pub fn retain(&mut self, keep: impl Fn(&Candidate) -> bool) {
+        let enclosing: HashMap<usize, Option<usize>> = self
+            .candidates
+            .iter()
+            .map(|c| (c.entry_id, c.nested_in))
+            .collect();
         self.candidates.retain(|c| keep(c));
         let kept: std::collections::HashSet<usize> =
             self.candidates.iter().map(|c| c.entry_id).collect();
-        let outer = self
-            .candidates
-            .iter()
-            .filter(|c| c.nested_in.is_none_or(|n| !kept.contains(&n)));
+        for candidate in &mut self.candidates {
+            let mut up = candidate.nested_in;
+            while let Some(id) = up.filter(|id| !kept.contains(id)) {
+                up = enclosing.get(&id).copied().flatten();
+            }
+            candidate.nested_in = up;
+        }
+        let outer = self.candidates.iter().filter(|c| c.nested_in.is_none());
         self.candidate_count = self.candidates.len();
         self.total_logical_bytes = outer.clone().map(|c| c.logical_bytes).sum();
         self.total_unique_logical_bytes = outer.clone().map(|c| c.unique_logical_bytes).sum();

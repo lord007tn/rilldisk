@@ -203,12 +203,18 @@ fn applied_commits_and_next_steps_come_from_real_repositories() {
         ("unique", vec!["--detach"]),
         ("rebased", vec!["-b", "feat-rebased"]),
         ("ahead", vec!["-b", "feat-ahead"]),
+        ("lookalike", vec!["--detach"]),
+        ("tracks-local", vec!["--track", "-b", "feat-local"]),
     ] {
         let path = root.join("wt").join(name);
         let mut args = vec!["worktree", "add", "-q"];
         args.extend(extra);
         let text = path.to_str().unwrap().to_string();
         args.push(&text);
+        if name == "tracks-local" {
+            // Its upstream is the local `main`, not a remote branch.
+            args.push("main");
+        }
         git(&repo, &args);
     }
     let wt = |name: &str| root.join("wt").join(name);
@@ -219,12 +225,24 @@ fn applied_commits_and_next_steps_come_from_real_repositories() {
     // rebase-merge does), one that was never pushed anywhere.
     let rebased = commit_file(&wt("rebased"), "rebased.txt");
     commit_file(&wt("ahead"), "ahead.txt");
+    // Same file, same words, different spacing: Git's own patch matching ignores
+    // whitespace and would call these equal.
+    let write_commit = |dir: &Path, text: &str| {
+        std::fs::write(dir.join("spaced.txt"), text).unwrap();
+        git(dir, &["add", "spaced.txt"]);
+        git(dir, &["commit", "-q", "-m", "spaced"]);
+    };
+    write_commit(&wt("lookalike"), "a b\n");
+    let local = commit_file(&wt("tracks-local"), "local.txt");
     // Main moves on first, so a cherry-pick is a new commit with the same patch
     // (on the same parent within the same second it would be the same commit).
     commit_file(&repo, "main.txt");
     git(&repo, &["cherry-pick", &picked]);
     git(&repo, &["cherry-pick", &rebased]);
+    write_commit(&repo, "ab\n");
     git(&repo, &["push", "-q", "origin", "main"]);
+    // Applied to local main only, after the push: no remote has it.
+    git(&repo, &["cherry-pick", &local]);
     let refs_before = git_out(&repo, &["for-each-ref"]);
 
     let state = |name: &str| git::inspect(&wt(name)).unwrap();
@@ -242,6 +260,22 @@ fn applied_commits_and_next_steps_come_from_real_repositories() {
     assert_eq!((rebased.unpushed_commits, rebased.unpushed_applied), (1, 1));
     let ahead = state("ahead");
     assert_eq!((ahead.unpushed_commits, ahead.unpushed_applied), (1, 0));
+    let lookalike = state("lookalike");
+    assert_eq!(
+        (
+            lookalike.commits_only_here,
+            lookalike.commits_only_here_applied
+        ),
+        (1, 0),
+        "a whitespace-only match is not the same work"
+    );
+    let tracks_local = state("tracks-local");
+    assert_eq!(tracks_local.upstream.as_deref(), Some("main"));
+    assert_eq!(
+        (tracks_local.unpushed_commits, tracks_local.unpushed_applied),
+        (1, 0),
+        "a local upstream is not a remote"
+    );
 
     let later = now_ms() + 30 * DAY;
     let judge = |name: &str, state: git::GitState, now: u64| {
@@ -418,7 +452,7 @@ fn cleanup_rechecks_git_and_refuses_stale_reassurance() {
         &report,
         &ids,
         cleanup::CleanupMode::Trash,
-        &Guard::system(),
+        &Guard::built_in(),
         &CleanupControl::default(),
         &mut |path, _| {
             reached.push(path.to_path_buf());

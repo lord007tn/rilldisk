@@ -96,7 +96,7 @@ fn permanent_cleanup_removes_only_selected_candidates_and_reports_freed_space() 
         &report,
         &[target, modules],
         CleanupMode::Permanent,
-        &Guard::system(),
+        &Guard::built_in(),
         &control,
     );
     assert_eq!(result.removed, 2, "{result:#?}");
@@ -140,7 +140,7 @@ fn refuses_ids_that_are_not_candidates_of_this_report() {
     let src = (0..snapshot.entries.len())
         .find(|&id| snapshot.path(id) == root.join("app/src"))
         .unwrap();
-    let result = run(&snapshot, &report, &[src, 0, 999_999], &Guard::system());
+    let result = run(&snapshot, &report, &[src, 0, 999_999], &Guard::built_in());
     assert_eq!(result.removed, 0);
     assert_eq!(result.refused.len(), 3);
     assert!(
@@ -158,7 +158,7 @@ fn refuses_ids_that_are_not_candidates_of_this_report() {
     let foreign = id_of(&other_report, &other_root.join("app/target"));
     let mut mixed = report.clone();
     mixed.candidates = other_report.candidates.clone();
-    let result = run(&snapshot, &mixed, &[foreign], &Guard::system());
+    let result = run(&snapshot, &mixed, &[foreign], &Guard::built_in());
     assert_eq!(result.removed, 0);
     assert!(
         result.refused[0].reason.contains("does not match"),
@@ -207,7 +207,7 @@ fn refuses_the_scan_root_trash_folders_and_files() {
         fake_candidate(&snapshot, file, Category::BuildOutput),
         fake_candidate(&snapshot, py, Category::RecycleBin),
     ];
-    let result = run(&snapshot, &report, &[0, file, py], &Guard::system());
+    let result = run(&snapshot, &report, &[0, file, py], &Guard::built_in());
     assert_eq!(result.removed, 0);
     let reasons: Vec<&str> = result.refused.iter().map(|r| r.reason.as_str()).collect();
     assert!(reasons[0].contains("scanned folder"), "{reasons:?}");
@@ -225,7 +225,7 @@ fn refuses_the_home_folder_its_ancestors_and_system_folders() {
     let target = id_of(&report, &root.join("app/target"));
     let modules = id_of(&report, &root.join("web/node_modules"));
     let cache = id_of(&report, &root.join("py/pkg/__pycache__"));
-    let mut guard = Guard::system();
+    let mut guard = Guard::built_in();
     // Pretend the home folder is a candidate, sits inside one, or holds system files.
     guard.protect(&root.join("app/target"), "your home folder");
     guard.protect(&root.join("web/node_modules/a"), "your home folder");
@@ -280,7 +280,7 @@ fn refuses_a_candidate_replaced_by_a_link_or_junction_after_the_scan() {
     let modules = id_of(&report, &root.join("web/node_modules"));
     fs::remove_dir_all(root.join("web/node_modules")).unwrap();
     link_dir(&root.join("web/node_modules"), victim.path());
-    let result = run(&snapshot, &report, &[modules], &Guard::system());
+    let result = run(&snapshot, &report, &[modules], &Guard::built_in());
     assert_eq!(result.removed, 0);
     assert!(refusal(&result).contains("link"), "{result:#?}");
     assert!(victim.path().join("precious.txt").exists());
@@ -310,7 +310,7 @@ fn permanent_cleanup_removes_links_inside_a_candidate_but_not_their_targets() {
         candidate.logical_bytes, 20_010,
         "the link target is not counted"
     );
-    let result = run(&snapshot, &report, &[modules], &Guard::system());
+    let result = run(&snapshot, &report, &[modules], &Guard::built_in());
     assert_eq!(result.removed, 1, "{result:#?}");
     assert!(!root.join("web/node_modules").exists());
     assert_eq!(
@@ -350,7 +350,7 @@ fn protected_paths_hide_candidates_and_block_their_removal() {
     assert!(shown.total_exclusive_bytes < report.total_exclusive_bytes);
     assert_eq!(shown.candidate_count, shown.candidates.len());
 
-    let mut guard = Guard::system();
+    let mut guard = Guard::built_in();
     guard.protect_user(&protected);
     assert!(!cleanup::select_safe(&snapshot, &report, &guard).contains(&modules));
     let result = run(&snapshot, &report, &[modules, target, other], &guard);
@@ -379,7 +379,7 @@ fn refuses_a_candidate_whose_parent_became_a_link() {
     let target = id_of(&report, &root.join("lib/target"));
     fs::remove_dir_all(root.join("lib")).unwrap();
     link_dir(&root.join("lib"), elsewhere.path());
-    let result = run(&snapshot, &report, &[target], &Guard::system());
+    let result = run(&snapshot, &report, &[target], &Guard::built_in());
     assert_eq!(result.removed, 0);
     assert!(
         refusal(&result).contains("different location"),
@@ -404,7 +404,7 @@ fn refuses_a_different_folder_created_at_a_candidate_path_after_the_scan() {
         &report,
         &[target],
         CleanupMode::Permanent,
-        &Guard::system(),
+        &Guard::built_in(),
         &CleanupControl::default(),
         &mut |path, _| {
             removed.push(path.to_path_buf());
@@ -433,7 +433,7 @@ fn refuses_candidates_that_changed_kind_or_vanished() {
     fs::remove_dir_all(root.join("app/target")).unwrap();
     fs::write(root.join("app/target"), b"now a file").unwrap();
     fs::remove_dir_all(root.join("lib/target")).unwrap();
-    let result = run(&snapshot, &report, &[target, lib], &Guard::system());
+    let result = run(&snapshot, &report, &[target, lib], &Guard::built_in());
     assert_eq!(result.removed, 0);
     let reason = |path: &str| {
         let item = result
@@ -474,7 +474,7 @@ fn keeps_going_after_failures_and_reports_each_one() {
         &report,
         &ids,
         CleanupMode::Permanent,
-        &Guard::system(),
+        &Guard::built_in(),
         &CleanupControl::default(),
         &mut remover,
     );
@@ -516,7 +516,7 @@ fn reports_real_removal_errors() {
         )
         .unwrap();
     }
-    let result = run(&snapshot, &report, &[target], &Guard::system());
+    let result = run(&snapshot, &report, &[target], &Guard::built_in());
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -563,7 +563,7 @@ fn cancellation_stops_before_the_next_item() {
         &report,
         &ids,
         CleanupMode::Permanent,
-        &Guard::system(),
+        &Guard::built_in(),
         &control,
         &mut remover,
     );
@@ -586,7 +586,7 @@ fn select_safe_skips_review_items_and_nested_candidates() {
     write(&root.join("wt/feature/Cargo.toml"), 10);
     write(&root.join("wt/feature/target/x.bin"), 5_000);
     let (snapshot, report) = analyze(&root);
-    let safe = cleanup::select_safe(&snapshot, &report, &Guard::system());
+    let safe = cleanup::select_safe(&snapshot, &report, &Guard::built_in());
     let paths: Vec<PathBuf> = safe.iter().map(|&id| snapshot.path(id)).collect();
     assert!(paths.contains(&root.join("app/target")));
     assert!(paths.contains(&root.join("web/node_modules")));
@@ -606,12 +606,12 @@ fn select_safe_skips_review_items_and_nested_candidates() {
         &report,
         &[nested, worktree],
         CleanupMode::Permanent,
-        &Guard::system(),
+        &Guard::built_in(),
     );
     assert_eq!(plan.items.len(), 1);
     assert_eq!(plan.covered, 1);
     assert_eq!(plan.items[0].entry_id, worktree);
-    let result = run(&snapshot, &report, &[nested, worktree], &Guard::system());
+    let result = run(&snapshot, &report, &[nested, worktree], &Guard::built_in());
     assert_eq!(result.removed, 1);
     assert!(
         result
@@ -625,6 +625,27 @@ fn select_safe_skips_review_items_and_nested_candidates() {
 }
 
 #[test]
+fn snapshot_without_counts_a_nested_removal_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fixture(dir.path());
+    let (snapshot, _) = analyze(&root);
+    let id = |path: &str| {
+        (0..snapshot.entries.len())
+            .find(|&id| snapshot.path(id) == root.join(path))
+            .unwrap()
+    };
+    let outer = snapshot.without(&[id("app")]);
+    // Also naming an entry two levels inside it changes nothing.
+    let both = snapshot.without(&[id("app"), id("app/target/debug")]);
+    assert_eq!(both.summary.logical_bytes, outer.summary.logical_bytes);
+    assert_eq!(both.summary.files, outer.summary.files);
+    assert_eq!(
+        both.entries[0].logical_bytes,
+        outer.entries[0].logical_bytes
+    );
+}
+
+#[test]
 fn snapshot_without_removed_subtrees_matches_a_rescan() {
     let dir = tempfile::tempdir().unwrap();
     let root = fixture(dir.path());
@@ -633,7 +654,7 @@ fn snapshot_without_removed_subtrees_matches_a_rescan() {
         id_of(&report, &root.join("app/target")),
         id_of(&report, &root.join("web/node_modules")),
     ];
-    let result = run(&snapshot, &report, &ids, &Guard::system());
+    let result = run(&snapshot, &report, &ids, &Guard::built_in());
     assert_eq!(result.removed, 2);
     let adjusted = snapshot.without(&result.removed_entry_ids());
     let (fresh, _) = analyze(&root);
@@ -700,7 +721,7 @@ fn trash_mode_moves_the_folder_to_the_trash() {
         &report,
         &[target],
         CleanupMode::Trash,
-        &Guard::system(),
+        &Guard::built_in(),
         &CleanupControl::default(),
     );
     match &result.items[0].outcome {

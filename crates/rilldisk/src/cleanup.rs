@@ -154,6 +154,10 @@ pub fn run(
         }
     }
     drop(err);
+    // The prompt may have stayed open for a while: read the protected-paths file
+    // again, so a path protected in the meantime is still refused.
+    let mut guard = Guard::system();
+    guard.protect_user(&options.protected);
     RUNNING.store(true, Ordering::Relaxed);
     let control = CONTROL.clone();
     let progress = {

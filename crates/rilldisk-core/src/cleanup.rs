@@ -209,8 +209,20 @@ pub struct Guard {
 
 impl Guard {
     /// The protected locations of this machine and user, including the user's
-    /// own list ([`crate::protect::config_path`]).
+    /// own list ([`crate::protect::config_path`]). What every removal uses.
     pub fn system() -> Self {
+        let mut guard = Self::built_in();
+        match crate::protect::Protected::load() {
+            Ok(protected) => guard.protect_user(&protected),
+            Err(error) => guard.unreadable = Some(error),
+        }
+        guard
+    }
+
+    /// The machine's protected locations (home, system and temp folders, the
+    /// running program) without the user's list, for callers that supply their
+    /// own [`Guard::protect_user`] list, such as tests.
+    pub fn built_in() -> Self {
         let mut guard = Self {
             exact: Vec::new(),
             trees: Vec::new(),
@@ -219,10 +231,6 @@ impl Guard {
                 .map(|p| canonical(&p).unwrap_or(p)),
             unreadable: None,
         };
-        match crate::protect::Protected::load() {
-            Ok(protected) => guard.protect_user(&protected),
-            Err(error) => guard.unreadable = Some(error),
-        }
         let env = |key: &str| std::env::var_os(key).filter(|v| !v.is_empty());
         for home in [env("USERPROFILE"), env("HOME")].into_iter().flatten() {
             let home = PathBuf::from(home);

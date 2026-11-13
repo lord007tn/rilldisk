@@ -332,6 +332,48 @@ fn retain_recomputes_totals() {
     assert_eq!(report.total_logical_bytes, 50_000);
 }
 
+/// Dropping an enclosing candidate (a safety filter, a protected path) must not
+/// leave its children pointing at it: they would be labelled "inside another
+/// candidate" and left out of every total.
+#[test]
+fn retain_repoints_children_of_dropped_candidates() {
+    let root = tempfile::tempdir().unwrap();
+    let r = root.path();
+    let outer = r.join(".claude/worktrees/outer");
+    let inner = outer.join(".codex/worktrees/inner");
+    write(&outer.join(".git"), 40);
+    write(&inner.join(".git"), 40);
+    write(&inner.join("package.json"), 10);
+    write(&inner.join("node_modules/x.js"), 30_000);
+    let snapshot = scan(r, ScanOptions::default(), Arc::default()).unwrap();
+    let report = find_reclaimable(&snapshot, 0);
+    let id = |report: &rilldisk_core::ReclaimReport, path: &Path| {
+        report
+            .candidates
+            .iter()
+            .find(|c| c.path.ends_with(path.strip_prefix(r).unwrap()))
+            .map(|c| (c.entry_id, c.nested_in))
+            .unwrap()
+    };
+    let (outer_id, _) = id(&report, &outer);
+    let (inner_id, inner_parent) = id(&report, &inner);
+    assert_eq!(inner_parent, Some(outer_id));
+    assert_eq!(id(&report, &inner.join("node_modules")).1, Some(inner_id));
+
+    // Only the middle one goes: node_modules now sits directly in `outer`.
+    let mut middle = report.clone();
+    middle.retain(|c| c.entry_id != inner_id);
+    assert_eq!(id(&middle, &inner.join("node_modules")).1, Some(outer_id));
+    assert_eq!(middle.total_logical_bytes, report.total_logical_bytes);
+
+    // Review items filtered out: node_modules is outermost and counted.
+    let mut regenerable = report.clone();
+    regenerable.retain(|c| c.safety == Safety::Regenerable);
+    assert_eq!(regenerable.candidate_count, 1);
+    assert_eq!(id(&regenerable, &inner.join("node_modules")).1, None);
+    assert_eq!(regenerable.total_logical_bytes, 30_000);
+}
+
 #[test]
 fn finds_unix_home_caches_trash_and_agent_worktrees() {
     let root = tempfile::tempdir().unwrap();

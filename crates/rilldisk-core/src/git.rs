@@ -451,8 +451,17 @@ const MAX_COMPARED_COMMITS: usize = 500;
 
 /// Refs to compare HEAD's commits with: the upstream, each remote's default
 /// branch, and with `local` the usual local default branches. At most four.
+/// Without `local` only remote-tracking refs count: a branch may track a local
+/// branch, and that one says nothing about what a remote holds.
 fn equivalence_bases(path: &Path, upstream: Option<&str>, local: bool) -> Vec<String> {
-    let mut bases: Vec<String> = upstream.map(str::to_string).into_iter().collect();
+    let mut bases: Vec<String> = upstream
+        .and_then(|name| {
+            let full = run(path, &["rev-parse", "--symbolic-full-name", name]).ok()?;
+            let full = full.trim().to_string();
+            (local || full.starts_with("refs/remotes/")).then_some(full)
+        })
+        .into_iter()
+        .collect();
     if let Ok(refs) = run(
         path,
         &["for-each-ref", "--format=%(refname)", "refs/remotes/"],
@@ -476,9 +485,11 @@ fn equivalence_bases(path: &Path, upstream: Option<&str>, local: bool) -> Vec<St
 }
 
 /// How many of HEAD's commits outside `exclude` (`--remotes` and so on) have the
-/// same patch on one of `bases` (`git rev-list --cherry-pick`). Merge commits are
-/// never counted as applied, and any Git failure counts nothing as applied: an
-/// error must not make work look safe to lose.
+/// same patch on one of `bases`, byte for byte. Git's own matching
+/// (`--cherry-mark`) ignores whitespace, so `"a b"` and `"ab"` would match; it
+/// only proposes pairs, and [`verbatim_patch_ids`] confirms them. Merge commits,
+/// empty commits and any Git failure never count as applied: an error must not
+/// make work look safe to lose.
 fn applied_elsewhere(path: &Path, exclude: &[&str], bases: &[String]) -> u64 {
     if bases.is_empty() {
         return 0;
@@ -495,26 +506,68 @@ fn applied_elsewhere(path: &Path, exclude: &[&str], bases: &[String]) -> u64 {
     let total = pending.len();
     for base in bases {
         let range = format!("{base}...HEAD");
-        // HEAD-side commits with no equivalent patch on `base`.
-        let Ok(unmatched) = run(
-            path,
-            &[
-                "rev-list",
-                "--cherry-pick",
-                "--right-only",
-                "--no-merges",
-                &range,
-            ],
-        ) else {
+        // `=` marks commits on either side whose patch Git considers equivalent
+        // to one on the other side (whitespace ignored).
+        let Ok(marked) = run(path, &["rev-list", "--cherry-mark", "--no-merges", &range]) else {
             continue;
         };
-        let unmatched: std::collections::HashSet<&str> = unmatched.lines().collect();
-        pending.retain(|commit| unmatched.contains(commit));
+        let equivalent: Vec<&str> = marked.lines().filter_map(|l| l.strip_prefix('=')).collect();
+        if !equivalent.iter().any(|c| pending.contains(c)) {
+            continue;
+        }
+        if equivalent.len() > 2 * MAX_COMPARED_COMMITS {
+            continue;
+        }
+        let Some(ids) = verbatim_patch_ids(path, &equivalent) else {
+            continue;
+        };
+        // Patch IDs of the commits that stay after removal (not pending).
+        let elsewhere: std::collections::HashSet<&str> = ids
+            .iter()
+            .filter(|(commit, _)| !pending.contains(commit.as_str()))
+            .map(|(_, id)| id.as_str())
+            .collect();
+        pending.retain(|commit| {
+            ids.get(*commit)
+                .is_none_or(|id| !elsewhere.contains(id.as_str()))
+        });
         if pending.is_empty() {
             break;
         }
     }
     (total - pending.len()) as u64
+}
+
+/// Whitespace-preserving patch ID of each commit (`git patch-id --verbatim`,
+/// Git 2.39 or later), keyed by commit. Binary changes are compared in full.
+/// Commits without a patch (empty) are absent. `None` when Git cannot answer.
+fn verbatim_patch_ids(
+    path: &Path,
+    commits: &[&str],
+) -> Option<std::collections::HashMap<String, String>> {
+    let mut args = vec![
+        "log",
+        "--no-walk=unsorted",
+        "-p",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--binary",
+        "--full-index",
+        "--format=commit %H",
+    ];
+    args.extend_from_slice(commits);
+    // Raw bytes: decoding a patch that is not UTF-8 could make two differ-
+    // ent patches look the same.
+    let patches = run_bytes(path, &args, None).ok()?;
+    let ids = run_bytes(path, &["patch-id", "--verbatim"], Some(patches)).ok()?;
+    let ids = String::from_utf8_lossy(&ids);
+    Some(
+        ids.lines()
+            .filter_map(|line| line.split_once(' '))
+            .map(|(id, commit)| (commit.to_string(), id.to_string()))
+            .collect(),
+    )
 }
 
 /// `git status --porcelain=v2 --branch -z` output, without the timestamps.
@@ -546,6 +599,12 @@ pub fn parse_status(output: &str) -> GitState {
 
 /// Run one read-only Git command in `dir` and return its standard output.
 fn run(dir: &Path, args: &[&str]) -> Result<String, String> {
+    // Lossy: a file name that is not UTF-8 must not empty the whole output.
+    run_bytes(dir, args, None).map(|out| String::from_utf8_lossy(&out).into_owned())
+}
+
+/// [`run`] returning raw bytes, with optional `input` on standard input.
+fn run_bytes(dir: &Path, args: &[&str], input: Option<Vec<u8>>) -> Result<Vec<u8>, String> {
     // Git does not understand `\\?\` verbatim paths.
     let dir = crate::simplify(dir.to_path_buf());
     let mut command = Command::new("git");
@@ -567,7 +626,11 @@ fn run(dir: &Path, args: &[&str]) -> Result<String, String> {
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(windows)]
@@ -581,13 +644,20 @@ fn run(dir: &Path, args: &[&str]) -> Result<String, String> {
         std::io::ErrorKind::NotFound => "Git is not installed or not on PATH".to_string(),
         _ => format!("could not start Git ({error})"),
     })?;
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        // A thread, so Git can fill its output pipe while it still reads input.
+        std::thread::spawn(move || {
+            use std::io::Write;
+            let _ = stdin.write_all(&input);
+        });
+    }
     // Read both pipes on threads so a chatty command cannot block on a full pipe.
     let mut stdout = child.stdout.take().expect("piped stdout");
     let mut stderr = child.stderr.take().expect("piped stderr");
     let out = std::thread::spawn(move || {
-        let mut text = String::new();
-        let _ = stdout.read_to_string(&mut text);
-        text
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        bytes
     });
     let err = std::thread::spawn(move || {
         let mut text = String::new();
