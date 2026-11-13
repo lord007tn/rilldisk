@@ -55,7 +55,9 @@ A lock (`git worktree lock`) also matters: someone said "keep this".
      whitespace, so it only proposes pairs: each is confirmed byte for byte with
      `log --no-walk -p --binary --full-index --no-textconv --no-ext-diff <commits>`
      piped into `patch-id --verbatim` (Git 2.39 or later; older Git confirms
-     nothing). Patch IDs are computed in memory; nothing is written.
+     nothing). Patch IDs hash each line only up to a NUL byte, so patches that
+     contain one confirm nothing. Patch IDs are computed in memory; nothing is
+     written.
    - `rev-parse --absolute-git-dir`, then a metadata check for `<git-dir>/locked`
 3. **Read-only.** `--no-optional-locks` and `GIT_OPTIONAL_LOCKS=0` stop `status`
    from refreshing or writing the index. fsmonitor hooks and the untracked cache

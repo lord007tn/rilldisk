@@ -204,6 +204,7 @@ fn applied_commits_and_next_steps_come_from_real_repositories() {
         ("rebased", vec!["-b", "feat-rebased"]),
         ("ahead", vec!["-b", "feat-ahead"]),
         ("lookalike", vec!["--detach"]),
+        ("nul-lookalike", vec!["--detach"]),
         ("tracks-local", vec!["--track", "-b", "feat-local"]),
     ] {
         let path = root.join("wt").join(name);
@@ -233,6 +234,15 @@ fn applied_commits_and_next_steps_come_from_real_repositories() {
         git(dir, &["commit", "-q", "-m", "spaced"]);
     };
     write_commit(&wt("lookalike"), "a b\n");
+    // The same, after a NUL byte in a file diffed as text: patch IDs, even
+    // verbatim ones, hash each line only up to its first NUL.
+    std::fs::write(repo.join(".git/info/attributes"), "zero.txt diff\n").unwrap();
+    let write_nul_commit = |dir: &Path, text: &[u8]| {
+        std::fs::write(dir.join("zero.txt"), text).unwrap();
+        git(dir, &["add", "zero.txt"]);
+        git(dir, &["commit", "-q", "-m", "nul"]);
+    };
+    write_nul_commit(&wt("nul-lookalike"), b"prefix\0a b\n");
     let local = commit_file(&wt("tracks-local"), "local.txt");
     // Main moves on first, so a cherry-pick is a new commit with the same patch
     // (on the same parent within the same second it would be the same commit).
@@ -240,6 +250,7 @@ fn applied_commits_and_next_steps_come_from_real_repositories() {
     git(&repo, &["cherry-pick", &picked]);
     git(&repo, &["cherry-pick", &rebased]);
     write_commit(&repo, "ab\n");
+    write_nul_commit(&repo, b"prefix\0ab\n");
     git(&repo, &["push", "-q", "origin", "main"]);
     // Applied to local main only, after the push: no remote has it.
     git(&repo, &["cherry-pick", &local]);
@@ -268,6 +279,15 @@ fn applied_commits_and_next_steps_come_from_real_repositories() {
         ),
         (1, 0),
         "a whitespace-only match is not the same work"
+    );
+    let nul_lookalike = state("nul-lookalike");
+    assert_eq!(
+        (
+            nul_lookalike.commits_only_here,
+            nul_lookalike.commits_only_here_applied
+        ),
+        (1, 0),
+        "a match hidden after a NUL byte is not confirmed"
     );
     let tracks_local = state("tracks-local");
     assert_eq!(tracks_local.upstream.as_deref(), Some("main"));

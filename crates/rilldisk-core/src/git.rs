@@ -540,7 +540,8 @@ fn applied_elsewhere(path: &Path, exclude: &[&str], bases: &[String]) -> u64 {
 
 /// Whitespace-preserving patch ID of each commit (`git patch-id --verbatim`,
 /// Git 2.39 or later), keyed by commit. Binary changes are compared in full.
-/// Commits without a patch (empty) are absent. `None` when Git cannot answer.
+/// Commits without a patch (empty) are absent. `None` when Git cannot answer
+/// or a patch contains a NUL byte.
 fn verbatim_patch_ids(
     path: &Path,
     commits: &[&str],
@@ -560,6 +561,11 @@ fn verbatim_patch_ids(
     // Raw bytes: decoding a patch that is not UTF-8 could make two differ-
     // ent patches look the same.
     let patches = run_bytes(path, &args, None).ok()?;
+    // Patch IDs hash each line only up to its first NUL byte, so a patch that
+    // contains one (a file diffed as text) cannot be confirmed byte for byte.
+    if patches.contains(&0) {
+        return None;
+    }
     let ids = run_bytes(path, &["patch-id", "--verbatim"], Some(patches)).ok()?;
     let ids = String::from_utf8_lossy(&ids);
     Some(
