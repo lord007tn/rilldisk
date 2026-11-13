@@ -61,6 +61,26 @@ Line references are to this branch. "0.1.3" describes behaviour before it.
 | 13 | MCP: paging hint at the 500 cap; are verdicts and owners exposed? | Pagination existed (`next_offset`, [mcp.rs:244](../crates/rilldisk/src/mcp.rs#L244)) but the error just said "limit must be between 1 and 500". The MCP server never runs Git (git-inspection.md), so no verdicts. **Now:** the error explains paging ([mcp.rs:94](../crates/rilldisk/src/mcp.rs#L94)); `find_reclaimable` applies protected paths and reports `protected_excluded` ([mcp.rs:277](../crates/rilldisk/src/mcp.rs#L277)); `idle_days` is file-based | Done in part. Next: owners from item 1 in MCP output (read-only, no program execution needed for database readers); Git verdicts stay CLI/desktop-only | S | Medium |
 | 14 | A final "what remains and why" listing, grouped by root | `reclaim` lists candidates largest first ([main.rs:818](../crates/rilldisk/src/main.rs#L818)); `next_step` now explains Git's view | `rilldisk reclaim --git --group-by root`: per root, each worktree with size, branch, state and keep reason (owner, recent, locked, unsaved work); JSON the same | M | High |
 
+## Field run of this branch
+
+`rilldisk reclaim <home> --git --min-size 50MB` on the same machine the day after
+the cleanup, release build, not elevated: 15.4 million files and 1.56 million
+folders in 244 s, peak memory about 1.5 GB, scan complete with no issues. 299
+candidates; 85 linked worktrees checked with Git. What it showed:
+
+| Finding | Proposed change | Effort | Value |
+| --- | --- | --- | --- |
+| Every worktree's next step was Keep: 65 were active (files written today by assistant threads), 15 had uncommitted changes, 4 had detached-only commits. Spot checks confirmed the activity was real. In one worktree the only fresh files were `.pytest_cache` | Ignore nested Regenerable and Cache folders (the candidate's own nested candidates, plus tool caches such as `.pytest_cache`) when taking the newest file time, as the cleanup scripts did | S | Medium |
+| One worktree came back Unknown because `git rev-list` took over 15 s. Alone, the same commands take 0.2 s: four checks on one large repository right after a big scan hit the per-command timeout. Unknown means Keep, so a healthy worktree drops out of every suggestion | Retry a timed-out check once, alone, with a longer timeout, and check worktrees of the same repository one after another rather than in parallel | S | Medium |
+| A repository held 555 MiB of `tmp_pack_*` / `tmp_obj_*` files in `.git/objects`, left behind by interrupted Git processes (0.56 GiB across two repositories) | A metadata-only rule: such files idle at least a day under a `.git/objects` folder, Cache class, suggested action `git -C <repo> prune` / `git gc` (RillDisk does not run them) | S | Low |
+| Hard-linked bytes dominate: candidates hold 328 GB of logical data but free at most 165 GB, and 167 GB are shared with the pnpm store | Item 6 above (selection-level freed space) matters in practice | M | Medium |
+
+The independent review of the scanner, MCP and updater found no high or medium
+issues. Three low ones are fixed on this branch: `Snapshot::without` subtracting a
+nested removal twice, MFT progress left over after a fallback walk, and unchecked
+boot-sector arithmetic on hostile volumes. By design, releases are verified by
+checksum over HTTPS but not signed.
+
 ## Implemented on this branch
 
 * **Protected paths.** `rilldisk_core::protect`: one absolute path per line in
