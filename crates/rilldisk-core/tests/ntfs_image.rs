@@ -25,12 +25,22 @@ fn image() -> tempfile::NamedTempFile {
 #[test]
 fn reads_names_sizes_links_and_extension_records() {
     let image = image();
-    let control = Arc::new(ScanControl::default());
+    let control = Arc::new(ScanControl::with_live_view());
     let snapshot = scan_ntfs_image(image.path(), ScanOptions::default(), control.clone()).unwrap();
     let s = &snapshot.summary;
     // Entries built in parallel still reach the live view through the collector.
     let live = control.live().expect("published at the end of the scan");
     assert_eq!(live.total_logical(), s.logical_bytes);
+    for folder in &live.folders {
+        assert_eq!(folder.name, snapshot.name(folder.id));
+    }
+    // Without the request there is no view, and the same result.
+    let control = Arc::new(ScanControl::default());
+    let plain = scan_ntfs_image(image.path(), ScanOptions::default(), control.clone()).unwrap();
+    assert!(control.live().is_none());
+    assert_eq!(plain.entries.len(), snapshot.entries.len());
+    assert_eq!(plain.summary.logical_bytes, s.logical_bytes);
+    assert_eq!(plain.summary.allocated_bytes, s.allocated_bytes);
     assert!(s.complete, "{:?}", s.issues);
     assert_eq!(s.backend, "ntfs-mft");
     // small, big, its link, deep, 名前, sparse, 300 numbered, the 50-link target

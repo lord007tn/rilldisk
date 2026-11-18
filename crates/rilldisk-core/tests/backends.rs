@@ -324,7 +324,7 @@ fn mft_matches_the_walk(root: &Path, mft: Snapshot) {
 fn the_live_view_ends_at_the_final_totals_for_every_walk() {
     let root = tree();
     for backend in [Backend::Directory, Backend::Legacy] {
-        let control = Arc::new(ScanControl::default());
+        let control = Arc::new(ScanControl::with_live_view());
         let snapshot = scan(
             root.path(),
             ScanOptions {
@@ -336,5 +336,33 @@ fn the_live_view_ends_at_the_final_totals_for_every_walk() {
         .unwrap();
         let live = control.live().expect("published at the end of the scan");
         assert_eq!(live.total_logical(), snapshot.summary.logical_bytes);
+        // Names come from the scan's own entries.
+        assert!(!live.folders.is_empty());
+        for folder in &live.folders {
+            assert_eq!(folder.name, snapshot.name(folder.id));
+        }
+    }
+}
+
+#[test]
+fn scans_keep_no_live_view_unless_asked() {
+    let root = tree();
+    for backend in [Backend::Directory, Backend::Legacy] {
+        let control = Arc::new(ScanControl::default());
+        let options = ScanOptions {
+            backend,
+            ..Default::default()
+        };
+        let plain = scan(root.path(), options.clone(), control.clone()).unwrap();
+        assert!(control.live().is_none());
+        // Asking for one changes nothing about the result.
+        let watched = scan(
+            root.path(),
+            options,
+            Arc::new(ScanControl::with_live_view()),
+        )
+        .unwrap();
+        assert_eq!(totals(&plain), totals(&watched));
+        assert_eq!(inventory(&plain), inventory(&watched));
     }
 }

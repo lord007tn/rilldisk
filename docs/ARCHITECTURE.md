@@ -259,7 +259,8 @@ enumerates; `Summary.backend` names the one that ran. Every backend feeds the
 same collector, parents before children: the walks store each retained entry
 through `Collector::accept`, and the MFT backend builds its entries in parallel
 directly in the collector's list. `Collector::count` is the single place either
-kind is counted, and both also feed the live view. Rollups, the child index,
+kind is counted. Both also feed the live view when the caller asked for one
+(`ScanControl::with_live_view`, used by the desktop). Rollups, the child index,
 issues, the entry budget, cancellation and partial results are shared.
 Measurements are in [PERFORMANCE.md](PERFORMANCE.md).
 

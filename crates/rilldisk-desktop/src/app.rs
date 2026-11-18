@@ -420,7 +420,8 @@ impl RillApp {
         if root.is_empty() {
             return;
         }
-        let control = Arc::new(ScanControl::default());
+        // The scan dashboard draws from the live view.
+        let control = Arc::new(ScanControl::with_live_view());
         let (tx, rx) = mpsc::channel();
         let (thread_control, thread_root, repaint) =
             (control.clone(), PathBuf::from(&root), ctx.clone());

@@ -413,6 +413,8 @@ pub struct ScanControl {
     limit_reached: AtomicBool,
     /// Set when the scan stops waiting (stall or cancel grace) so leftover workers quit.
     abandoned: AtomicBool,
+    /// Scans keep a live view; see [`ScanControl::with_live_view`].
+    live_enabled: bool,
     /// Latest picture of the scan in progress; see [`ScanControl::live`].
     live: std::sync::Mutex<Option<Arc<LiveView>>>,
     live_focus: AtomicUsize,
@@ -437,6 +439,15 @@ pub struct MftProgress {
 }
 
 impl ScanControl {
+    /// A control whose scan maintains the view read through [`ScanControl::live`],
+    /// for a UI that shows folders while scanning. With [`ScanControl::default`]
+    /// a scan does no live tracking at all and `live` stays `None`.
+    pub fn with_live_view() -> Self {
+        Self {
+            live_enabled: true,
+            ..Self::default()
+        }
+    }
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
@@ -463,7 +474,6 @@ impl ScanControl {
     pub fn live_focus(&self) -> usize {
         self.live_focus.load(Ordering::Relaxed)
     }
-    /// Partial totals below the requested directory, refreshed during scanning.
     /// Progress of an NTFS table scan, if this is one.
     pub fn mft_progress(&self) -> Option<MftProgress> {
         let total = self.mft_total.load(Ordering::Relaxed);
@@ -474,6 +484,8 @@ impl ScanControl {
         })
     }
 
+    /// Partial totals below the requested directory, refreshed during scanning.
+    /// Always `None` unless the control came from [`ScanControl::with_live_view`].
     pub fn live(&self) -> Option<Arc<LiveView>> {
         self.live.lock().ok().and_then(|slot| slot.clone())
     }
@@ -782,12 +794,26 @@ pub(crate) struct Collector {
     summary: Summary,
     links: LinkTable,
     /// Running totals for [`ScanControl::live`], fed by every retained entry.
-    live: live::LiveTracker,
+    /// None unless the caller asked for a live view.
+    live: Option<live::LiveTracker>,
 }
 
 impl Collector {
+    /// The live-view group of directory `parent`, for [`Collector::push`]. Every
+    /// child of a directory shares it, so it is looked up once per batch.
+    fn live_group(&self, parent: usize) -> Option<u32> {
+        self.live.as_ref()?.group_of(parent)
+    }
+
+    fn publish_live(&mut self, control: &ScanControl, force: bool) {
+        if let Some(live) = &mut self.live {
+            live.publish(&control.live, force, control.live_focus(), &self.entries);
+        }
+    }
+
     /// Retain one entry below `parent`, resolving hard links, and return its id.
-    pub(crate) fn push(&mut self, parent: usize, raw: RawEntry) -> usize {
+    /// `live_group` is [`Collector::live_group`] of `parent`.
+    pub(crate) fn push(&mut self, parent: usize, live_group: Option<u32>, raw: RawEntry) -> usize {
         let id = self.entries.len();
         let mut duplicate = false;
         if raw.kind == EntryKind::File
@@ -813,6 +839,7 @@ impl Collector {
                 fully_listed: raw.kind != EntryKind::Directory,
             },
             raw.skipped,
+            live_group,
         );
         id
     }
@@ -837,36 +864,45 @@ impl Collector {
             live,
             ..
         } = self;
+        // Siblings are adjacent (breadth-first order): one lookup per run of them.
+        let mut run: Option<(usize, Option<u32>)> = None;
         for (index, entry) in entries.iter().enumerate().skip(first) {
             debug_assert_eq!(entry.id, index);
             debug_assert!(entry.parent_id.is_some_and(|p| p < entry.id));
             Self::count(summary, entry, false);
-            live.add(
-                entry.id,
-                entry.parent_id.expect("only the root has no parent"),
-                entry.kind,
-                &entry.name,
-                entry.logical_bytes,
-                entry.allocated_bytes,
-            );
+            if let Some(live) = live {
+                let parent = entry.parent_id.expect("only the root has no parent");
+                let group = match run {
+                    Some((dir, group)) if dir == parent => group,
+                    _ => live.group_of(parent),
+                };
+                run = Some((parent, group));
+                live.add(
+                    group,
+                    entry.id,
+                    entry.kind,
+                    entry.logical_bytes,
+                    entry.allocated_bytes,
+                );
+            }
         }
     }
 
     /// Store one entry and count it, with its parent id, parents before children.
     /// `skipped`: a folder that was deliberately not entered (a mount point).
-    fn accept(&mut self, entry: Entry, skipped: bool) {
+    fn accept(&mut self, entry: Entry, skipped: bool, live_group: Option<u32>) {
         debug_assert_eq!(entry.id, self.entries.len());
         debug_assert!(entry.parent_id.is_some_and(|p| p < entry.id));
         Self::count(&mut self.summary, &entry, skipped);
-        let parent = entry.parent_id.expect("only the root has no parent");
-        self.live.add(
-            entry.id,
-            parent,
-            entry.kind,
-            &entry.name,
-            entry.logical_bytes,
-            entry.allocated_bytes,
-        );
+        if let Some(live) = &mut self.live {
+            live.add(
+                live_group,
+                entry.id,
+                entry.kind,
+                entry.logical_bytes,
+                entry.allocated_bytes,
+            );
+        }
         self.entries.push(entry);
     }
 
@@ -955,8 +991,8 @@ fn prepare(root: &Path, options: &ScanOptions) -> Result<(PathBuf, PathBuf)> {
 }
 
 impl Collector {
-    /// A collector holding only the root entry.
-    fn new(root: PathBuf, root_modified: Option<u64>) -> Result<Self> {
+    /// A collector holding only the root entry. `live`: keep a live view.
+    fn new(root: PathBuf, root_modified: Option<u64>, live: bool) -> Result<Self> {
         let summary = Summary {
             schema_version: 2,
             root: root.clone(),
@@ -998,7 +1034,7 @@ impl Collector {
             entries: vec![entry],
             summary,
             links: LinkTable::default(),
-            live: live::LiveTracker::new(),
+            live: live.then(live::LiveTracker::new),
         })
     }
 }
@@ -1036,7 +1072,7 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
         .and_then(unix_ms);
     control.focus_live(0);
     control.set_backend_status("Selecting scan backend".into());
-    let fresh = || Collector::new(root.clone(), root_modified);
+    let fresh = || Collector::new(root.clone(), root_modified, control.live_enabled);
     let reset = || reset_progress(&control, &options);
     reset();
     if let Ok(mut slot) = control.live.lock() {
@@ -1124,7 +1160,7 @@ pub fn scan_ntfs_image(
     let file =
         std::fs::File::open(image).with_context(|| format!("cannot open {}", image.display()))?;
     reset_progress(&control, &options);
-    let mut collector = Collector::new(image.to_path_buf(), None)?;
+    let mut collector = Collector::new(image.to_path_buf(), None, control.live_enabled)?;
     collector.summary.backend = platform::BACKEND_MFT;
     let pool = thread_pool(&options)?;
     pool.install(|| platform::scan_ntfs_image(file, &control, &mut collector))
@@ -1211,9 +1247,7 @@ fn walk(
                         stop = true;
                     }
                     if !stop {
-                        collector
-                            .live
-                            .publish(&control.live, false, control.live_focus());
+                        collector.publish_live(control, false);
                         continue;
                     }
                 }
@@ -1235,9 +1269,10 @@ fn walk(
             outstanding.remove(&key);
             collector.errors(parent, &batch.errors);
             collector.set_fully_listed(parent, batch.complete);
+            let live_group = collector.live_group(parent);
             for raw in batch.entries {
                 let child = raw.key;
-                let id = collector.push(parent, raw);
+                let id = collector.push(parent, live_group, raw);
                 if let Some(child) = child {
                     if ids.len() <= child {
                         ids.resize(child + 1, usize::MAX);
@@ -1250,11 +1285,7 @@ fn walk(
                 }
             }
         }
-        collector.live.publish(
-            &control.live,
-            false,
-            control.live_focus.load(Ordering::Relaxed),
-        );
+        collector.publish_live(control, false);
         if stop {
             break;
         }
@@ -1285,29 +1316,31 @@ fn walk(
 
 /// Totals, rollups and the child index, shared by every backend.
 fn finish(
-    collector: Collector,
+    mut collector: Collector,
     options: &ScanOptions,
     control: &ScanControl,
     start: Instant,
 ) -> Snapshot {
+    collector.publish_live(control, true);
     let Collector {
         mut entries,
         mut summary,
         links,
-        mut live,
+        live,
     } = collector;
-    live.publish(
-        &control.live,
-        true,
-        control.live_focus.load(Ordering::Relaxed),
-    );
     if tracing() {
-        let (publishes, cost) = live.publish_stats();
-        eprintln!("live view: {publishes} publishes, {:.1} ms", millis(cost));
+        match &live {
+            Some(live) => {
+                let (publishes, cost) = live.publish_stats();
+                eprintln!("live view: {publishes} publishes, {:.1} ms", millis(cost));
+            }
+            None => eprintln!("live view: off"),
+        }
     }
     let mut phase = Instant::now();
     control.abandoned.store(true, Ordering::Relaxed);
     drop(links);
+    drop(live);
     // Report the memory bound once rather than once per truncated directory.
     if control.limit_reached.load(Ordering::Relaxed) {
         summary.entry_limit_reached = true;
@@ -1758,9 +1791,13 @@ impl Snapshot {
 
 #[cfg(all(test, windows))]
 mod collector_tests {
-    use super::{Collector, Entry, EntryKind, RawEntry};
+    use super::{Collector, Entry, EntryKind, RawEntry, ScanControl};
     use rayon::prelude::*;
     use std::{ffi::OsStr, path::PathBuf};
+
+    fn collector() -> Collector {
+        Collector::new(PathBuf::from("root"), None, true).unwrap()
+    }
 
     fn raw(name: &str, kind: EntryKind, logical: u64, identity: Option<(u64, u64)>) -> RawEntry {
         RawEntry {
@@ -1777,7 +1814,7 @@ mod collector_tests {
 
     /// Root / a, f; a / g (a hard link of f), l, b; b / h, in breadth-first order.
     fn pushed() -> Collector {
-        let mut collector = Collector::new(PathBuf::from("root"), None).unwrap();
+        let mut collector = collector();
         let shared = Some((0, 7));
         for (parent, entry) in [
             (0, raw("a", EntryKind::Directory, 0, None)),
@@ -1787,9 +1824,18 @@ mod collector_tests {
             (1, raw("b", EntryKind::Directory, 0, None)),
             (5, raw("h", EntryKind::File, 5, None)),
         ] {
-            collector.push(parent, entry);
+            // One lookup per entry: the reference for the per-run lookup.
+            let group = collector.live_group(parent);
+            collector.push(parent, group, entry);
         }
         collector
+    }
+
+    fn view(collector: &mut Collector, focus: usize) -> super::LiveView {
+        let control = ScanControl::with_live_view();
+        control.focus_live(focus);
+        collector.publish_live(&control, true);
+        (*control.live().unwrap()).clone()
     }
 
     fn listing(entries: &[Entry]) -> Vec<String> {
@@ -1798,8 +1844,8 @@ mod collector_tests {
 
     #[test]
     fn entries_built_in_place_count_like_entries_pushed_one_by_one() {
-        let pushed = pushed();
-        let mut built = Collector::new(PathBuf::from("root"), None).unwrap();
+        let mut pushed = pushed();
+        let mut built = collector();
         built.build_entries(pushed.entries[1..].to_vec().into_par_iter());
         // Stored right away, counted only once accounted for.
         assert_eq!(built.entries.len(), pushed.entries.len());
@@ -1818,6 +1864,23 @@ mod collector_tests {
         };
         assert_eq!(counts(&built), (3, 3, 1, 0, 1));
         assert_eq!(counts(&built), counts(&pushed));
+        for focus in [0, 1, 5] {
+            assert_eq!(view(&mut built, focus), view(&mut pushed, focus));
+        }
+        let root = view(&mut built, 0);
+        assert_eq!(root.folders[0].name, "a");
+        assert_eq!(root.total_logical(), 25);
+    }
+
+    #[test]
+    fn without_a_live_view_nothing_is_tracked() {
+        let mut collector = Collector::new(PathBuf::from("root"), None, false).unwrap();
+        assert_eq!(collector.live_group(0), None);
+        collector.push(0, None, raw("f", EntryKind::File, 1, None));
+        let control = ScanControl::with_live_view();
+        collector.publish_live(&control, true);
+        assert!(collector.live.is_none());
+        assert!(control.live().is_none());
     }
 }
 

@@ -2,14 +2,15 @@
 //! A cheap, growing picture of a scan in progress, so a UI can draw the largest
 //! folders while the scanner is still walking them.
 //!
-//! The collector feeds every retained entry to [`LiveTracker`]; it keeps running
-//! own totals for every directory and publishes a focused two-level
-//! [`LiveView`] a few times per second through [`crate::ScanControl::live`].
-//! Totals are what has been found so far: they only ever grow, and they become
-//! the final numbers once the scan finishes.
+//! A scan started with [`crate::ScanControl::with_live_view`] feeds every retained
+//! entry to [`LiveTracker`]; it keeps running own totals for every directory and
+//! publishes a focused two-level [`LiveView`] a few times per second through
+//! [`crate::ScanControl::live`]. Other scans do none of this. Totals are what has
+//! been found so far: they only ever grow, and they become the final numbers once
+//! the scan finishes.
 
-use crate::EntryKind;
-use std::{collections::HashMap, ffi::OsStr, sync::Arc, time::Instant};
+use crate::{Entry, EntryKind};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 /// Running totals of one folder below the focused directory.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -54,8 +55,8 @@ const PUBLISH_EVERY_MS: u128 = 250;
 const TOP: u32 = u32::MAX;
 
 struct Group {
+    /// The directory's entry id; its name is read from the entry when published.
     id: usize,
-    name: Box<str>,
     /// `TOP` for a first-level folder, else the index of its parent group.
     parent: u32,
     logical: u64,
@@ -94,71 +95,66 @@ impl LiveTracker {
         (self.generation, self.publish_total)
     }
 
-    /// Account for one retained entry. `parent` is its parent's entry id (0 is
-    /// the scan root); `allocated` is already zero for hard-link duplicates.
+    /// The group that entries directly in directory `dir` count toward (`TOP` for
+    /// the scan root), or None for a directory that is not tracked. All entries of
+    /// a directory share it, so callers look it up once per run of siblings.
+    pub(crate) fn group_of(&self, dir: usize) -> Option<u32> {
+        if dir == 0 {
+            Some(TOP)
+        } else {
+            self.group_of_dir.get(&dir).copied()
+        }
+    }
+
+    /// Account for one retained entry, in `group` ([`LiveTracker::group_of`] of its
+    /// parent). `allocated` is already zero for hard-link duplicates.
     pub(crate) fn add(
         &mut self,
+        group: Option<u32>,
         id: usize,
-        parent: usize,
         kind: EntryKind,
-        name: &OsStr,
         logical: u64,
         allocated: Option<u64>,
     ) {
-        let group = if parent == 0 {
-            None
-        } else {
-            match self.group_of_dir.get(&parent) {
-                Some(&g) => Some(g),
-                None => return,
-            }
+        let Some(group) = group else {
+            return;
         };
         match kind {
             EntryKind::Directory => {
-                let own = match group {
-                    None => self.push(id, name, TOP),
-                    Some(g) => self.push(id, name, g),
-                };
-                self.group_of_dir.insert(id, own);
+                self.groups.push(Group {
+                    id,
+                    parent: group,
+                    logical: 0,
+                    allocated: 0,
+                    files: 0,
+                });
+                self.group_of_dir.insert(id, (self.groups.len() - 1) as u32);
             }
             EntryKind::File => {
                 let allocated = allocated.unwrap_or(0);
-                match group {
-                    None => {
-                        self.loose.0 += logical;
-                        self.loose.1 += allocated;
-                        self.loose.2 += 1;
-                    }
-                    Some(g) => {
-                        let entry = &mut self.groups[g as usize];
-                        entry.logical += logical;
-                        entry.allocated += allocated;
-                        entry.files += 1;
-                    }
+                if group == TOP {
+                    self.loose.0 += logical;
+                    self.loose.1 += allocated;
+                    self.loose.2 += 1;
+                } else {
+                    let entry = &mut self.groups[group as usize];
+                    entry.logical += logical;
+                    entry.allocated += allocated;
+                    entry.files += 1;
                 }
             }
             _ => {}
         }
     }
 
-    fn push(&mut self, id: usize, name: &OsStr, parent: u32) -> u32 {
-        self.groups.push(Group {
-            id,
-            name: name.to_string_lossy().into(),
-            parent,
-            logical: 0,
-            allocated: 0,
-            files: 0,
-        });
-        (self.groups.len() - 1) as u32
-    }
-
-    /// Publish a fresh view if enough time has passed (or `force`).
+    /// Publish a fresh view if enough time has passed (or `force`). `entries` is
+    /// the scan's entry list, which holds the folder names.
     pub(crate) fn publish(
         &mut self,
         slot: &std::sync::Mutex<Option<Arc<LiveView>>>,
         force: bool,
         focus: usize,
+        entries: &[Entry],
     ) {
         // Bound publication to roughly 5% of scan time on a large tree.
         let interval = std::time::Duration::from_millis(PUBLISH_EVERY_MS as u64)
@@ -168,7 +164,7 @@ impl LiveTracker {
         }
         let started = Instant::now();
         self.generation += 1;
-        let view = Arc::new(self.view(focus));
+        let view = Arc::new(self.view(focus, entries));
         if let Ok(mut slot) = slot.lock() {
             *slot = Some(view);
         }
@@ -178,7 +174,8 @@ impl LiveTracker {
         self.last_publish = Instant::now();
     }
 
-    fn view(&self, focus: usize) -> LiveView {
+    fn view(&self, focus: usize, entries: &[Entry]) -> LiveView {
+        let name = |group: &Group| entries[group.id].name.to_string_lossy().into_owned();
         // Own counters keep ingestion O(1) per file at any depth. Roll up once
         // per publication, in parent-first insertion order reversed: O(D).
         let mut totals: Vec<_> = self
@@ -201,7 +198,7 @@ impl LiveTracker {
         let mut at = focused;
         while at != TOP {
             let g = &self.groups[at as usize];
-            ancestors.push((g.id, g.name.to_string()));
+            ancestors.push((g.id, name(g)));
             at = g.parent;
         }
         ancestors.reverse();
@@ -219,7 +216,7 @@ impl LiveTracker {
             let total = totals[i as usize];
             LiveFolder {
                 id: g.id,
-                name: g.name.to_string(),
+                name: name(g),
                 logical_bytes: total.0,
                 allocated_bytes: total.1,
                 files: total.2,
@@ -266,10 +263,78 @@ impl LiveTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
+
+    /// A tracker with the entry list a collector would hold beside it.
+    struct Scan {
+        tracker: LiveTracker,
+        entries: Vec<Entry>,
+    }
+
+    fn entry(id: usize, parent: usize, kind: EntryKind, name: &OsStr) -> Entry {
+        Entry {
+            id,
+            parent_id: Some(parent),
+            name: name.into(),
+            kind,
+            logical_bytes: 0,
+            unique_logical_bytes: 0,
+            allocated_bytes: Some(0),
+            modified_unix_ms: None,
+            file_count: 0,
+            hard_link_duplicate: false,
+            multiple_links: false,
+            fully_listed: false,
+        }
+    }
+
+    impl Scan {
+        fn new() -> Self {
+            Self {
+                tracker: LiveTracker::new(),
+                entries: Vec::new(),
+            }
+        }
+
+        fn store(&mut self, id: usize, parent: usize, kind: EntryKind, name: &OsStr) {
+            if self.entries.len() <= id {
+                let blank = entry(0, 0, EntryKind::Other, OsStr::new(""));
+                self.entries.resize(id + 1, blank);
+            }
+            self.entries[id] = entry(id, parent, kind, name);
+        }
+
+        fn add(
+            &mut self,
+            id: usize,
+            parent: usize,
+            kind: EntryKind,
+            name: &OsStr,
+            logical: u64,
+            allocated: Option<u64>,
+        ) {
+            self.store(id, parent, kind, name);
+            let group = self.tracker.group_of(parent);
+            self.tracker.add(group, id, kind, logical, allocated);
+        }
+
+        fn view(&self, focus: usize) -> LiveView {
+            self.tracker.view(focus, &self.entries)
+        }
+
+        fn publish(
+            &mut self,
+            slot: &std::sync::Mutex<Option<Arc<LiveView>>>,
+            force: bool,
+            focus: usize,
+        ) {
+            self.tracker.publish(slot, force, focus, &self.entries);
+        }
+    }
 
     #[test]
     fn focus_changes_publish_without_new_entries_or_waiting_for_the_interval() {
-        let mut tracker = LiveTracker::new();
+        let mut tracker = Scan::new();
         tracker.add(1, 0, EntryKind::Directory, OsStr::new("folder"), 0, Some(0));
         let slot = std::sync::Mutex::new(None);
         tracker.publish(&slot, true, 0);
@@ -281,7 +346,7 @@ mod tests {
 
     #[test]
     fn browse_deep_folders_and_return_without_losing_totals() {
-        let mut t = LiveTracker::new();
+        let mut t = Scan::new();
         for id in 1..=8 {
             t.add(
                 id,
@@ -318,7 +383,7 @@ mod tests {
 
     #[test]
     fn empty_and_small_folders_remain_navigable_and_totals_are_not_truncated() {
-        let mut t = LiveTracker::new();
+        let mut t = Scan::new();
         for i in 1..=60 {
             t.add(i, 0, EntryKind::Directory, OsStr::new("folder"), 0, Some(0));
             t.add(60 + i, i, EntryKind::File, OsStr::new("file"), 1, Some(0));
@@ -339,7 +404,7 @@ mod tests {
 
     #[test]
     fn totals_roll_up_two_levels() {
-        let mut t = LiveTracker::new();
+        let mut t = Scan::new();
         let n = |s: &str| OsStr::new(s).to_owned();
         // root(0) / a(1) / b(2) / c(3) / f(4); root / g(5); a / h(6)
         t.add(1, 0, EntryKind::Directory, &n("a"), 0, Some(0));
@@ -363,5 +428,44 @@ mod tests {
         );
         assert_eq!((view.loose_logical_bytes, view.loose_files), (7, 1));
         assert_eq!(view.total_logical(), 117);
+    }
+
+    #[test]
+    fn one_group_lookup_per_run_of_siblings_gives_the_same_view() {
+        use EntryKind::{Directory as D, File as F, Link as L};
+        // Breadth first, as batches and the MFT plan arrive. Directory 4 is
+        // listed in two separate runs; 99 was never seen, so its entry is ignored.
+        let tree = [
+            (1, 0, D, "a", 0),
+            (2, 0, D, "b", 0),
+            (3, 0, F, "loose", 1),
+            (4, 1, D, "c", 0),
+            (5, 1, F, "f", 10),
+            (6, 1, L, "link", 0),
+            (7, 2, F, "g", 20),
+            (8, 4, F, "h", 40),
+            (9, 99, F, "lost", 1000),
+            (10, 4, F, "i", 80),
+        ];
+        let (mut each, mut runs) = (Scan::new(), Scan::new());
+        let mut run = None;
+        for (id, parent, kind, name, logical) in tree {
+            let name = OsStr::new(name);
+            each.add(id, parent, kind, name, logical, Some(logical));
+            let group = match run {
+                Some((dir, group)) if dir == parent => group,
+                _ => runs.tracker.group_of(parent),
+            };
+            run = Some((parent, group));
+            runs.store(id, parent, kind, name);
+            runs.tracker.add(group, id, kind, logical, Some(logical));
+        }
+        for focus in [0, 1, 2, 4] {
+            assert_eq!(runs.view(focus), each.view(focus));
+        }
+        let root = runs.view(0);
+        assert_eq!(root.total_logical(), 151);
+        assert_eq!(root.folders[0].name, "a");
+        assert_eq!(root.folders[0].children[0].name, "c");
     }
 }
