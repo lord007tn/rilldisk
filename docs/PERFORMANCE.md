@@ -87,11 +87,10 @@ isolated without administrator rights (see "Cold caches"), so the default
 (available cores, clamped to 8–32) is unchanged.
 
 With `RILLDISK_TRACE_PHASES=1`, directory scans print collector-loop elapsed
-time, time in the blocking receive call, time processing batches, and the peak
-number of batches parked until their parent arrived. The remaining loop time
-includes publication, scheduling and bookkeeping. On Windows, `nt-directory`
-also reports completed directory opens and listing calls (including errors and
-end-of-list queries) with summed time across workers. These worker times overlap
+time inside and outside the blocking receive call, batches processed and peak
+ready and waiting backlogs. Time outside receive includes ingestion, live
+publication and bookkeeping. Windows walk traces also time opening, listing
+and parsing across workers. These worker times overlap
 one another and the collector. The root layout probe is outside these counts.
 Tracing writes aggregate diagnostics to stderr and adds timing overhead. Use
 untraced runs for throughput comparisons.
@@ -109,9 +108,9 @@ untraced runs for throughput comparisons.
 | Build entries (names, sizes) | | 105–213 |
 | Total `scan()` | 2,324–2,643 | 1,080–1,525 |
 
-Planning is sequential on indexes only; entries are built in parallel and then
-pass one at a time through `Collector::accept`, the single place every backend
-retains an entry (where the live view is fed).
+Planning is sequential on indexes only; entries are built in parallel directly
+in the collector's list, then counted by `Collector::count`, the single place
+every backend counts an entry.
 
 **Memory:** the hard-link table no longer allocates a slot per MFT record
 number for small scans: a 20k-file folder on this drive peaked at 276 MiB RSS

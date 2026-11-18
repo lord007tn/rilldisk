@@ -336,5 +336,28 @@ fn the_live_view_ends_at_the_final_totals_for_every_walk() {
         .unwrap();
         let live = control.live().expect("published at the end of the scan");
         assert_eq!(live.total_logical(), snapshot.summary.logical_bytes);
+        // Names come from the scan's own entries.
+        assert!(!live.folders.is_empty());
+        for folder in &live.folders {
+            assert_eq!(folder.name, snapshot.name(folder.id));
+        }
+    }
+}
+
+#[test]
+fn headless_scans_skip_the_live_view_and_preserve_accounting() {
+    let root = tree();
+    for backend in [Backend::Directory, Backend::Legacy] {
+        let control = Arc::new(ScanControl::without_live_view());
+        let options = ScanOptions {
+            backend,
+            ..Default::default()
+        };
+        let plain = scan(root.path(), options.clone(), control.clone()).unwrap();
+        assert!(control.live().is_none());
+        // Asking for one changes nothing about the result.
+        let watched = scan(root.path(), options, Arc::new(ScanControl::default())).unwrap();
+        assert_eq!(totals(&plain), totals(&watched));
+        assert_eq!(inventory(&plain), inventory(&watched));
     }
 }

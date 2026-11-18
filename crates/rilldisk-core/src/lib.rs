@@ -413,6 +413,8 @@ pub struct ScanControl {
     limit_reached: AtomicBool,
     /// Set when the scan stops waiting (stall or cancel grace) so leftover workers quit.
     abandoned: AtomicBool,
+    /// Headless callers can skip live folder tracking.
+    live_disabled: bool,
     /// Latest picture of the scan in progress; see [`ScanControl::live`].
     live: std::sync::Mutex<Option<Arc<LiveView>>>,
     live_focus: AtomicUsize,
@@ -422,6 +424,8 @@ pub struct ScanControl {
     mft_total: AtomicU64,
     /// The table is read; folders are being built from it.
     mft_building: AtomicBool,
+    /// What directory-walk workers spent their time on (only while tracing).
+    worker_trace: WorkerTrace,
 }
 
 /// Where an NTFS table (MFT) scan is, for progress displays. The table is read in
@@ -435,6 +439,13 @@ pub struct MftProgress {
 }
 
 impl ScanControl {
+    /// Keep progress counters but skip the folder view for headless scans.
+    pub fn without_live_view() -> Self {
+        Self {
+            live_disabled: true,
+            ..Self::default()
+        }
+    }
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
@@ -461,7 +472,6 @@ impl ScanControl {
     pub fn live_focus(&self) -> usize {
         self.live_focus.load(Ordering::Relaxed)
     }
-    /// Partial totals below the requested directory, refreshed during scanning.
     /// Progress of an NTFS table scan, if this is one.
     pub fn mft_progress(&self) -> Option<MftProgress> {
         let total = self.mft_total.load(Ordering::Relaxed);
@@ -472,6 +482,8 @@ impl ScanControl {
         })
     }
 
+    /// Partial totals below the requested directory, refreshed during scanning.
+    /// Always `None` for [`ScanControl::without_live_view`].
     pub fn live(&self) -> Option<Arc<LiveView>> {
         self.live.lock().ok().and_then(|slot| slot.clone())
     }
@@ -772,19 +784,34 @@ pub(crate) struct Batch {
     complete: bool,
 }
 
-/// Builds the entry list. Every retained entry passes through [`Collector::push`],
-/// parents before children, whatever the backend.
+/// Builds the entry list, parents before children, whatever the backend. The
+/// walks retain entries one at a time through [`Collector::push`]; the MFT backend
+/// builds them in place with [`Collector::build_entries`].
 pub(crate) struct Collector {
     entries: Vec<Entry>,
     summary: Summary,
     links: LinkTable,
     /// Running totals for [`ScanControl::live`], fed by every retained entry.
-    live: live::LiveTracker,
+    /// Absent for headless scans.
+    live: Option<live::LiveTracker>,
 }
 
 impl Collector {
+    /// The live-view group of directory `parent`, for [`Collector::push`]. Every
+    /// child of a directory shares it, so it is looked up once per batch.
+    fn live_group(&self, parent: usize) -> Option<u32> {
+        self.live.as_ref()?.group_of(parent)
+    }
+
+    fn publish_live(&mut self, control: &ScanControl, force: bool) {
+        if let Some(live) = &mut self.live {
+            live.publish(&control.live, force, control.live_focus(), &self.entries);
+        }
+    }
+
     /// Retain one entry below `parent`, resolving hard links, and return its id.
-    pub(crate) fn push(&mut self, parent: usize, raw: RawEntry) -> usize {
+    /// `live_group` is [`Collector::live_group`] of `parent`.
+    pub(crate) fn push(&mut self, parent: usize, live_group: Option<u32>, raw: RawEntry) -> usize {
         let id = self.entries.len();
         let mut duplicate = false;
         if raw.kind == EntryKind::File
@@ -810,27 +837,75 @@ impl Collector {
                 fully_listed: raw.kind != EntryKind::Directory,
             },
             raw.skipped,
+            live_group,
         );
         id
     }
 
-    /// Append entries a backend built in parallel (ids already assigned in
-    /// order, parents first, hard links resolved).
+    /// Build entries in parallel directly in the entry list, so no second array
+    /// of them ever exists. `build` yields them with ids already assigned in
+    /// order, parents first, hard links resolved. They count once
+    /// [`Collector::account_built`] has run, which a caller can delay until it
+    /// has freed what the entries were built from.
     #[cfg(windows)]
-    pub(crate) fn append(&mut self, entries: Vec<Entry>) {
-        self.entries.reserve(entries.len());
-        for entry in entries {
-            self.accept(entry, false);
+    pub(crate) fn build_entries(&mut self, build: impl IndexedParallelIterator<Item = Entry>) {
+        self.entries.reserve_exact(build.len());
+        self.entries.par_extend(build);
+    }
+
+    /// Count the entries from index `first` on, added by [`Collector::build_entries`].
+    #[cfg(windows)]
+    pub(crate) fn account_built(&mut self, first: usize) {
+        let Self {
+            entries,
+            summary,
+            live,
+            ..
+        } = self;
+        // Siblings are adjacent (breadth-first order): one lookup per run of them.
+        let mut run: Option<(usize, Option<u32>)> = None;
+        for (index, entry) in entries.iter().enumerate().skip(first) {
+            debug_assert_eq!(entry.id, index);
+            debug_assert!(entry.parent_id.is_some_and(|p| p < entry.id));
+            Self::count(summary, entry, false);
+            if let Some(live) = live {
+                let parent = entry.parent_id.expect("only the root has no parent");
+                let group = match run {
+                    Some((dir, group)) if dir == parent => group,
+                    _ => live.group_of(parent),
+                };
+                run = Some((parent, group));
+                live.add(
+                    group,
+                    entry.id,
+                    entry.kind,
+                    entry.logical_bytes,
+                    entry.allocated_bytes,
+                );
+            }
         }
     }
 
-    /// The single place where every retained entry, of every backend, is
-    /// counted and stored, with its parent id, parents before children.
+    /// Store one entry and count it, with its parent id, parents before children.
     /// `skipped`: a folder that was deliberately not entered (a mount point).
-    fn accept(&mut self, entry: Entry, skipped: bool) {
+    fn accept(&mut self, entry: Entry, skipped: bool, live_group: Option<u32>) {
         debug_assert_eq!(entry.id, self.entries.len());
         debug_assert!(entry.parent_id.is_some_and(|p| p < entry.id));
-        let summary = &mut self.summary;
+        Self::count(&mut self.summary, &entry, skipped);
+        if let Some(live) = &mut self.live {
+            live.add(
+                live_group,
+                entry.id,
+                entry.kind,
+                entry.logical_bytes,
+                entry.allocated_bytes,
+            );
+        }
+        self.entries.push(entry);
+    }
+
+    /// The single place where every retained entry, of every backend, is counted.
+    fn count(summary: &mut Summary, entry: &Entry, skipped: bool) {
         match entry.kind {
             EntryKind::Directory => {
                 summary.directories += 1;
@@ -844,16 +919,6 @@ impl Collector {
             EntryKind::Link => summary.skipped_links += 1,
             EntryKind::Other => {}
         }
-        let parent = entry.parent_id.expect("only the root has no parent");
-        self.live.add(
-            entry.id,
-            parent,
-            entry.kind,
-            &entry.name,
-            entry.logical_bytes,
-            entry.allocated_bytes,
-        );
-        self.entries.push(entry);
     }
 
     #[cfg(windows)]
@@ -924,8 +989,8 @@ fn prepare(root: &Path, options: &ScanOptions) -> Result<(PathBuf, PathBuf)> {
 }
 
 impl Collector {
-    /// A collector holding only the root entry.
-    fn new(root: PathBuf, root_modified: Option<u64>) -> Result<Self> {
+    /// A collector holding only the root entry. `live`: keep a live view.
+    fn new(root: PathBuf, root_modified: Option<u64>, live: bool) -> Result<Self> {
         let summary = Summary {
             schema_version: 2,
             root: root.clone(),
@@ -967,7 +1032,7 @@ impl Collector {
             entries: vec![entry],
             summary,
             links: LinkTable::default(),
-            live: live::LiveTracker::new(),
+            live: live.then(live::LiveTracker::new),
         })
     }
 }
@@ -986,6 +1051,10 @@ fn reset_progress(control: &ScanControl, options: &ScanOptions) {
     control.mft_total.store(0, Ordering::Relaxed);
     control.mft_read.store(0, Ordering::Relaxed);
     control.mft_building.store(false, Ordering::Relaxed);
+    control.worker_trace.reset();
+    if let Ok(mut slot) = control.live.lock() {
+        *slot = None;
+    }
 }
 
 fn thread_pool(options: &ScanOptions) -> Result<rayon::ThreadPool> {
@@ -996,6 +1065,22 @@ fn thread_pool(options: &ScanOptions) -> Result<rayon::ThreadPool> {
 }
 
 pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Result<Snapshot> {
+    scan_with_mft(
+        root,
+        options,
+        control,
+        platform::mft_source,
+        platform::scan_mft,
+    )
+}
+
+fn scan_with_mft<S: Send>(
+    root: &Path,
+    options: ScanOptions,
+    control: Arc<ScanControl>,
+    open_mft: impl Fn(&Path, bool) -> io::Result<S>,
+    read_mft: impl Fn(S, &Path, &ScanControl, &mut Collector) -> io::Result<()> + Sync,
+) -> Result<Snapshot> {
     let (verbatim, root) = prepare(root, &options)?;
     let start = Instant::now();
     let root_modified = std::fs::symlink_metadata(&verbatim)
@@ -1004,33 +1089,29 @@ pub fn scan(root: &Path, options: ScanOptions, control: Arc<ScanControl>) -> Res
         .and_then(unix_ms);
     control.focus_live(0);
     control.set_backend_status("Selecting scan backend".into());
-    let fresh = || Collector::new(root.clone(), root_modified);
+    let fresh = || Collector::new(root.clone(), root_modified, !control.live_disabled);
     let reset = || reset_progress(&control, &options);
     reset();
-    if let Ok(mut slot) = control.live.lock() {
-        *slot = None;
-    }
     let pool = thread_pool(&options)?;
     let mut collector = fresh()?;
     let mut walk_backend = Backend::Directory;
     match options.backend {
         Backend::Mft => {
-            let source = platform::mft_source(&verbatim, true)
+            let source = open_mft(&verbatim, true)
                 .context("the MFT backend needs an NTFS volume and administrator rights")?;
             control.set_backend_status("NTFS MFT scan".into());
             collector.summary.backend = platform::BACKEND_MFT;
-            pool.install(|| platform::scan_mft(source, &verbatim, &control, &mut collector))
+            pool.install(|| read_mft(source, &verbatim, &control, &mut collector))
                 .context("cannot read the NTFS Master File Table")?;
             return Ok(pool.install(|| finish(collector, &options, &control, start)));
         }
         Backend::Auto => {
-            match platform::mft_source(&verbatim, false) {
+            match open_mft(&verbatim, false) {
                 Ok(source) => {
                     control.set_backend_status("NTFS MFT scan".into());
                     collector.summary.backend = platform::BACKEND_MFT;
-                    let result = pool.install(|| {
-                        platform::scan_mft(source, &verbatim, &control, &mut collector)
-                    });
+                    let result =
+                        pool.install(|| read_mft(source, &verbatim, &control, &mut collector));
                     // A failed MFT attempt resets entries and progress before falling back.
                     match result {
                         Ok(()) => {
@@ -1092,7 +1173,7 @@ pub fn scan_ntfs_image(
     let file =
         std::fs::File::open(image).with_context(|| format!("cannot open {}", image.display()))?;
     reset_progress(&control, &options);
-    let mut collector = Collector::new(image.to_path_buf(), None)?;
+    let mut collector = Collector::new(image.to_path_buf(), None, !control.live_disabled)?;
     collector.summary.backend = platform::BACKEND_MFT;
     let pool = thread_pool(&options)?;
     pool.install(|| platform::scan_ntfs_image(file, &control, &mut collector))
@@ -1136,10 +1217,9 @@ fn walk(
     let mut last_budget = control.remaining_entries.load(Ordering::Relaxed);
     let mut cancel_seen: Option<Instant> = None;
     let mut stalled = false;
-    let trace_start = tracing().then(Instant::now);
-    let mut receive_time = Duration::ZERO;
-    let mut collection_time = Duration::ZERO;
-    let mut peak_waiting = 0;
+    let tracing = tracing();
+    let started = Instant::now();
+    let mut trace = WalkTrace::default();
     loop {
         let mut stop = false;
         if walk.pending.load(Ordering::Acquire) == 0 {
@@ -1150,12 +1230,12 @@ fn walk(
         } else {
             // A worker sends before it decrements `pending`, so poll briefly rather
             // than blocking: the final result can arrive just before the count drops.
-            let start = trace_start.map(|_| Instant::now());
-            let result = results.recv_timeout(Duration::from_millis(5));
-            if let Some(start) = start {
-                receive_time += start.elapsed();
+            let wait = tracing.then(Instant::now);
+            let received = results.recv_timeout(Duration::from_millis(5));
+            if let Some(wait) = wait {
+                trace.waiting += wait.elapsed();
             }
-            match result {
+            match received {
                 Ok(result) => {
                     ready.push(result);
                     ready.extend(results.try_iter());
@@ -1180,29 +1260,32 @@ fn walk(
                         stop = true;
                     }
                     if !stop {
-                        collector
-                            .live
-                            .publish(&control.live, false, control.live_focus());
+                        collector.publish_live(control, false);
                         continue;
                     }
                 }
             }
         }
-        let start = trace_start.map(|_| Instant::now());
         while let Some((key, batch)) = ready.pop() {
+            if tracing {
+                // Everything queued passes here, so this sees the true peak.
+                trace.peak_ready = trace.peak_ready.max(ready.len() + 1);
+            }
             let Some(&parent) = ids.get(key).filter(|&&id| id != usize::MAX) else {
                 waiting.insert(key, batch);
-                if start.is_some() {
-                    peak_waiting = peak_waiting.max(waiting.len());
+                if tracing {
+                    trace.peak_waiting = trace.peak_waiting.max(waiting.len());
                 }
                 continue;
             };
+            trace.batches += 1;
             outstanding.remove(&key);
             collector.errors(parent, &batch.errors);
             collector.set_fully_listed(parent, batch.complete);
+            let live_group = collector.live_group(parent);
             for raw in batch.entries {
                 let child = raw.key;
-                let id = collector.push(parent, raw);
+                let id = collector.push(parent, live_group, raw);
                 if let Some(child) = child {
                     if ids.len() <= child {
                         ids.resize(child + 1, usize::MAX);
@@ -1215,27 +1298,10 @@ fn walk(
                 }
             }
         }
-        if let Some(start) = start {
-            collection_time += start.elapsed();
-        }
-        collector.live.publish(
-            &control.live,
-            false,
-            control.live_focus.load(Ordering::Relaxed),
-        );
+        collector.publish_live(control, false);
         if stop {
             break;
         }
-    }
-    if let Some(start) = trace_start {
-        eprintln!(
-            "walk: {:.1} ms elapsed, {:.1} ms receiving, {:.1} ms collecting, {peak_waiting} peak batches waiting for parents",
-            start.elapsed().as_secs_f64() * 1000.0,
-            receive_time.as_secs_f64() * 1000.0,
-            collection_time.as_secs_f64() * 1000.0
-        );
-        #[cfg(windows)]
-        walk.volume.print_io_trace();
     }
     if stalled {
         let mut keys: Vec<usize> = outstanding.into_iter().collect();
@@ -1256,29 +1322,38 @@ fn walk(
     }
     // Leftover workers (hung reads, cancelled tails) exit at their next check.
     control.abandoned.store(true, Ordering::Relaxed);
+    if tracing {
+        trace.report(started.elapsed(), &collector.links, &control.worker_trace);
+    }
 }
 
 /// Totals, rollups and the child index, shared by every backend.
 fn finish(
-    collector: Collector,
+    mut collector: Collector,
     options: &ScanOptions,
     control: &ScanControl,
     start: Instant,
 ) -> Snapshot {
+    collector.publish_live(control, true);
     let Collector {
         mut entries,
         mut summary,
         links,
-        mut live,
+        live,
     } = collector;
-    live.publish(
-        &control.live,
-        true,
-        control.live_focus.load(Ordering::Relaxed),
-    );
+    if tracing() {
+        match &live {
+            Some(live) => {
+                let (publishes, cost) = live.publish_stats();
+                eprintln!("live view: {publishes} publishes, {:.1} ms", millis(cost));
+            }
+            None => eprintln!("live view: off"),
+        }
+    }
     let mut phase = Instant::now();
     control.abandoned.store(true, Ordering::Relaxed);
     drop(links);
+    drop(live);
     // Report the memory bound once rather than once per truncated directory.
     if control.limit_reached.load(Ordering::Relaxed) {
         summary.entry_limit_reached = true;
@@ -1334,7 +1409,9 @@ fn finish(
 }
 
 /// Profiling aid: with `RILLDISK_TRACE_PHASES=1`, print how long each scan phase
-/// took to stderr (local only; nothing is recorded or sent anywhere).
+/// took and what the collector, the workers and the MFT reader did to stderr.
+/// Counts and timings only, never names or paths (local only; nothing is
+/// recorded or sent anywhere).
 pub(crate) fn tracing() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("RILLDISK_TRACE_PHASES").is_some())
@@ -1342,12 +1419,110 @@ pub(crate) fn tracing() -> bool {
 
 pub(crate) fn trace(phase: &str, since: &mut Instant) {
     if tracing() {
-        eprintln!(
-            "phase {phase}: {:.1} ms",
-            since.elapsed().as_secs_f64() * 1000.0
-        );
+        eprintln!("phase {phase}: {:.1} ms", millis(since.elapsed()));
     }
     *since = Instant::now();
+}
+
+pub(crate) fn millis(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+/// Calls of one worker step and their summed duration across all workers.
+/// Updated only while tracing.
+#[derive(Debug, Default)]
+pub(crate) struct StepTimer {
+    calls: AtomicU64,
+    nanos: AtomicU64,
+}
+
+impl StepTimer {
+    /// Run `step`, recording it when tracing.
+    #[cfg(windows)]
+    #[inline]
+    pub(crate) fn time<R>(&self, step: impl FnOnce() -> R) -> R {
+        if !tracing() {
+            return step();
+        }
+        let start = Instant::now();
+        let result = step();
+        self.nanos
+            .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        result
+    }
+
+    pub(crate) fn calls(&self) -> u64 {
+        self.calls.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn millis(&self) -> f64 {
+        self.nanos.load(Ordering::Relaxed) as f64 / 1e6
+    }
+
+    fn reset(&self) {
+        self.calls.store(0, Ordering::Relaxed);
+        self.nanos.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Where directory-walk workers spend their time (Windows walks only).
+#[derive(Debug, Default)]
+struct WorkerTrace {
+    open: StepTimer,
+    list: StepTimer,
+    parse: StepTimer,
+}
+
+impl WorkerTrace {
+    fn reset(&self) {
+        self.open.reset();
+        self.list.reset();
+        self.parse.reset();
+    }
+}
+
+/// What the collector thread of a directory walk did. Apart from the batch
+/// count, filled only while tracing.
+#[derive(Default)]
+struct WalkTrace {
+    waiting: Duration,
+    batches: u64,
+    peak_ready: usize,
+    peak_waiting: usize,
+}
+
+impl WalkTrace {
+    fn report(&self, total: Duration, links: &LinkTable, workers: &WorkerTrace) {
+        eprintln!(
+            "walk collector: outside receive (ingest and live publish) {:.1} ms, waiting {:.1} ms, {} batches, peak backlog {} ready, {} waiting",
+            millis(total.saturating_sub(self.waiting)),
+            millis(self.waiting),
+            self.batches,
+            self.peak_ready,
+            self.peak_waiting,
+        );
+        if links.dense_active {
+            eprintln!(
+                "walk hard links: dense table, {} slots, {} in the map",
+                links.dense.len(),
+                links.map.len()
+            );
+        } else {
+            eprintln!("walk hard links: map, {} entries", links.map.len());
+        }
+        if cfg!(windows) {
+            eprintln!(
+                "walk workers (summed): open {:.1} ms ({} calls), list {:.1} ms ({} calls), parse {:.1} ms ({} buffers)",
+                workers.open.millis(),
+                workers.open.calls(),
+                workers.list.millis(),
+                workers.list.calls(),
+                workers.parse.millis(),
+                workers.parse.calls(),
+            );
+        }
+    }
 }
 
 /// Full path of `id`, rebuilt from the parent chain.
@@ -1624,6 +1799,157 @@ impl Snapshot {
                 .take(limit.min(500))
                 .collect(),
         )
+    }
+}
+
+#[cfg(all(test, windows))]
+mod collector_tests {
+    use super::{Collector, Entry, EntryKind, RawEntry, ScanControl};
+    use rayon::prelude::*;
+    use std::{ffi::OsStr, path::PathBuf};
+
+    fn collector() -> Collector {
+        Collector::new(PathBuf::from("root"), None, true).unwrap()
+    }
+
+    fn raw(name: &str, kind: EntryKind, logical: u64, identity: Option<(u64, u64)>) -> RawEntry {
+        RawEntry {
+            name: OsStr::new(name).into(),
+            kind,
+            logical,
+            allocated: Some(logical),
+            modified: Some(1),
+            identity,
+            skipped: false,
+            key: None,
+        }
+    }
+
+    #[test]
+    fn auto_resets_a_partial_mft_attempt_before_walking() {
+        use std::sync::{Arc, atomic::Ordering};
+
+        let root = tempfile::tempdir().unwrap();
+        let kept = root.path().join("kept");
+        std::fs::create_dir(&kept).unwrap();
+        std::fs::write(kept.join("data"), b"1234567").unwrap();
+        let control = Arc::new(ScanControl::default());
+        let snapshot = super::scan_with_mft(
+            root.path(),
+            super::ScanOptions {
+                max_entries: 3,
+                threads: 2,
+                ..Default::default()
+            },
+            control.clone(),
+            |_, explicit| {
+                assert!(!explicit);
+                Ok(())
+            },
+            |(), _, control, collector| {
+                control.mft_total.store(100, Ordering::Relaxed);
+                control.mft_read.store(1, Ordering::Relaxed);
+                assert!(control.record(EntryKind::File, 500));
+                let group = collector.live_group(0);
+                collector.push(0, group, raw("discarded", EntryKind::File, 500, None));
+                collector.publish_live(control, true);
+                assert_eq!(control.live().unwrap().total_logical(), 500);
+                Err(std::io::Error::other("simulated MFT read failure"))
+            },
+        )
+        .unwrap();
+        assert_eq!(snapshot.summary.backend, "nt-directory");
+        assert!(snapshot.summary.complete, "{:?}", snapshot.summary.issues);
+        assert_eq!(
+            (
+                snapshot.summary.directories,
+                snapshot.summary.files,
+                snapshot.summary.logical_bytes
+            ),
+            (2, 1, 7)
+        );
+        assert_eq!(snapshot.entries.len(), 3);
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .all(|e| snapshot.name(e.id) != "discarded")
+        );
+        assert!(control.mft_progress().is_none());
+        let view = control.live().unwrap();
+        assert_eq!(view.total_logical(), 7);
+        assert_eq!(view.folders[0].name, "kept");
+    }
+
+    /// Root / a, f; a / g (a hard link of f), l, b; b / h, in breadth-first order.
+    fn pushed() -> Collector {
+        let mut collector = collector();
+        let shared = Some((0, 7));
+        for (parent, entry) in [
+            (0, raw("a", EntryKind::Directory, 0, None)),
+            (0, raw("f", EntryKind::File, 10, shared)),
+            (1, raw("g", EntryKind::File, 10, shared)),
+            (1, raw("l", EntryKind::Link, 0, None)),
+            (1, raw("b", EntryKind::Directory, 0, None)),
+            (5, raw("h", EntryKind::File, 5, None)),
+        ] {
+            // One lookup per entry: the reference for the per-run lookup.
+            let group = collector.live_group(parent);
+            collector.push(parent, group, entry);
+        }
+        collector
+    }
+
+    fn view(collector: &mut Collector, focus: usize) -> super::LiveView {
+        let control = ScanControl::default();
+        control.focus_live(focus);
+        collector.publish_live(&control, true);
+        (*control.live().unwrap()).clone()
+    }
+
+    fn listing(entries: &[Entry]) -> Vec<String> {
+        entries.iter().map(|entry| format!("{entry:?}")).collect()
+    }
+
+    #[test]
+    fn entries_built_in_place_count_like_entries_pushed_one_by_one() {
+        let mut pushed = pushed();
+        let mut built = collector();
+        built.build_entries(pushed.entries[1..].to_vec().into_par_iter());
+        // Stored right away, counted only once accounted for.
+        assert_eq!(built.entries.len(), pushed.entries.len());
+        assert_eq!(built.summary.files, 0);
+        built.account_built(1);
+        assert_eq!(listing(&built.entries), listing(&pushed.entries));
+        let counts = |c: &Collector| {
+            let s = &c.summary;
+            (
+                s.files,
+                s.directories,
+                s.skipped_links,
+                s.skipped_mounts,
+                s.hard_link_duplicates,
+            )
+        };
+        assert_eq!(counts(&built), (3, 3, 1, 0, 1));
+        assert_eq!(counts(&built), counts(&pushed));
+        for focus in [0, 1, 5] {
+            assert_eq!(view(&mut built, focus), view(&mut pushed, focus));
+        }
+        let root = view(&mut built, 0);
+        assert_eq!(root.folders[0].name, "a");
+        assert_eq!(root.total_logical(), 25);
+    }
+
+    #[test]
+    fn without_a_live_view_nothing_is_tracked() {
+        let mut collector = Collector::new(PathBuf::from("root"), None, false).unwrap();
+        assert_eq!(collector.live_group(0), None);
+        collector.push(0, None, raw("f", EntryKind::File, 1, None));
+        let control = ScanControl::default();
+        collector.publish_live(&control, true);
+        assert!(collector.live.is_none());
+        assert!(control.live().is_none());
     }
 }
 

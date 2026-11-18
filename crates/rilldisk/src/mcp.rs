@@ -156,7 +156,7 @@ impl DiskServer {
         }
         state.next_id += 1;
         let id = state.next_id;
-        let control = Arc::new(ScanControl::default());
+        let control = Arc::new(ScanControl::without_live_view());
         state.active = Some(Job {
             id,
             control: control.clone(),

@@ -22,11 +22,7 @@ use std::{
         io::AsRawHandle,
     },
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Instant,
+    sync::Arc,
 };
 use windows_sys::{
     Wdk::{
@@ -134,54 +130,14 @@ const _: () = {
 };
 
 /// Per-scan volume facts shared by every directory read.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct VolumeInfo {
     pub allocation_unit: Option<u64>,
     legacy: bool,
     layout: Layout,
-    trace: Option<DirectoryIo>,
-}
-
-#[derive(Debug, Default)]
-struct TimedCalls {
-    count: AtomicU64,
-    nanos: AtomicU64,
-}
-
-impl TimedCalls {
-    fn measure<T>(counter: Option<&Self>, call: impl FnOnce() -> T) -> T {
-        let Some(counter) = counter else {
-            return call();
-        };
-        let start = Instant::now();
-        let result = call();
-        counter
-            .nanos
-            .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        counter.count.fetch_add(1, Ordering::Relaxed);
-        result
-    }
-}
-
-#[derive(Debug, Default)]
-struct DirectoryIo {
-    open: TimedCalls,
-    query: TimedCalls,
 }
 
 impl VolumeInfo {
-    pub(crate) fn print_io_trace(&self) {
-        if let Some(trace) = &self.trace {
-            for (name, calls) in [("open", &trace.open), ("query", &trace.query)] {
-                eprintln!(
-                    "nt {name}: {} completed calls, {:.1} worker-ms",
-                    calls.count.load(Ordering::Relaxed),
-                    calls.nanos.load(Ordering::Relaxed) as f64 / 1_000_000.0
-                );
-            }
-        }
-    }
-
     /// Windows has no scan-wide caveat to report.
     pub(crate) fn warning(&self) -> Option<&str> {
         None
@@ -349,7 +305,6 @@ pub(crate) fn volume_info(
         allocation_unit: allocation_unit(root)?,
         legacy,
         layout,
-        trace: (!legacy && crate::tracing()).then(DirectoryIo::default),
     })
 }
 
@@ -433,10 +388,8 @@ fn nt_enumerate(
     volume: &VolumeInfo,
     listing: &mut Listing,
 ) -> io::Result<()> {
-    let handle = TimedCalls::measure(volume.trace.as_ref().map(|t| &t.open), || {
-        nt_open(parent.as_deref(), name)
-    })?;
-    let handle = Arc::new(handle);
+    let trace = &control.worker_trace;
+    let handle = Arc::new(trace.open.time(|| nt_open(parent.as_deref(), name))?);
     // The scan root was resolved (and is not a link) before the walk started.
     let root = parent.is_none();
     // The parent stays open only until its last child has opened.
@@ -444,10 +397,10 @@ fn nt_enumerate(
     let mut first = true;
     with_buffer(|buffer| {
         while !control.should_stop() {
-            let filled = TimedCalls::measure(volume.trace.as_ref().map(|t| &t.query), || {
-                nt_list(&handle, buffer, volume.layout.class, false)
-            })
-            .map_err(nt_error)?;
+            let filled = trace
+                .list
+                .time(|| nt_list(&handle, buffer, volume.layout.class, false))
+                .map_err(nt_error)?;
             if filled == 0 {
                 listing.batch.complete = true;
                 break;
@@ -460,11 +413,14 @@ fn nt_enumerate(
             if std::mem::take(&mut first) && !root && !starts_with_dot(bytes, volume.layout) {
                 check_not_reparse(&handle)?;
             }
-            if !add_records(bytes, volume, control, listing, |listing, index, wide| {
-                listing
-                    .children
-                    .push((index, Target::Relative(Some(handle.clone()), wide.to_vec())));
-            })? {
+            let more = trace.parse.time(|| {
+                add_records(bytes, volume, control, listing, |listing, index, wide| {
+                    listing
+                        .children
+                        .push((index, Target::Relative(Some(handle.clone()), wide.to_vec())));
+                })
+            })?;
+            if !more {
                 return Ok(());
             }
         }
@@ -570,11 +526,14 @@ fn legacy_enumerate(
     volume: &VolumeInfo,
     listing: &mut Listing,
 ) -> io::Result<()> {
-    let directory = OpenOptions::new()
-        .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)?;
+    let trace = &control.worker_trace;
+    let directory = trace.open.time(|| {
+        OpenOptions::new()
+            .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    })?;
     // Recheck the opened handle: a directory may have become a junction since discovery.
     let attributes: FILE_ATTRIBUTE_TAG_INFO = info(&directory, FileAttributeTagInfo)?;
     if attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
@@ -587,16 +546,25 @@ fn legacy_enumerate(
     let mut storage = vec![0_u64; LIST_BUFFER / 8];
     while !control.should_stop() {
         // SAFETY: storage is writable, aligned, and lives throughout this synchronous call.
-        let success = unsafe {
-            GetFileInformationByHandleEx(
-                directory.as_raw_handle(),
-                FileIdBothDirectoryInfo,
-                storage.as_mut_ptr().cast(),
-                (storage.len() * 8) as u32,
-            )
-        };
-        if success == 0 {
-            let error = io::Error::last_os_error();
+        // The error is read inside the timed step: nothing may run between the
+        // failed call and `last_os_error`.
+        let listed = trace.list.time(|| {
+            // SAFETY: as above.
+            let success = unsafe {
+                GetFileInformationByHandleEx(
+                    directory.as_raw_handle(),
+                    FileIdBothDirectoryInfo,
+                    storage.as_mut_ptr().cast(),
+                    (storage.len() * 8) as u32,
+                )
+            };
+            if success == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(error) = listed {
             if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
                 listing.batch.complete = true;
                 break;
@@ -606,10 +574,13 @@ fn legacy_enumerate(
         // SAFETY: viewing initialized storage as bytes is valid; parsing validates all offsets.
         let bytes =
             unsafe { std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), storage.len() * 8) };
-        if !add_records(bytes, volume, control, listing, |listing, index, _| {
-            let child = path.join(&*listing.batch.entries[index].name);
-            listing.children.push((index, Target::Path(child)));
-        })? {
+        let more = trace.parse.time(|| {
+            add_records(bytes, volume, control, listing, |listing, index, _| {
+                let child = path.join(&*listing.batch.entries[index].name);
+                listing.children.push((index, Target::Path(child)));
+            })
+        })?;
+        if !more {
             return Ok(());
         }
     }
@@ -936,40 +907,43 @@ fn emit_mft(
         }
     }
     crate::trace("mft plan", &mut phase);
-    let entries: Vec<crate::Entry> = plan
-        .par_iter()
-        .enumerate()
-        .map(|(i, &(index, parent, duplicate))| {
-            let name = table.name_at(index);
-            let slot = &table.slots[name.record as usize];
-            let kind = kind_of(slot);
-            let is_file = kind == EntryKind::File;
-            let logical = if is_file { slot.logical } else { 0 };
-            // Same rule as the directory walk: data that fits in the record has
-            // no clusters of its own.
-            let allocated = if is_file && unit.is_none_or(|unit| slot.allocated >= unit) {
-                slot.allocated
-            } else {
-                0
-            };
-            crate::Entry {
-                id: base + i,
-                parent_id: Some(parent as usize),
-                name: table.name(name).into(),
-                kind,
-                logical_bytes: logical,
-                unique_logical_bytes: if duplicate { 0 } else { logical },
-                allocated_bytes: Some(if duplicate { 0 } else { allocated }),
-                modified_unix_ms: filetime_to_unix_ms(slot.modified),
-                file_count: u64::from(is_file),
-                hard_link_duplicate: duplicate,
-                multiple_links: duplicate,
-                fully_listed: kind != EntryKind::Directory,
-            }
-        })
-        .collect();
+    // Written straight into the collector's list; the plan and the table are
+    // freed as soon as the last name has been copied out.
+    collector.build_entries(
+        plan.par_iter()
+            .enumerate()
+            .map(|(i, &(index, parent, duplicate))| {
+                let name = table.name_at(index);
+                let slot = &table.slots[name.record as usize];
+                let kind = kind_of(slot);
+                let is_file = kind == EntryKind::File;
+                let logical = if is_file { slot.logical } else { 0 };
+                // Same rule as the directory walk: data that fits in the record has
+                // no clusters of its own.
+                let allocated = if is_file && unit.is_none_or(|unit| slot.allocated >= unit) {
+                    slot.allocated
+                } else {
+                    0
+                };
+                crate::Entry {
+                    id: base + i,
+                    parent_id: Some(parent as usize),
+                    name: table.name(name).into(),
+                    kind,
+                    logical_bytes: logical,
+                    unique_logical_bytes: if duplicate { 0 } else { logical },
+                    allocated_bytes: Some(if duplicate { 0 } else { allocated }),
+                    modified_unix_ms: filetime_to_unix_ms(slot.modified),
+                    file_count: u64::from(is_file),
+                    hard_link_duplicate: duplicate,
+                    multiple_links: duplicate,
+                    fully_listed: kind != EntryKind::Directory,
+                }
+            }),
+    );
     drop(plan);
-    collector.append(entries);
+    drop(table);
+    collector.account_built(base);
     for id in multiple {
         collector.mark_multiple_links(id);
     }

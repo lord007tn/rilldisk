@@ -31,7 +31,10 @@ use std::{
         fs::{FileExt, OpenOptionsExt},
     },
     path::Path,
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use rayon::prelude::*;
@@ -693,7 +696,10 @@ fn parse_record(record: &mut [u8], index: u64, slot: &mut Slot, chunk: &mut Chun
                     if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
                         slot.flags |= SLOT_REPARSE;
                     }
-                    if attributes & (FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS) != 0 {
+                    if attributes
+                        & (FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+                        != 0
+                    {
                         slot.flags |= SLOT_RECALL;
                     }
                 }
@@ -805,6 +811,7 @@ impl Mft {
         total: &dyn Fn(u64),
         progress: &(dyn Fn(u64, u64, u64) + Sync),
     ) -> io::Result<Self> {
+        let mut phase = std::time::Instant::now();
         let alignment = source.alignment();
         let mut boot = Aligned::new(4096, alignment);
         source.read_at(0, boot.bytes())?;
@@ -825,8 +832,11 @@ impl Mft {
         let unit = geometry.record.max(geometry.cluster);
         let chunk_bytes = CHUNK_BYTES.div_ceil(unit) * unit;
         let per_chunk = (chunk_bytes / geometry.record) as usize;
-        let mut phase = std::time::Instant::now();
         let mut slots = vec![Slot::default(); records as usize];
+        crate::trace("mft setup", &mut phase);
+        let tracing = crate::tracing();
+        let (read_timer, parse_timer) = (crate::StepTimer::default(), crate::StepTimer::default());
+        let (in_use, bytes_read) = (AtomicU64::new(0), AtomicU64::new(0));
         let chunks: Vec<io::Result<Chunk>> = slots
             .par_chunks_mut(per_chunk)
             .enumerate()
@@ -845,21 +855,28 @@ impl Mft {
                         *buffer = Aligned::new(chunk_bytes as usize, alignment);
                     }
                     let bytes = &mut buffer.bytes()[..len as usize];
-                    read_mapped(source, &extents, start, bytes)?;
+                    read_timer.time(|| read_mapped(source, &extents, start, bytes))?;
                     let mut chunk = Chunk::default();
                     let first = start / geometry.record;
-                    let (mut files, mut folders) = (0, 0);
-                    for (j, slot) in slots.iter_mut().enumerate() {
-                        let at = j * geometry.record as usize;
-                        let record = &mut bytes[at..at + geometry.record as usize];
-                        parse_record(record, first + j as u64, slot, &mut chunk, i as u32);
-                        if slot.in_use() {
-                            if slot.is_directory() {
-                                folders += 1;
-                            } else {
-                                files += 1;
+                    let (files, folders) = parse_timer.time(|| {
+                        let (mut files, mut folders) = (0, 0);
+                        for (j, slot) in slots.iter_mut().enumerate() {
+                            let at = j * geometry.record as usize;
+                            let record = &mut bytes[at..at + geometry.record as usize];
+                            parse_record(record, first + j as u64, slot, &mut chunk, i as u32);
+                            if slot.in_use() {
+                                if slot.is_directory() {
+                                    folders += 1;
+                                } else {
+                                    files += 1;
+                                }
                             }
                         }
+                        (files, folders)
+                    });
+                    if tracing {
+                        in_use.fetch_add(files + folders, Ordering::Relaxed);
+                        bytes_read.fetch_add(len, Ordering::Relaxed);
                     }
                     progress(files, folders, slots.len() as u64);
                     Ok(chunk)
@@ -867,6 +884,19 @@ impl Mft {
             })
             .collect();
         crate::trace("mft read and parse", &mut phase);
+        if tracing {
+            eprintln!(
+                "mft records: {records} total, {} files and folders in use (extension records not counted), {} table bytes read in parsed chunks",
+                in_use.load(Ordering::Relaxed),
+                bytes_read.load(Ordering::Relaxed),
+            );
+            eprintln!(
+                "mft workers (summed): read {:.1} ms ({} chunks), parse {:.1} ms",
+                read_timer.millis(),
+                read_timer.calls(),
+                parse_timer.millis(),
+            );
+        }
         let mut texts = Vec::with_capacity(chunks.len());
         let mut names = Vec::new();
         let mut wof = Vec::new();

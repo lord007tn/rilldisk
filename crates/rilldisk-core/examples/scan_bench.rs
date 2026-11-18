@@ -46,7 +46,7 @@ fn main() {
             other => path = Some(PathBuf::from(other)),
         }
     }
-    let control = Arc::new(ScanControl::default());
+    let control = Arc::new(ScanControl::without_live_view());
     let start = Instant::now();
     let snapshot: Snapshot = match image {
         #[cfg(windows)]

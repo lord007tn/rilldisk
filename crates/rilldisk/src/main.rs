@@ -506,7 +506,7 @@ async fn run(
     hint_to: Hint,
     write: impl FnOnce(&mut dyn Write, &Snapshot) -> Result<()>,
 ) -> Result<ExitCode> {
-    let control = Arc::new(ScanControl::default());
+    let control = Arc::new(ScanControl::without_live_view());
     let exporting = Arc::new(AtomicBool::new(false));
     let signal_exporting = exporting.clone();
     let signal_control = control.clone();
