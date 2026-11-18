@@ -1482,7 +1482,7 @@ struct WalkTrace {
 impl WalkTrace {
     fn report(&self, total: Duration, links: &LinkTable, workers: &WorkerTrace) {
         eprintln!(
-            "walk collector: busy {:.1} ms, waiting {:.1} ms, {} batches, peak backlog {} ready, {} waiting",
+            "walk collector: outside receive (ingest and live publish) {:.1} ms, waiting {:.1} ms, {} batches, peak backlog {} ready, {} waiting",
             millis(total.saturating_sub(self.waiting)),
             millis(self.waiting),
             self.batches,

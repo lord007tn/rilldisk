@@ -546,16 +546,25 @@ fn legacy_enumerate(
     let mut storage = vec![0_u64; LIST_BUFFER / 8];
     while !control.should_stop() {
         // SAFETY: storage is writable, aligned, and lives throughout this synchronous call.
-        let success = trace.list.time(|| unsafe {
-            GetFileInformationByHandleEx(
-                directory.as_raw_handle(),
-                FileIdBothDirectoryInfo,
-                storage.as_mut_ptr().cast(),
-                (storage.len() * 8) as u32,
-            )
+        // The error is read inside the timed step: nothing may run between the
+        // failed call and `last_os_error`.
+        let listed = trace.list.time(|| {
+            // SAFETY: as above.
+            let success = unsafe {
+                GetFileInformationByHandleEx(
+                    directory.as_raw_handle(),
+                    FileIdBothDirectoryInfo,
+                    storage.as_mut_ptr().cast(),
+                    (storage.len() * 8) as u32,
+                )
+            };
+            if success == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
         });
-        if success == 0 {
-            let error = io::Error::last_os_error();
+        if let Err(error) = listed {
             if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
                 listing.batch.complete = true;
                 break;

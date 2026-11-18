@@ -882,7 +882,7 @@ impl Mft {
         crate::trace("mft read and parse", &mut phase);
         if tracing {
             eprintln!(
-                "mft records: {records} total, {} in use, {} bytes read",
+                "mft records: {records} total, {} files and folders in use (extension records not counted), {} table bytes read in parsed chunks",
                 in_use.load(Ordering::Relaxed),
                 bytes_read.load(Ordering::Relaxed),
             );
