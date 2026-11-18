@@ -217,6 +217,18 @@ fn protected_paths_are_neither_listed_nor_deleted() {
             .contains("Not listed: 1 candidate(s) under your protected paths")
     );
 
+    let summary = Command::new(env!("CARGO_BIN_EXE_rilldisk"))
+        .arg("scan")
+        .arg(root.path())
+        .env("LOCALAPPDATA", state.path())
+        .env("XDG_STATE_HOME", state.path())
+        .env("HOME", state.path())
+        .output()
+        .unwrap();
+    assert!(summary.status.success());
+    let text = String::from_utf8_lossy(&summary.stdout);
+    assert!(text.contains("in 2 candidates."), "{text}");
+
     // Only the file applies now: app/target goes, web/node_modules stays.
     let output = run(&["--delete", "--permanent", "--yes", "--format", "json"]);
     assert_eq!(

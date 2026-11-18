@@ -20,8 +20,8 @@ use eframe::egui::{
     Shape, Ui, UiBuilder, pos2, vec2,
 };
 use rilldisk_core::{
-    Candidate, Category, EntryKind, LiveView, ReclaimReport, Safety, ScanControl, ScanOptions,
-    Snapshot, TypeStat, Volume, file_types, find_reclaimable, largest_files, scan, volumes,
+    Candidate, Category, EntryKind, LiveView, ReclaimDiscovery, ReclaimReport, Safety, ScanControl,
+    ScanOptions, Snapshot, TypeStat, Volume, file_types, largest_files, scan, volumes,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -66,12 +66,13 @@ pub struct Data {
 impl Data {
     pub(crate) fn analyze(snapshot: Snapshot) -> Self {
         let start = Instant::now();
-        let mut reclaim = find_reclaimable(&snapshot, now_ms());
+        let mut reclaim = ReclaimDiscovery::new(&snapshot).into_report(now_ms());
         // The user's never-touch list (protected-paths.txt). An unreadable list
         // hides nothing here, but cleanup then refuses every removal.
         if let Ok(protected) = rilldisk_core::protect::Protected::load() {
             reclaim.exclude_protected(&protected);
         }
+        reclaim.capture_cleanup_identities();
         let candidate_of = reclaim
             .candidates
             .iter()

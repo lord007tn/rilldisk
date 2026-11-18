@@ -67,7 +67,7 @@ fn main() {
             .unwrap()
             .as_millis() as u64;
         let phase = Instant::now();
-        let reclaim = rilldisk_core::find_reclaimable(&snapshot, now);
+        let reclaim = rilldisk_core::ReclaimDiscovery::new(&snapshot).into_report(now);
         let reclaim_ms = phase.elapsed().as_millis();
         let phase = Instant::now();
         let types = rilldisk_core::file_types(&snapshot);
