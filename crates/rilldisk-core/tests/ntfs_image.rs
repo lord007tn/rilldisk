@@ -108,8 +108,10 @@ fn a_torn_git_pointer_cannot_turn_a_tracked_worktree_into_an_orphan() {
     // The fixture uses 1 KiB FILE records and 512-byte fixup sectors.
     // Identify the pointer by its unique resident payload, independent of its record number.
     let marker = b"gitdir: synthetic-worktree-fixture";
-    let pointer = raw
-        .chunks_exact_mut(1024)
+    let (records, tail) = raw.as_chunks_mut::<1024>();
+    assert!(tail.is_empty());
+    let pointer = records
+        .iter_mut()
         .find(|r| r.starts_with(b"FILE") && r.windows(marker.len()).any(|w| w == marker))
         .unwrap();
     pointer[510] ^= 1;
