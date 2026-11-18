@@ -897,40 +897,43 @@ fn emit_mft(
         }
     }
     crate::trace("mft plan", &mut phase);
-    let entries: Vec<crate::Entry> = plan
-        .par_iter()
-        .enumerate()
-        .map(|(i, &(index, parent, duplicate))| {
-            let name = table.name_at(index);
-            let slot = &table.slots[name.record as usize];
-            let kind = kind_of(slot);
-            let is_file = kind == EntryKind::File;
-            let logical = if is_file { slot.logical } else { 0 };
-            // Same rule as the directory walk: data that fits in the record has
-            // no clusters of its own.
-            let allocated = if is_file && unit.is_none_or(|unit| slot.allocated >= unit) {
-                slot.allocated
-            } else {
-                0
-            };
-            crate::Entry {
-                id: base + i,
-                parent_id: Some(parent as usize),
-                name: table.name(name).into(),
-                kind,
-                logical_bytes: logical,
-                unique_logical_bytes: if duplicate { 0 } else { logical },
-                allocated_bytes: Some(if duplicate { 0 } else { allocated }),
-                modified_unix_ms: filetime_to_unix_ms(slot.modified),
-                file_count: u64::from(is_file),
-                hard_link_duplicate: duplicate,
-                multiple_links: duplicate,
-                fully_listed: kind != EntryKind::Directory,
-            }
-        })
-        .collect();
+    // Written straight into the collector's list; the plan and the table are
+    // freed as soon as the last name has been copied out.
+    collector.build_entries(
+        plan.par_iter()
+            .enumerate()
+            .map(|(i, &(index, parent, duplicate))| {
+                let name = table.name_at(index);
+                let slot = &table.slots[name.record as usize];
+                let kind = kind_of(slot);
+                let is_file = kind == EntryKind::File;
+                let logical = if is_file { slot.logical } else { 0 };
+                // Same rule as the directory walk: data that fits in the record has
+                // no clusters of its own.
+                let allocated = if is_file && unit.is_none_or(|unit| slot.allocated >= unit) {
+                    slot.allocated
+                } else {
+                    0
+                };
+                crate::Entry {
+                    id: base + i,
+                    parent_id: Some(parent as usize),
+                    name: table.name(name).into(),
+                    kind,
+                    logical_bytes: logical,
+                    unique_logical_bytes: if duplicate { 0 } else { logical },
+                    allocated_bytes: Some(if duplicate { 0 } else { allocated }),
+                    modified_unix_ms: filetime_to_unix_ms(slot.modified),
+                    file_count: u64::from(is_file),
+                    hard_link_duplicate: duplicate,
+                    multiple_links: duplicate,
+                    fully_listed: kind != EntryKind::Directory,
+                }
+            }),
+    );
     drop(plan);
-    collector.append(entries);
+    drop(table);
+    collector.account_built(base);
     for id in multiple {
         collector.mark_multiple_links(id);
     }

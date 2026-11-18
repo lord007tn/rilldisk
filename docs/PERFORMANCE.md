@@ -99,9 +99,9 @@ isolated without administrator rights (see "Cold caches"), so the default
 | Build entries (names, sizes) | | 105–213 |
 | Total `scan()` | 2,324–2,643 | 1,080–1,525 |
 
-Planning is sequential on indexes only; entries are built in parallel and then
-pass one at a time through `Collector::accept`, the single place every backend
-retains an entry (where the live view is fed).
+Planning is sequential on indexes only; entries are built in parallel directly
+in the collector's list, then counted by `Collector::count`, the single place
+every backend counts an entry.
 
 **Memory:** the hard-link table no longer allocates a slot per MFT record
 number for small scans: a 20k-file folder on this drive peaked at 276 MiB RSS

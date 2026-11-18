@@ -256,10 +256,12 @@ installation per system is in [INSTALL.md](INSTALL.md).
 
 `ScanOptions::backend` (`--backend auto|mft|dir` in the CLI) chooses how a scan
 enumerates; `Summary.backend` names the one that ran. Every backend feeds the
-same collector: `Collector::accept` is the single place each retained entry is
-counted and stored, with its parent id, parents before children (it also feeds
-the live view). Rollups, the child index, issues, the entry budget, cancellation
-and partial results are shared. Measurements are in [PERFORMANCE.md](PERFORMANCE.md).
+same collector, parents before children: the walks store each retained entry
+through `Collector::accept`, and the MFT backend builds its entries in parallel
+directly in the collector's list. `Collector::count` is the single place either
+kind is counted, and both also feed the live view. Rollups, the child index,
+issues, the entry budget, cancellation and partial results are shared.
+Measurements are in [PERFORMANCE.md](PERFORMANCE.md).
 
 * **`nt-directory`** (Windows walk): each folder opens with `NtCreateFile`
   relative to its parent's open handle (`FILE_OPEN_FOR_BACKUP_INTENT`,

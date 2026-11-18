@@ -774,8 +774,9 @@ pub(crate) struct Batch {
     complete: bool,
 }
 
-/// Builds the entry list. Every retained entry passes through [`Collector::push`],
-/// parents before children, whatever the backend.
+/// Builds the entry list, parents before children, whatever the backend. The
+/// walks retain entries one at a time through [`Collector::push`]; the MFT backend
+/// builds them in place with [`Collector::build_entries`].
 pub(crate) struct Collector {
     entries: Vec<Entry>,
     summary: Summary,
@@ -816,23 +817,61 @@ impl Collector {
         id
     }
 
-    /// Append entries a backend built in parallel (ids already assigned in
-    /// order, parents first, hard links resolved).
+    /// Build entries in parallel directly in the entry list, so no second array
+    /// of them ever exists. `build` yields them with ids already assigned in
+    /// order, parents first, hard links resolved. They count once
+    /// [`Collector::account_built`] has run, which a caller can delay until it
+    /// has freed what the entries were built from.
     #[cfg(windows)]
-    pub(crate) fn append(&mut self, entries: Vec<Entry>) {
-        self.entries.reserve(entries.len());
-        for entry in entries {
-            self.accept(entry, false);
+    pub(crate) fn build_entries(&mut self, build: impl IndexedParallelIterator<Item = Entry>) {
+        self.entries.reserve_exact(build.len());
+        self.entries.par_extend(build);
+    }
+
+    /// Count the entries from index `first` on, added by [`Collector::build_entries`].
+    #[cfg(windows)]
+    pub(crate) fn account_built(&mut self, first: usize) {
+        let Self {
+            entries,
+            summary,
+            live,
+            ..
+        } = self;
+        for (index, entry) in entries.iter().enumerate().skip(first) {
+            debug_assert_eq!(entry.id, index);
+            debug_assert!(entry.parent_id.is_some_and(|p| p < entry.id));
+            Self::count(summary, entry, false);
+            live.add(
+                entry.id,
+                entry.parent_id.expect("only the root has no parent"),
+                entry.kind,
+                &entry.name,
+                entry.logical_bytes,
+                entry.allocated_bytes,
+            );
         }
     }
 
-    /// The single place where every retained entry, of every backend, is
-    /// counted and stored, with its parent id, parents before children.
+    /// Store one entry and count it, with its parent id, parents before children.
     /// `skipped`: a folder that was deliberately not entered (a mount point).
     fn accept(&mut self, entry: Entry, skipped: bool) {
         debug_assert_eq!(entry.id, self.entries.len());
         debug_assert!(entry.parent_id.is_some_and(|p| p < entry.id));
-        let summary = &mut self.summary;
+        Self::count(&mut self.summary, &entry, skipped);
+        let parent = entry.parent_id.expect("only the root has no parent");
+        self.live.add(
+            entry.id,
+            parent,
+            entry.kind,
+            &entry.name,
+            entry.logical_bytes,
+            entry.allocated_bytes,
+        );
+        self.entries.push(entry);
+    }
+
+    /// The single place where every retained entry, of every backend, is counted.
+    fn count(summary: &mut Summary, entry: &Entry, skipped: bool) {
         match entry.kind {
             EntryKind::Directory => {
                 summary.directories += 1;
@@ -846,16 +885,6 @@ impl Collector {
             EntryKind::Link => summary.skipped_links += 1,
             EntryKind::Other => {}
         }
-        let parent = entry.parent_id.expect("only the root has no parent");
-        self.live.add(
-            entry.id,
-            parent,
-            entry.kind,
-            &entry.name,
-            entry.logical_bytes,
-            entry.allocated_bytes,
-        );
-        self.entries.push(entry);
     }
 
     #[cfg(windows)]
@@ -1724,6 +1753,71 @@ impl Snapshot {
                 .take(limit.min(500))
                 .collect(),
         )
+    }
+}
+
+#[cfg(all(test, windows))]
+mod collector_tests {
+    use super::{Collector, Entry, EntryKind, RawEntry};
+    use rayon::prelude::*;
+    use std::{ffi::OsStr, path::PathBuf};
+
+    fn raw(name: &str, kind: EntryKind, logical: u64, identity: Option<(u64, u64)>) -> RawEntry {
+        RawEntry {
+            name: OsStr::new(name).into(),
+            kind,
+            logical,
+            allocated: Some(logical),
+            modified: Some(1),
+            identity,
+            skipped: false,
+            key: None,
+        }
+    }
+
+    /// Root / a, f; a / g (a hard link of f), l, b; b / h, in breadth-first order.
+    fn pushed() -> Collector {
+        let mut collector = Collector::new(PathBuf::from("root"), None).unwrap();
+        let shared = Some((0, 7));
+        for (parent, entry) in [
+            (0, raw("a", EntryKind::Directory, 0, None)),
+            (0, raw("f", EntryKind::File, 10, shared)),
+            (1, raw("g", EntryKind::File, 10, shared)),
+            (1, raw("l", EntryKind::Link, 0, None)),
+            (1, raw("b", EntryKind::Directory, 0, None)),
+            (5, raw("h", EntryKind::File, 5, None)),
+        ] {
+            collector.push(parent, entry);
+        }
+        collector
+    }
+
+    fn listing(entries: &[Entry]) -> Vec<String> {
+        entries.iter().map(|entry| format!("{entry:?}")).collect()
+    }
+
+    #[test]
+    fn entries_built_in_place_count_like_entries_pushed_one_by_one() {
+        let pushed = pushed();
+        let mut built = Collector::new(PathBuf::from("root"), None).unwrap();
+        built.build_entries(pushed.entries[1..].to_vec().into_par_iter());
+        // Stored right away, counted only once accounted for.
+        assert_eq!(built.entries.len(), pushed.entries.len());
+        assert_eq!(built.summary.files, 0);
+        built.account_built(1);
+        assert_eq!(listing(&built.entries), listing(&pushed.entries));
+        let counts = |c: &Collector| {
+            let s = &c.summary;
+            (
+                s.files,
+                s.directories,
+                s.skipped_links,
+                s.skipped_mounts,
+                s.hard_link_duplicates,
+            )
+        };
+        assert_eq!(counts(&built), (3, 3, 1, 0, 1));
+        assert_eq!(counts(&built), counts(&pushed));
     }
 }
 
