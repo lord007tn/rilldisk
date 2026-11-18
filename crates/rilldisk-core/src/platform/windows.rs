@@ -905,7 +905,8 @@ fn emit_mft(
         }
         if table.slots[record as usize].may_lack_children() {
             placeholders += 1;
-        } else {
+        } else if table.torn == 0 {
+            // A torn record cannot reliably identify the parent of a missing name.
             listed.push(id);
         }
     }

@@ -5,6 +5,7 @@
 # as root, with ntfs-3g installed (mkntfs, ntfs-3g). Nothing here comes from a real disk.
 #
 #   sudo scripts/make_ntfs_image.sh tiny OUT.img          # the 8 MiB test image (gzip it)
+#   sudo scripts/make_ntfs_image.sh worktrees OUT.img      # orphan-detection regression fixture
 #   sudo scripts/make_ntfs_image.sh fixture OUT.img N SIZE MAKE_FIXTURE
 #        # SIZE-byte volume holding `make_fixture OUT/fx --files N` (manifest next to OUT.img)
 set -euo pipefail
@@ -12,7 +13,7 @@ kind=$1
 img=$2
 mount=$(mktemp -d)
 rm -f "$img"
-if [ "$kind" = tiny ]; then truncate -s 8M "$img"; else truncate -s "$4" "$img"; fi
+if [ "$kind" = tiny ] || [ "$kind" = worktrees ]; then truncate -s 8M "$img"; else truncate -s "$4" "$img"; fi
 mkntfs -F -Q -c 4096 -L RILLDISK "$img" >/dev/null 2>&1
 ntfs-3g "$img" "$mount"
 trap 'umount "$mount"; rmdir "$mount"' EXIT
@@ -31,6 +32,9 @@ if [ "$kind" = tiny ]; then
   for i in $(seq 1 50); do ln many-links-target.bin "links/link-$i-$(printf 'n%.0s' $(seq 1 60)).bin"; done
   head -c 42 /dev/zero > "$(printf 'L%.0s' $(seq 1 200)).txt"
   cd /
+elif [ "$kind" = worktrees ]; then
+  mkdir -p "$mount/.t3/worktrees/tracked" "$mount/.t3/worktrees/orphan"
+  printf "gitdir: synthetic-worktree-fixture" > "$mount/.t3/worktrees/tracked/.git"
 else
   "$5" "$mount/fx" --files "$3" > "${img%.img}.manifest.json"
 fi

@@ -66,6 +66,36 @@ fn reads_names_sizes_links_and_extension_records() {
 }
 
 #[test]
+fn a_torn_git_pointer_cannot_turn_a_tracked_worktree_into_an_orphan() {
+    let packed = include_bytes!("fixtures/worktrees.img.gz");
+    let mut raw = Vec::new();
+    flate2::read::GzDecoder::new(&packed[..]).read_to_end(&mut raw).unwrap();
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let scan = |bytes: &[u8]| {
+        std::fs::write(file.path(), bytes).unwrap();
+        scan_ntfs_image(file.path(), ScanOptions::default(), Arc::default()).unwrap()
+    };
+    let report = |s: &rilldisk_core::Snapshot| rilldisk_core::ReclaimDiscovery::new(s).into_report(0);
+    let intact = scan(&raw);
+    assert!(intact.summary.complete);
+    let before = report(&intact);
+    assert!(before.candidates.iter().any(|c| c.path.ends_with("tracked") && c.is_linked_worktree()));
+    assert!(before.candidates.iter().any(|c| c.path.ends_with("orphan") && c.label == "Orphaned agent worktree"));
+
+    // The fixture uses 1 KiB FILE records and 512-byte fixup sectors.
+    // Identify the pointer by its unique resident payload, independent of its record number.
+    let marker = b"gitdir: synthetic-worktree-fixture";
+    let pointer = raw.chunks_exact_mut(1024).find(|r| r.starts_with(b"FILE")
+        && r.windows(marker.len()).any(|w| w == marker)).unwrap();
+    pointer[510] ^= 1;
+    let partial = scan(&raw);
+    assert!(!partial.summary.complete);
+    assert!(partial.summary.issues.iter().any(|i| i.message.contains("1 MFT records")));
+    assert!(partial.entries.iter().any(|e| partial.name(e.id) == "tracked" && !e.fully_listed));
+    assert!(!report(&partial).candidates.iter().any(|c| c.label == "Orphaned agent worktree"));
+}
+
+#[test]
 fn image_scans_honor_the_entry_budget_and_cancellation() {
     let image = image();
     let budget = |max_entries| {

@@ -84,6 +84,7 @@ const SLOT_TORN: u8 = 0x20;
 /// all on this disk (the provider fills them in when it is listed).
 const SLOT_RECALL: u8 = 0x40;
 const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x0004_0000;
+const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
 
 /// One MFT record, after parsing. Indexed by record number.
 #[derive(Clone, Copy, Default)]
@@ -692,7 +693,7 @@ fn parse_record(record: &mut [u8], index: u64, slot: &mut Slot, chunk: &mut Chun
                     if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
                         slot.flags |= SLOT_REPARSE;
                     }
-                    if attributes & FILE_ATTRIBUTE_RECALL_ON_OPEN != 0 {
+                    if attributes & (FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS) != 0 {
                         slot.flags |= SLOT_RECALL;
                     }
                 }
@@ -1567,6 +1568,7 @@ mod tests {
             parse(&mut r, 90).0
         };
         assert!(folder(0x9000_701A, FILE_ATTRIBUTE_RECALL_ON_OPEN).may_lack_children());
+        assert!(folder(0x9000_701A, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS).may_lack_children());
         assert!(!folder(0x9000_701A, 0).may_lack_children(), "fully on disk");
         assert!(folder(TAG_PROJFS, 0).may_lack_children());
         assert!(
