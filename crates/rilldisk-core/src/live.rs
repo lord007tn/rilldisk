@@ -71,6 +71,7 @@ pub(crate) struct LiveTracker {
     generation: u64,
     last_publish: Instant,
     publish_cost: std::time::Duration,
+    publish_total: std::time::Duration,
     published_focus: usize,
 }
 
@@ -83,8 +84,14 @@ impl LiveTracker {
             generation: 0,
             last_publish: Instant::now(),
             publish_cost: std::time::Duration::ZERO,
+            publish_total: std::time::Duration::ZERO,
             published_focus: 0,
         }
+    }
+
+    /// Views published so far and the time spent building them.
+    pub(crate) fn publish_stats(&self) -> (u64, std::time::Duration) {
+        (self.generation, self.publish_total)
     }
 
     /// Account for one retained entry. `parent` is its parent's entry id (0 is
@@ -166,6 +173,7 @@ impl LiveTracker {
             *slot = Some(view);
         }
         self.publish_cost = started.elapsed();
+        self.publish_total += self.publish_cost;
         self.published_focus = focus;
         self.last_publish = Instant::now();
     }

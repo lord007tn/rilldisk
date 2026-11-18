@@ -388,7 +388,8 @@ fn nt_enumerate(
     volume: &VolumeInfo,
     listing: &mut Listing,
 ) -> io::Result<()> {
-    let handle = Arc::new(nt_open(parent.as_deref(), name)?);
+    let trace = &control.worker_trace;
+    let handle = Arc::new(trace.open.time(|| nt_open(parent.as_deref(), name))?);
     // The scan root was resolved (and is not a link) before the walk started.
     let root = parent.is_none();
     // The parent stays open only until its last child has opened.
@@ -396,7 +397,10 @@ fn nt_enumerate(
     let mut first = true;
     with_buffer(|buffer| {
         while !control.should_stop() {
-            let filled = nt_list(&handle, buffer, volume.layout.class, false).map_err(nt_error)?;
+            let filled = trace
+                .list
+                .time(|| nt_list(&handle, buffer, volume.layout.class, false))
+                .map_err(nt_error)?;
             if filled == 0 {
                 listing.batch.complete = true;
                 break;
@@ -409,11 +413,14 @@ fn nt_enumerate(
             if std::mem::take(&mut first) && !root && !starts_with_dot(bytes, volume.layout) {
                 check_not_reparse(&handle)?;
             }
-            if !add_records(bytes, volume, control, listing, |listing, index, wide| {
-                listing
-                    .children
-                    .push((index, Target::Relative(Some(handle.clone()), wide.to_vec())));
-            })? {
+            let more = trace.parse.time(|| {
+                add_records(bytes, volume, control, listing, |listing, index, wide| {
+                    listing
+                        .children
+                        .push((index, Target::Relative(Some(handle.clone()), wide.to_vec())));
+                })
+            })?;
+            if !more {
                 return Ok(());
             }
         }
@@ -519,11 +526,14 @@ fn legacy_enumerate(
     volume: &VolumeInfo,
     listing: &mut Listing,
 ) -> io::Result<()> {
-    let directory = OpenOptions::new()
-        .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)?;
+    let trace = &control.worker_trace;
+    let directory = trace.open.time(|| {
+        OpenOptions::new()
+            .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    })?;
     // Recheck the opened handle: a directory may have become a junction since discovery.
     let attributes: FILE_ATTRIBUTE_TAG_INFO = info(&directory, FileAttributeTagInfo)?;
     if attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
@@ -536,14 +546,14 @@ fn legacy_enumerate(
     let mut storage = vec![0_u64; LIST_BUFFER / 8];
     while !control.should_stop() {
         // SAFETY: storage is writable, aligned, and lives throughout this synchronous call.
-        let success = unsafe {
+        let success = trace.list.time(|| unsafe {
             GetFileInformationByHandleEx(
                 directory.as_raw_handle(),
                 FileIdBothDirectoryInfo,
                 storage.as_mut_ptr().cast(),
                 (storage.len() * 8) as u32,
             )
-        };
+        });
         if success == 0 {
             let error = io::Error::last_os_error();
             if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
@@ -555,10 +565,13 @@ fn legacy_enumerate(
         // SAFETY: viewing initialized storage as bytes is valid; parsing validates all offsets.
         let bytes =
             unsafe { std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), storage.len() * 8) };
-        if !add_records(bytes, volume, control, listing, |listing, index, _| {
-            let child = path.join(&*listing.batch.entries[index].name);
-            listing.children.push((index, Target::Path(child)));
-        })? {
+        let more = trace.parse.time(|| {
+            add_records(bytes, volume, control, listing, |listing, index, _| {
+                let child = path.join(&*listing.batch.entries[index].name);
+                listing.children.push((index, Target::Path(child)));
+            })
+        })?;
+        if !more {
             return Ok(());
         }
     }

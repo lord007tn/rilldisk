@@ -422,6 +422,8 @@ pub struct ScanControl {
     mft_total: AtomicU64,
     /// The table is read; folders are being built from it.
     mft_building: AtomicBool,
+    /// What directory-walk workers spent their time on (only while tracing).
+    worker_trace: WorkerTrace,
 }
 
 /// Where an NTFS table (MFT) scan is, for progress displays. The table is read in
@@ -986,6 +988,7 @@ fn reset_progress(control: &ScanControl, options: &ScanOptions) {
     control.mft_total.store(0, Ordering::Relaxed);
     control.mft_read.store(0, Ordering::Relaxed);
     control.mft_building.store(false, Ordering::Relaxed);
+    control.worker_trace.reset();
 }
 
 fn thread_pool(options: &ScanOptions) -> Result<rayon::ThreadPool> {
@@ -1136,6 +1139,9 @@ fn walk(
     let mut last_budget = control.remaining_entries.load(Ordering::Relaxed);
     let mut cancel_seen: Option<Instant> = None;
     let mut stalled = false;
+    let tracing = tracing();
+    let started = Instant::now();
+    let mut trace = WalkTrace::default();
     loop {
         let mut stop = false;
         if walk.pending.load(Ordering::Acquire) == 0 {
@@ -1146,7 +1152,12 @@ fn walk(
         } else {
             // A worker sends before it decrements `pending`, so poll briefly rather
             // than blocking: the final result can arrive just before the count drops.
-            match results.recv_timeout(Duration::from_millis(5)) {
+            let wait = tracing.then(Instant::now);
+            let received = results.recv_timeout(Duration::from_millis(5));
+            if let Some(wait) = wait {
+                trace.waiting += wait.elapsed();
+            }
+            match received {
                 Ok(result) => {
                     ready.push(result);
                     ready.extend(results.try_iter());
@@ -1180,10 +1191,18 @@ fn walk(
             }
         }
         while let Some((key, batch)) = ready.pop() {
+            if tracing {
+                // Everything queued passes here, so this sees the true peak.
+                trace.peak_ready = trace.peak_ready.max(ready.len() + 1);
+            }
             let Some(&parent) = ids.get(key).filter(|&&id| id != usize::MAX) else {
                 waiting.insert(key, batch);
+                if tracing {
+                    trace.peak_waiting = trace.peak_waiting.max(waiting.len());
+                }
                 continue;
             };
+            trace.batches += 1;
             outstanding.remove(&key);
             collector.errors(parent, &batch.errors);
             collector.set_fully_listed(parent, batch.complete);
@@ -1230,6 +1249,9 @@ fn walk(
     }
     // Leftover workers (hung reads, cancelled tails) exit at their next check.
     control.abandoned.store(true, Ordering::Relaxed);
+    if tracing {
+        trace.report(started.elapsed(), &collector.links, &control.worker_trace);
+    }
 }
 
 /// Totals, rollups and the child index, shared by every backend.
@@ -1250,6 +1272,10 @@ fn finish(
         true,
         control.live_focus.load(Ordering::Relaxed),
     );
+    if tracing() {
+        let (publishes, cost) = live.publish_stats();
+        eprintln!("live view: {publishes} publishes, {:.1} ms", millis(cost));
+    }
     let mut phase = Instant::now();
     control.abandoned.store(true, Ordering::Relaxed);
     drop(links);
@@ -1308,7 +1334,9 @@ fn finish(
 }
 
 /// Profiling aid: with `RILLDISK_TRACE_PHASES=1`, print how long each scan phase
-/// took to stderr (local only; nothing is recorded or sent anywhere).
+/// took and what the collector, the workers and the MFT reader did to stderr.
+/// Counts and timings only, never names or paths (local only; nothing is
+/// recorded or sent anywhere).
 pub(crate) fn tracing() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("RILLDISK_TRACE_PHASES").is_some())
@@ -1316,12 +1344,110 @@ pub(crate) fn tracing() -> bool {
 
 pub(crate) fn trace(phase: &str, since: &mut Instant) {
     if tracing() {
-        eprintln!(
-            "phase {phase}: {:.1} ms",
-            since.elapsed().as_secs_f64() * 1000.0
-        );
+        eprintln!("phase {phase}: {:.1} ms", millis(since.elapsed()));
     }
     *since = Instant::now();
+}
+
+pub(crate) fn millis(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+/// Calls of one worker step and their summed duration across all workers.
+/// Updated only while tracing.
+#[derive(Debug, Default)]
+pub(crate) struct StepTimer {
+    calls: AtomicU64,
+    nanos: AtomicU64,
+}
+
+impl StepTimer {
+    /// Run `step`, recording it when tracing.
+    #[cfg(windows)]
+    #[inline]
+    pub(crate) fn time<R>(&self, step: impl FnOnce() -> R) -> R {
+        if !tracing() {
+            return step();
+        }
+        let start = Instant::now();
+        let result = step();
+        self.nanos
+            .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        result
+    }
+
+    pub(crate) fn calls(&self) -> u64 {
+        self.calls.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn millis(&self) -> f64 {
+        self.nanos.load(Ordering::Relaxed) as f64 / 1e6
+    }
+
+    fn reset(&self) {
+        self.calls.store(0, Ordering::Relaxed);
+        self.nanos.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Where directory-walk workers spend their time (Windows walks only).
+#[derive(Debug, Default)]
+struct WorkerTrace {
+    open: StepTimer,
+    list: StepTimer,
+    parse: StepTimer,
+}
+
+impl WorkerTrace {
+    fn reset(&self) {
+        self.open.reset();
+        self.list.reset();
+        self.parse.reset();
+    }
+}
+
+/// What the collector thread of a directory walk did. Apart from the batch
+/// count, filled only while tracing.
+#[derive(Default)]
+struct WalkTrace {
+    waiting: Duration,
+    batches: u64,
+    peak_ready: usize,
+    peak_waiting: usize,
+}
+
+impl WalkTrace {
+    fn report(&self, total: Duration, links: &LinkTable, workers: &WorkerTrace) {
+        eprintln!(
+            "walk collector: busy {:.1} ms, waiting {:.1} ms, {} batches, peak backlog {} ready, {} waiting",
+            millis(total.saturating_sub(self.waiting)),
+            millis(self.waiting),
+            self.batches,
+            self.peak_ready,
+            self.peak_waiting,
+        );
+        if links.dense_active {
+            eprintln!(
+                "walk hard links: dense table, {} slots, {} in the map",
+                links.dense.len(),
+                links.map.len()
+            );
+        } else {
+            eprintln!("walk hard links: map, {} entries", links.map.len());
+        }
+        if cfg!(windows) {
+            eprintln!(
+                "walk workers (summed): open {:.1} ms ({} calls), list {:.1} ms ({} calls), parse {:.1} ms ({} buffers)",
+                workers.open.millis(),
+                workers.open.calls(),
+                workers.list.millis(),
+                workers.list.calls(),
+                workers.parse.millis(),
+                workers.parse.calls(),
+            );
+        }
+    }
 }
 
 /// Full path of `id`, rebuilt from the parent chain.
