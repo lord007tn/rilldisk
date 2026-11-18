@@ -95,6 +95,11 @@ def main():
             page = tool("query_entries", {"scan_id": job, "query": "مرحبا"})
             assert page["total"] == 1, page
             reclaim = tool("find_reclaimable", {"scan_id": job, "min_bytes": 0})
+            first = tool("find_reclaimable", {"scan_id": job, "min_bytes": 0, "limit": 1})
+            second = tool("find_reclaimable", {"scan_id": job, "min_bytes": 0, "limit": 1,
+                                               "offset": first["next_offset"]})
+            assert first["next_offset"] == 1 and second["next_offset"] is None
+            assert first["candidates"] + second["candidates"] == reclaim["candidates"]
             kinds = {c["category"]: c for c in reclaim["candidates"]}
             assert set(kinds) == {"build_output", "git_worktree"}, reclaim
             assert kinds["build_output"]["suggested_action"].startswith("cargo clean --manifest-path ")

@@ -587,6 +587,29 @@ fn age(path: &Path, days: u64) {
 }
 
 #[test]
+fn cached_discovery_dates_each_report_and_only_cleanup_captures_identity() {
+    let root = tempfile::tempdir().unwrap();
+    write(&root.path().join("__pycache__/item.pyc"), 64);
+    let snapshot = scan(root.path(), ScanOptions::default(), Arc::default()).unwrap();
+    let discovery = rilldisk_core::ReclaimDiscovery::new(&snapshot);
+    let recent = discovery.clone().into_report(0);
+    let candidate = &recent.candidates[0];
+    assert!(candidate.identity.is_none());
+    assert_eq!(candidate.idle_days, Some(0));
+    let modified = candidate.newest_modified_unix_ms.unwrap();
+    let mut older = discovery.into_report(modified + 30 * DAY_MS);
+    assert_eq!(older.candidates[0].idle_days, Some(30));
+    assert!(
+        older.candidates[0]
+            .reason
+            .ends_with("Nothing inside changed for 30 days.")
+    );
+    assert!(!candidate.reason.contains("Nothing inside changed"));
+    older.capture_cleanup_identities();
+    assert!(older.candidates[0].identity.is_some());
+}
+
+#[test]
 fn idle_days_come_from_files_not_folder_times() {
     let root = tempfile::tempdir().unwrap();
     let r = root.path();

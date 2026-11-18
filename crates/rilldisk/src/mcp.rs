@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 use anyhow::{Context, Result, bail};
 use rilldisk_core::{
-    Category, ScanControl, ScanOptions, Snapshot, file_types, find_reclaimable, scan,
+    Category, ReclaimDiscovery, ScanControl, ScanOptions, Snapshot, file_types, scan,
 };
 use rmcp::{
     ErrorData, ServerHandler, ServiceExt,
@@ -13,7 +13,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     path::PathBuf,
-    sync::{Arc, atomic::Ordering},
+    sync::{Arc, OnceLock, atomic::Ordering},
 };
 use tokio::sync::{Mutex, Semaphore};
 
@@ -36,8 +36,13 @@ struct Job {
     id: u64,
     control: Arc<ScanControl>,
     status: &'static str,
-    snapshot: Option<Arc<Snapshot>>,
+    snapshot: Option<Arc<CompletedScan>>,
     error: Option<String>,
+}
+
+struct CompletedScan {
+    snapshot: Snapshot,
+    reclaim: OnceLock<ReclaimDiscovery>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -174,7 +179,10 @@ impl DiskServer {
                         } else {
                             "partial"
                         };
-                        job.snapshot = Some(Arc::new(snapshot));
+                        job.snapshot = Some(Arc::new(CompletedScan {
+                            snapshot,
+                            reclaim: OnceLock::new(),
+                        }));
                     }
                     error => {
                         job.status = "failed";
@@ -206,7 +214,7 @@ impl DiskServer {
             .ok_or_else(|| invalid("unknown or expired scan_id"))?;
         output(json!({"scan_id": job.id, "status": job.status,
             "files": job.control.files.load(Ordering::Relaxed), "directories": job.control.directories.load(Ordering::Relaxed), "bytes_found": job.control.bytes.load(Ordering::Relaxed),
-            "summary": job.snapshot.as_ref().map(|s| &s.summary), "error": job.error}))
+            "summary": job.snapshot.as_ref().map(|s| &s.snapshot.summary), "error": job.error}))
     }
 
     #[tool(
@@ -229,16 +237,17 @@ impl DiskServer {
         if input.query.as_ref().is_some_and(|query| query.len() > 4096) {
             return Err(invalid("query is too long"));
         }
-        let snapshot = self.snapshot(input.scan_id).await?;
+        let completed = self.completed_scan(input.scan_id).await?;
         if input
             .parent_id
-            .is_some_and(|id| id >= snapshot.entries.len())
+            .is_some_and(|id| id >= completed.snapshot.entries.len())
         {
             return Err(invalid("unknown parent_id"));
         }
         let value = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let offset = input.offset.unwrap_or(0);
+            let snapshot = &completed.snapshot;
             let (total, entries) = snapshot.query(input.parent_id, input.query.as_deref(), input.files_only.unwrap_or(false), offset, limit);
             json!({"scan_id": input.scan_id, "complete": snapshot.summary.complete, "total": total,
                 "offset": offset, "next_offset": (offset.saturating_add(entries.len()) < total).then_some(offset.saturating_add(entries.len())),
@@ -268,13 +277,16 @@ impl DiskServer {
             Some(text) => Some(Category::parse(text).ok_or_else(|| invalid("unknown category"))?),
         };
         let permit = self.query_permit()?;
-        let snapshot = self.snapshot(input.scan_id).await?;
+        let completed = self.completed_scan(input.scan_id).await?;
         let value = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_millis() as u64);
-            let mut report = find_reclaimable(&snapshot, now);
+            let discovery = completed
+                .reclaim
+                .get_or_init(|| ReclaimDiscovery::new(&completed.snapshot));
+            let mut report = discovery.clone().into_report(now);
             // The user's never-touch list hides candidates here too. Read per call,
             // so edits apply without restarting the server.
             let protected_error = match rilldisk_core::protect::Protected::load() {
@@ -325,10 +337,11 @@ impl DiskServer {
             return Err(invalid("limit must be between 1 and 500"));
         }
         let permit = self.query_permit()?;
-        let snapshot = self.snapshot(input.scan_id).await?;
+        let completed = self.completed_scan(input.scan_id).await?;
         let value = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let mut types = file_types(&snapshot);
+            let snapshot = &completed.snapshot;
+            let mut types = file_types(snapshot);
             let total = types.len();
             types.truncate(limit);
             json!({"scan_id": input.scan_id, "complete": snapshot.summary.complete,
@@ -374,7 +387,7 @@ impl DiskServer {
             .map_err(|_| invalid("query capacity reached; retry after another query finishes"))
     }
 
-    async fn snapshot(&self, scan_id: u64) -> Result<Arc<Snapshot>, ErrorData> {
+    async fn completed_scan(&self, scan_id: u64) -> Result<Arc<CompletedScan>, ErrorData> {
         let state = self.state.lock().await;
         state
             .active

@@ -780,6 +780,16 @@ const LOCATIONS: &[(&[&str], Rule)] = {
 };
 
 impl ReclaimReport {
+    /// Capture the retained folders before presenting them for removal. Cleanup
+    /// compares these identities again immediately before acting.
+    pub fn capture_cleanup_identities(&mut self) {
+        for candidate in &mut self.candidates {
+            if candidate.identity.is_none() {
+                candidate.identity = crate::cleanup::folder_identity(&candidate.path);
+            }
+        }
+    }
+
     /// Ask Git about every linked worktree (a few at a time) and attach its
     /// verdict; the suggested action becomes Git-aware. Runs `git`; see
     /// docs/proposals/git-inspection.md. Other candidates are untouched.
@@ -880,8 +890,39 @@ impl ReclaimReport {
     }
 }
 
-/// Analyze a snapshot. `now_unix_ms` makes idle-day calculations reproducible.
+/// Analyze a snapshot for a caller that may later offer cleanup.
 pub fn find_reclaimable(snapshot: &Snapshot, now_unix_ms: u64) -> ReclaimReport {
+    let mut report = ReclaimDiscovery::new(snapshot).into_report(now_unix_ms);
+    report.capture_cleanup_identities();
+    report
+}
+
+/// Immutable candidate discovery. Only snapshot metadata is consulted. Each
+/// report derives its idle-day text from the requested time.
+#[derive(Clone)]
+pub struct ReclaimDiscovery(ReclaimReport);
+
+impl ReclaimDiscovery {
+    pub fn new(snapshot: &Snapshot) -> Self {
+        Self(discover(snapshot))
+    }
+
+    pub fn into_report(mut self, now_unix_ms: u64) -> ReclaimReport {
+        for candidate in &mut self.0.candidates {
+            candidate.idle_days = candidate
+                .newest_modified_unix_ms
+                .map(|m| now_unix_ms.saturating_sub(m) / 86_400_000);
+            if let Some(days) = candidate.idle_days.filter(|&d| d >= 30) {
+                candidate
+                    .reason
+                    .push_str(&format!(" Nothing inside changed for {days} days."));
+            }
+        }
+        self.0
+    }
+}
+
+fn discover(snapshot: &Snapshot) -> ReclaimReport {
     let entries = &snapshot.entries;
     let mut found: Vec<(usize, &Rule, Option<String>, Safety)> = Vec::new();
     let mut worktrees = Vec::new();
@@ -996,14 +1037,10 @@ pub fn find_reclaimable(snapshot: &Snapshot, now_unix_ms: u64) -> ReclaimReport 
         let entry = &entries[*id];
         let subtree = subtree(snapshot, *id);
         let newest = subtree.newest_file_ms.or(entry.modified_unix_ms);
-        let idle_days = newest.map(|m| now_unix_ms.saturating_sub(m) / 86_400_000);
         let mut reason = rule.reason.to_string();
         if let Some(detail) = detail {
             reason.push(' ');
             reason.push_str(detail);
-        }
-        if let Some(days) = idle_days.filter(|&d| d >= 30) {
-            reason.push_str(&format!(" Nothing inside changed for {days} days."));
         }
         let path = snapshot.path(*id);
         let suggested_action = if rule.category == Category::GitWorktree && rule.action.is_empty() {
@@ -1028,7 +1065,6 @@ pub fn find_reclaimable(snapshot: &Snapshot, now_unix_ms: u64) -> ReclaimReport 
         let agent = (rule.category == Category::GitWorktree)
             .then(|| agent_owner(&path.join("x")))
             .flatten();
-        let identity = crate::cleanup::folder_identity(&path);
         candidates.push(Candidate {
             entry_id: *id,
             path,
@@ -1045,10 +1081,10 @@ pub fn find_reclaimable(snapshot: &Snapshot, now_unix_ms: u64) -> ReclaimReport 
             exclusive_bytes: subtree.exclusive_bytes,
             shared_bytes: subtree.shared_bytes,
             newest_modified_unix_ms: newest,
-            idle_days,
+            idle_days: None,
             nested_in: enclosing.map(|(parent, _)| parent),
             git: None,
-            identity,
+            identity: None,
         });
     }
     candidates.sort_by(|a, b| {

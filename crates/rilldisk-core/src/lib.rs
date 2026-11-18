@@ -27,7 +27,7 @@ mod stats;
 pub use cleanup::{CleanupMode, CleanupPlan, CleanupReport};
 pub use live::{LiveFolder, LiveView};
 pub use platform::{Volume, volumes};
-pub use reclaim::{Candidate, Category, ReclaimReport, Safety, find_reclaimable};
+pub use reclaim::{Candidate, Category, ReclaimDiscovery, ReclaimReport, Safety, find_reclaimable};
 pub use stats::{TypeStat, file_types, largest_files};
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -1136,6 +1136,10 @@ fn walk(
     let mut last_budget = control.remaining_entries.load(Ordering::Relaxed);
     let mut cancel_seen: Option<Instant> = None;
     let mut stalled = false;
+    let trace_start = tracing().then(Instant::now);
+    let mut receive_time = Duration::ZERO;
+    let mut collection_time = Duration::ZERO;
+    let mut peak_waiting = 0;
     loop {
         let mut stop = false;
         if walk.pending.load(Ordering::Acquire) == 0 {
@@ -1146,7 +1150,12 @@ fn walk(
         } else {
             // A worker sends before it decrements `pending`, so poll briefly rather
             // than blocking: the final result can arrive just before the count drops.
-            match results.recv_timeout(Duration::from_millis(5)) {
+            let start = trace_start.map(|_| Instant::now());
+            let result = results.recv_timeout(Duration::from_millis(5));
+            if let Some(start) = start {
+                receive_time += start.elapsed();
+            }
+            match result {
                 Ok(result) => {
                     ready.push(result);
                     ready.extend(results.try_iter());
@@ -1179,9 +1188,13 @@ fn walk(
                 }
             }
         }
+        let start = trace_start.map(|_| Instant::now());
         while let Some((key, batch)) = ready.pop() {
             let Some(&parent) = ids.get(key).filter(|&&id| id != usize::MAX) else {
                 waiting.insert(key, batch);
+                if start.is_some() {
+                    peak_waiting = peak_waiting.max(waiting.len());
+                }
                 continue;
             };
             outstanding.remove(&key);
@@ -1202,6 +1215,9 @@ fn walk(
                 }
             }
         }
+        if let Some(start) = start {
+            collection_time += start.elapsed();
+        }
         collector.live.publish(
             &control.live,
             false,
@@ -1210,6 +1226,16 @@ fn walk(
         if stop {
             break;
         }
+    }
+    if let Some(start) = trace_start {
+        eprintln!(
+            "walk: {:.1} ms elapsed, {:.1} ms receiving, {:.1} ms collecting, {peak_waiting} peak batches waiting for parents",
+            start.elapsed().as_secs_f64() * 1000.0,
+            receive_time.as_secs_f64() * 1000.0,
+            collection_time.as_secs_f64() * 1000.0
+        );
+        #[cfg(windows)]
+        walk.volume.print_io_trace();
     }
     if stalled {
         let mut keys: Vec<usize> = outstanding.into_iter().collect();

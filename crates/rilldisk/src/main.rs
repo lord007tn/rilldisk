@@ -2,7 +2,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use rilldisk_core::{
-    Backend, ReclaimReport, Safety, ScanControl, ScanOptions, Snapshot, Summary, find_reclaimable,
+    Backend, ReclaimDiscovery, ReclaimReport, Safety, ScanControl, ScanOptions, Snapshot, Summary,
     protect::{self, Protected},
     scan, volumes,
 };
@@ -381,11 +381,12 @@ async fn main() -> Result<ExitCode> {
             // No elevation hint: it would suggest removing folders as root.
             let scan_code = run(args, Hint::Off, |writer, snapshot| {
                 let safety = safety.unwrap_or(vec![SafetyArg::Regenerable, SafetyArg::Cache]);
-                let mut report = find_reclaimable(snapshot, now_ms());
+                let mut report = ReclaimDiscovery::new(snapshot).into_report(now_ms());
                 report.retain(|c| {
                     c.logical_bytes >= min_size && safety.iter().any(|s| s.matches(c.safety))
                 });
                 apply_protections(&mut report, &extra);
+                report.capture_cleanup_identities();
                 if git {
                     report.inspect_git(now_ms(), stale_days);
                     let before = report.candidates.len();
@@ -430,7 +431,7 @@ async fn main() -> Result<ExitCode> {
                 Hint::Stderr
             };
             run(args, hint, |writer, snapshot| {
-                let mut report = find_reclaimable(snapshot, now_ms());
+                let mut report = ReclaimDiscovery::new(snapshot).into_report(now_ms());
                 report.retain(|c| {
                     c.logical_bytes >= min_size
                         && safety
@@ -799,7 +800,8 @@ fn write_scan(
                     }
                 )?;
             }
-            let report = find_reclaimable(snapshot, now_ms());
+            let mut report = ReclaimDiscovery::new(snapshot).into_report(now_ms());
+            apply_protections(&mut report, &Protected::default());
             if report.candidate_count > 0 {
                 writeln!(
                     writer,

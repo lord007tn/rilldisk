@@ -86,6 +86,16 @@ median of 3, ms): 8 threads 2,934; 16 → 1,816; 24 → 2,167; 48 → 1,892; 64 
 isolated without administrator rights (see "Cold caches"), so the default
 (available cores, clamped to 8–32) is unchanged.
 
+With `RILLDISK_TRACE_PHASES=1`, directory scans print collector-loop elapsed
+time, time in the blocking receive call, time processing batches, and the peak
+number of batches parked until their parent arrived. The remaining loop time
+includes publication, scheduling and bookkeeping. On Windows, `nt-directory`
+also reports completed directory opens and listing calls (including errors and
+end-of-list queries) with summed time across workers. These worker times overlap
+one another and the collector. The root layout probe is outside these counts.
+Tracing writes aggregate diagnostics to stderr and adds timing overhead. Use
+untraced runs for throughput comparisons.
+
 **After the listing** (`RILLDISK_TRACE_PHASES=1`, 1.17M entries): rollup
 26–58 ms, child index (now sorted in parallel) 52–78 ms.
 

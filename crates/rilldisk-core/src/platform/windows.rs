@@ -22,7 +22,11 @@ use std::{
         io::AsRawHandle,
     },
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
 };
 use windows_sys::{
     Wdk::{
@@ -130,14 +134,54 @@ const _: () = {
 };
 
 /// Per-scan volume facts shared by every directory read.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub(crate) struct VolumeInfo {
     pub allocation_unit: Option<u64>,
     legacy: bool,
     layout: Layout,
+    trace: Option<DirectoryIo>,
+}
+
+#[derive(Debug, Default)]
+struct TimedCalls {
+    count: AtomicU64,
+    nanos: AtomicU64,
+}
+
+impl TimedCalls {
+    fn measure<T>(counter: Option<&Self>, call: impl FnOnce() -> T) -> T {
+        let Some(counter) = counter else {
+            return call();
+        };
+        let start = Instant::now();
+        let result = call();
+        counter
+            .nanos
+            .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        counter.count.fetch_add(1, Ordering::Relaxed);
+        result
+    }
+}
+
+#[derive(Debug, Default)]
+struct DirectoryIo {
+    open: TimedCalls,
+    query: TimedCalls,
 }
 
 impl VolumeInfo {
+    pub(crate) fn print_io_trace(&self) {
+        if let Some(trace) = &self.trace {
+            for (name, calls) in [("open", &trace.open), ("query", &trace.query)] {
+                eprintln!(
+                    "nt {name}: {} completed calls, {:.1} worker-ms",
+                    calls.count.load(Ordering::Relaxed),
+                    calls.nanos.load(Ordering::Relaxed) as f64 / 1_000_000.0
+                );
+            }
+        }
+    }
+
     /// Windows has no scan-wide caveat to report.
     pub(crate) fn warning(&self) -> Option<&str> {
         None
@@ -305,6 +349,7 @@ pub(crate) fn volume_info(
         allocation_unit: allocation_unit(root)?,
         legacy,
         layout,
+        trace: (!legacy && crate::tracing()).then(DirectoryIo::default),
     })
 }
 
@@ -388,7 +433,10 @@ fn nt_enumerate(
     volume: &VolumeInfo,
     listing: &mut Listing,
 ) -> io::Result<()> {
-    let handle = Arc::new(nt_open(parent.as_deref(), name)?);
+    let handle = TimedCalls::measure(volume.trace.as_ref().map(|t| &t.open), || {
+        nt_open(parent.as_deref(), name)
+    })?;
+    let handle = Arc::new(handle);
     // The scan root was resolved (and is not a link) before the walk started.
     let root = parent.is_none();
     // The parent stays open only until its last child has opened.
@@ -396,7 +444,10 @@ fn nt_enumerate(
     let mut first = true;
     with_buffer(|buffer| {
         while !control.should_stop() {
-            let filled = nt_list(&handle, buffer, volume.layout.class, false).map_err(nt_error)?;
+            let filled = TimedCalls::measure(volume.trace.as_ref().map(|t| &t.query), || {
+                nt_list(&handle, buffer, volume.layout.class, false)
+            })
+            .map_err(nt_error)?;
             if filled == 0 {
                 listing.batch.complete = true;
                 break;
